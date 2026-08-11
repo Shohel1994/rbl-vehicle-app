@@ -6,7 +6,7 @@ SDK, replacing SQLite. Adds self-service user registration with admin
 approval, in addition to requisition approval. No email — everything
 happens live inside the app. Exports: Excel (.xlsx) and PDF (.pdf).
 
-Author: Senior Python Developer (generated for Kazi Nur Shahin)
+Author: Senior Python Developer (generated for Shohel Rana)
 """
 
 import io
@@ -20,6 +20,7 @@ import streamlit as st
 from supabase import create_client, Client
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
+from fpdf.fonts import FontFace
 
 # =========================================================
 # 1. COMPANY INFO & PAGE CONFIG
@@ -43,8 +44,18 @@ DEPARTMENTS = [
     "TSD", "QMS", "Production Planning & Control", "Cutting", "R & D", "Admin",
     "Technical", "Finishing", "Quality", "IE", "HR & Compliance", "Other",
 ]
-STATUS_OPTIONS = ["Pending", "Approved", "Rejected"]
-STATUS_BADGE = {"Pending": "🟡 Pending", "Approved": "🟢 Approved", "Rejected": "🔴 Rejected"}
+
+# Account status (users table) — approval workflow for logins
+USER_STATUS_OPTIONS = ["Pending", "Approved", "Rejected"]
+ROLE_OPTIONS = ["user", "security_officer", "admin"]
+ROLE_DISPLAY = {"user": "Employee", "security_officer": "Security Officer", "admin": "Admin"}
+
+# Requisition status (requisitions table) — full trip lifecycle
+REQ_STATUS_OPTIONS = ["Pending", "Approved", "Rejected", "On Trip", "Completed"]
+STATUS_BADGE = {
+    "Pending": "🟡 Pending", "Approved": "🟢 Approved", "Rejected": "🔴 Rejected",
+    "On Trip": "🔵 On Trip", "Completed": "✅ Completed",
+}
 
 # =========================================================
 # 2. STYLING (desktop / Windows browser + mobile / Android friendly)
@@ -61,6 +72,8 @@ st.markdown("""
     .badge-pending  { background:#FFF3CD; color:#856404; padding:4px 12px; border-radius:14px; font-weight:700; white-space:nowrap; }
     .badge-approved { background:#D4EDDA; color:#155724; padding:4px 12px; border-radius:14px; font-weight:700; white-space:nowrap; }
     .badge-rejected { background:#F8D7DA; color:#721C24; padding:4px 12px; border-radius:14px; font-weight:700; white-space:nowrap; }
+    .badge-ontrip   { background:#D6E9FF; color:#084298; padding:4px 12px; border-radius:14px; font-weight:700; white-space:nowrap; }
+    .badge-completed{ background:#D1F2EB; color:#0B5345; padding:4px 12px; border-radius:14px; font-weight:700; white-space:nowrap; }
     .driver-box {
         background:#EAF7EE; border:1px solid #B7E4C7; border-radius:10px; padding:10px 14px; margin-top:8px;
     }
@@ -104,7 +117,34 @@ def company_header(subtitle: str = ""):
 
 
 def badge_class(status: str) -> str:
-    return {"Pending": "badge-pending", "Approved": "badge-approved", "Rejected": "badge-rejected"}.get(status, "badge-pending")
+    return {
+        "Pending": "badge-pending", "Approved": "badge-approved", "Rejected": "badge-rejected",
+        "On Trip": "badge-ontrip", "Completed": "badge-completed",
+    }.get(status, "badge-pending")
+
+
+def is_blank(val) -> bool:
+    """True if val is None, NaN, or an empty/whitespace string.
+
+    Pandas turns SQL NULLs (from nullable Supabase columns like approved_time,
+    admin_note, start_km) into float NaN when loaded into a DataFrame — and NaN
+    is truthy in plain Python (`if nan:` is True), so a bare `if val:` or
+    `val or fallback` silently does the wrong thing for unset fields. Every
+    place that reads an optional trip-lifecycle field goes through this check.
+    """
+    if val is None:
+        return True
+    if isinstance(val, float) and pd.isna(val):
+        return True
+    if isinstance(val, str) and not val.strip():
+        return True
+    return False
+
+
+def fmt(val, default: str = "—") -> str:
+    """Display-safe string formatting: shows `default` instead of a literal
+    'nan'/'None' for unset nullable fields (see is_blank)."""
+    return default if is_blank(val) else str(val)
 
 
 def hash_password(raw: str) -> str:
@@ -186,7 +226,8 @@ def fetch_all_requisitions() -> pd.DataFrame:
         "id", "request_id", "created_at", "username", "applicant_name", "department", "mobile_number",
         "date_of_travel", "time_of_travel", "destination", "passenger_count", "vehicle_type", "purpose",
         "special_request", "status", "driver_name", "driver_contact", "vehicle_number", "approved_by",
-        "action_timestamp",
+        "action_timestamp", "approved_time", "admin_note", "start_km", "end_km", "total_km",
+        "actual_exit_time", "actual_return_time",
     ])
 
 
@@ -204,7 +245,29 @@ def fetch_requisitions_by_user(username: str) -> pd.DataFrame:
         "id", "request_id", "created_at", "username", "applicant_name", "department", "mobile_number",
         "date_of_travel", "time_of_travel", "destination", "passenger_count", "vehicle_type", "purpose",
         "special_request", "status", "driver_name", "driver_contact", "vehicle_number", "approved_by",
-        "action_timestamp",
+        "action_timestamp", "approved_time", "admin_note", "start_km", "end_km", "total_km",
+        "actual_exit_time", "actual_return_time",
+    ])
+
+
+def fetch_requisitions_by_status(status: str) -> pd.DataFrame:
+    """Server-side filtered fetch used by the Security Officer panel — only pulls
+    requisitions in the given trip-status (e.g. 'Approved' or 'On Trip'), so
+    Pending/Rejected requests are never even requested, let alone shown."""
+    sb = get_supabase_client()
+    res = (
+        sb.table(REQUISITIONS_TABLE)
+        .select("*")
+        .eq("status", status)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=[
+        "id", "request_id", "created_at", "username", "applicant_name", "department", "mobile_number",
+        "date_of_travel", "time_of_travel", "destination", "passenger_count", "vehicle_type", "purpose",
+        "special_request", "status", "driver_name", "driver_contact", "vehicle_number", "approved_by",
+        "action_timestamp", "approved_time", "admin_note", "start_km", "end_km", "total_km",
+        "actual_exit_time", "actual_return_time",
     ])
 
 
@@ -277,49 +340,102 @@ def login_view():
                     st.rerun()
 
         with tab_register:
-            st.caption("New employees can request an account here. Your default password will be your **Employee ID**. "
+            st.caption("New employees or Security Officers can request an account here. "
                        "An admin must approve your account before you can log in.")
-            with st.form("register_form", clear_on_submit=True):
-                full_name = st.text_input("Full Name *")
-                username_r = st.text_input("Choose a Username *")
-                designation = st.text_input("Designation *")
-                employee_id = st.text_input("Employee ID *", help="This will also be your default password.")
-                department = st.selectbox("Department *", DEPARTMENTS)
-                mobile = st.text_input("Mobile Number *")
-                reg_submitted = st.form_submit_button("Submit Request", type="primary", use_container_width=True)
 
-            if reg_submitted:
-                errors = []
-                if not full_name.strip():
-                    errors.append("Full Name is required.")
-                if not username_r.strip():
-                    errors.append("Username is required.")
-                if not employee_id.strip():
-                    errors.append("Employee ID is required.")
-                if not mobile.strip():
-                    errors.append("Mobile Number is required.")
-                if not errors and get_user_by_username(username_r.strip()):
-                    errors.append("This username is already taken. Please choose another.")
+            reg_role = st.radio(
+                "Register as", ["Employee", "Security Officer"],
+                horizontal=True, key="reg_role_choice",
+            )
+            st.markdown("---")
 
-                if errors:
-                    for e in errors:
-                        st.error(e)
-                else:
-                    register_user({
-                        "username": username_r.strip(),
-                        "password": hash_password(employee_id.strip()),
-                        "full_name": full_name.strip(),
-                        "designation": designation.strip(),
-                        "employee_id": employee_id.strip(),
-                        "department": department,
-                        "mobile": mobile.strip(),
-                        "role": "user",
-                        "status": "Pending",
-                    })
-                    st.success(
-                        "✅ Your account request has been submitted! Your default password is your "
-                        f"**Employee ID ({employee_id.strip()})**. Please wait for admin approval before signing in."
-                    )
+            if reg_role == "Employee":
+                st.caption("Your default password will be your **Employee ID**.")
+                with st.form("register_employee_form", clear_on_submit=True):
+                    full_name = st.text_input("Full Name *")
+                    username_r = st.text_input("Choose a Username *")
+                    designation = st.text_input("Designation *")
+                    employee_id = st.text_input("Employee ID *", help="This will also be your default password.")
+                    department = st.selectbox("Department *", DEPARTMENTS)
+                    mobile = st.text_input("Mobile Number *")
+                    reg_submitted = st.form_submit_button("Submit Request", type="primary", use_container_width=True)
+
+                if reg_submitted:
+                    errors = []
+                    if not full_name.strip():
+                        errors.append("Full Name is required.")
+                    if not username_r.strip():
+                        errors.append("Username is required.")
+                    if not employee_id.strip():
+                        errors.append("Employee ID is required.")
+                    if not mobile.strip():
+                        errors.append("Mobile Number is required.")
+                    if not errors and get_user_by_username(username_r.strip()):
+                        errors.append("This username is already taken. Please choose another.")
+
+                    if errors:
+                        for e in errors:
+                            st.error(e)
+                    else:
+                        register_user({
+                            "username": username_r.strip(),
+                            "password": hash_password(employee_id.strip()),
+                            "full_name": full_name.strip(),
+                            "designation": designation.strip(),
+                            "employee_id": employee_id.strip(),
+                            "department": department,
+                            "mobile": mobile.strip(),
+                            "role": "user",
+                            "status": "Pending",
+                        })
+                        st.success(
+                            "✅ Your account request has been submitted! Your default password is your "
+                            f"**Employee ID ({employee_id.strip()})**. Please wait for admin approval before signing in."
+                        )
+
+            else:  # Security Officer registration — same simple flow as normal users
+                st.caption("Choose your own username and password below, just like a regular account.")
+                with st.form("register_security_form", clear_on_submit=True):
+                    sec_full_name = st.text_input("Full Name *", key="sec_full_name")
+                    sec_username = st.text_input("Username *", key="sec_username")
+                    sec_password = st.text_input("Password *", type="password", key="sec_password")
+                    sec_password_confirm = st.text_input("Confirm Password *", type="password", key="sec_password_confirm")
+                    sec_submitted = st.form_submit_button("Submit Request", type="primary", use_container_width=True)
+
+                if sec_submitted:
+                    errors = []
+                    if not sec_full_name.strip():
+                        errors.append("Full Name is required.")
+                    if not sec_username.strip():
+                        errors.append("Username is required.")
+                    if not sec_password:
+                        errors.append("Password is required.")
+                    elif len(sec_password) < 4:
+                        errors.append("Password must be at least 4 characters.")
+                    elif sec_password != sec_password_confirm:
+                        errors.append("Passwords do not match.")
+                    if not errors and get_user_by_username(sec_username.strip()):
+                        errors.append("This username is already taken. Please choose another.")
+
+                    if errors:
+                        for e in errors:
+                            st.error(e)
+                    else:
+                        register_user({
+                            "username": sec_username.strip(),
+                            "password": hash_password(sec_password),
+                            "full_name": sec_full_name.strip(),
+                            "designation": "Security Officer",
+                            "employee_id": "",
+                            "department": "Security",
+                            "mobile": "",
+                            "role": "security_officer",
+                            "status": "Pending",
+                        })
+                        st.success(
+                            "✅ Your Security Officer account request has been submitted! "
+                            "Please wait for admin approval before signing in."
+                        )
 
 
 def logout_button():
@@ -375,43 +491,44 @@ def build_pdf_report(df: pd.DataFrame, filters_summary: str) -> bytes:
     approved = int((df["status"] == "Approved").sum()) if not df.empty else 0
     rejected = int((df["status"] == "Rejected").sum()) if not df.empty else 0
     pending = int((df["status"] == "Pending").sum()) if not df.empty else 0
+    on_trip = int((df["status"] == "On Trip").sum()) if not df.empty else 0
+    completed = int((df["status"] == "Completed").sum()) if not df.empty else 0
 
     pdf.set_font("Helvetica", "B", 11)
     pdf.cell(0, 8, "Summary Statistics", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font("Helvetica", size=9)
     pdf.set_fill_color(230, 230, 230)
-    for label, value in [("Total", total), ("Approved", approved), ("Rejected", rejected), ("Pending", pending)]:
-        pdf.cell(45, 7, f"{label}: {value}", border=1, align="C", fill=True)
+    for label, value in [("Total", total), ("Pending", pending), ("Approved", approved),
+                          ("On Trip", on_trip), ("Completed", completed), ("Rejected", rejected)]:
+        pdf.cell(38, 7, f"{label}: {value}", border=1, align="C", fill=True)
     pdf.ln(12)
 
     pdf.set_font("Helvetica", "B", 11)
     pdf.cell(0, 8, "Requisition Records", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(1)
 
+    # Column widths are sized generously for "Req ID" (the longest field, e.g.
+    # "REQ-20260809072230-852") and every cell wraps automatically via fpdf2's
+    # table() API — this is what actually prevents text from bleeding into the
+    # next column, instead of truncating with "…" as the previous version did.
     headers = ["Req ID", "Applicant", "Department", "Date", "Time", "Destination",
-               "Vehicle", "Status", "Driver", "Contact", "Vehicle No."]
+               "Vehicle", "Status", "Driver", "Vehicle No.", "Total KM"]
     cols = ["request_id", "applicant_name", "department", "date_of_travel", "time_of_travel",
-            "destination", "vehicle_type", "status", "driver_name", "driver_contact", "vehicle_number"]
-    widths = [30, 30, 28, 20, 15, 30, 22, 20, 28, 30, 24]
+            "destination", "vehicle_type", "status", "driver_name", "vehicle_number", "total_km"]
+    col_widths = [42, 24, 22, 18, 13, 24, 16, 16, 22, 28, 16]
 
-    pdf.set_font("Helvetica", "B", 8)
-    pdf.set_fill_color(15, 98, 254)
-    pdf.set_text_color(255, 255, 255)
-    for h, w in zip(headers, widths):
-        pdf.cell(w, 7, h, border=1, align="C", fill=True)
-    pdf.ln()
-
-    pdf.set_font("Helvetica", size=8)
-    pdf.set_text_color(0, 0, 0)
-    fill = False
-    for _, row in df.iterrows():
-        pdf.set_fill_color(245, 245, 245)
-        for col, w in zip(cols, widths):
-            val = str(row.get(col, "") or "")
-            if len(val) > 22:
-                val = val[:20] + "…"
-            pdf.cell(w, 7, val, border=1, fill=fill)
-        pdf.ln()
-        fill = not fill
+    pdf.set_font("Helvetica", size=7)
+    heading_style = FontFace(emphasis="BOLD", color=(255, 255, 255), fill_color=(15, 98, 254))
+    with pdf.table(col_widths=col_widths, text_align="LEFT", first_row_as_headings=True,
+                   line_height=5, headings_style=heading_style, cell_fill_color=(245, 245, 245),
+                   cell_fill_mode="ROWS") as table:
+        header_row = table.row()
+        for h in headers:
+            header_row.cell(h)
+        for _, r in df.iterrows():
+            row = table.row()
+            for col in cols:
+                row.cell(fmt(r.get(col, ""), ""))
 
     return bytes(pdf.output())
 
@@ -432,16 +549,16 @@ st.sidebar.title(f"🚗 {COMPANY_NAME}")
 st.sidebar.caption(f"📍 {COMPANY_ADDRESS}")
 st.sidebar.markdown("---")
 st.sidebar.markdown(f"**{user['full_name']}**")
-st.sidebar.caption(f"Role: {user['role'].capitalize()}")
+st.sidebar.caption(f"Role: {ROLE_DISPLAY.get(user['role'], user['role'].capitalize())}")
 if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
     st.rerun()
 st.sidebar.markdown("---")
 logout_button()
 
 # =========================================================
-# 8. GENERAL USER DASHBOARD
+# 8. EMPLOYEE DASHBOARD
 # =========================================================
-if user["role"] != "admin":
+if user["role"] == "user":
     company_header("👤 Employee Dashboard")
     tab1, tab2 = st.tabs(["📋 New Requisition", "📍 My Requests / Live Status"])
 
@@ -529,21 +646,135 @@ if user["role"] != "admin":
                         st.write(f"**Purpose:** {r['purpose']}")
                         if r["special_request"]:
                             st.write(f"**Special Request:** {r['special_request']}")
-                        if r["status"] == "Approved":
+
+                        if r["status"] in ("Approved", "On Trip", "Completed"):
+                            approved_time = r["time_of_travel"] if is_blank(r.get("approved_time")) else r.get("approved_time")
+                            time_note = (
+                                f" (rescheduled from {r['time_of_travel']})"
+                                if not is_blank(r.get("approved_time")) and r.get("approved_time") != r["time_of_travel"]
+                                else ""
+                            )
                             st.markdown(f"""
                             <div class="driver-box">
-                            🚘 <b>Driver:</b> {r['driver_name'] or 'TBD'} &nbsp;|&nbsp;
-                            📞 <b>Contact:</b> {r['driver_contact'] or 'TBD'} &nbsp;|&nbsp;
-                            🔢 <b>Vehicle No.:</b> {r['vehicle_number'] or 'TBD'}
+                            🚘 <b>Driver:</b> {fmt(r['driver_name'], 'TBD')} &nbsp;|&nbsp;
+                            📞 <b>Contact:</b> {fmt(r['driver_contact'], 'TBD')} &nbsp;|&nbsp;
+                            🔢 <b>Vehicle No.:</b> {fmt(r['vehicle_number'], 'TBD')} &nbsp;|&nbsp;
+                            🕒 <b>Approved Departure Time:</b> {approved_time}{time_note}
                             </div>
                             """, unsafe_allow_html=True)
-                        elif r["status"] == "Rejected":
+                            if not is_blank(r.get("admin_note")):
+                                st.caption(f"📝 Admin Note: {r['admin_note']}")
+
+                        if r["status"] in ("On Trip", "Completed"):
+                            st.write(f"**Gate Out (Actual Exit):** {fmt(r.get('actual_exit_time'))}  |  **Start KM:** {fmt(r.get('start_km'))}")
+                        if r["status"] == "Completed":
+                            st.write(f"**Gate In (Actual Return):** {fmt(r.get('actual_return_time'))}  |  **End KM:** {fmt(r.get('end_km'))}  |  **Total KM:** {fmt(r.get('total_km'))}")
+
+                        if r["status"] == "Rejected":
                             st.error("This request was rejected by the admin.")
+                            if not is_blank(r.get("admin_note")):
+                                st.caption(f"📝 Reason: {r['admin_note']}")
 
 # =========================================================
-# 9. ADMIN DASHBOARD
+# 9. SECURITY OFFICER DASHBOARD — Vehicle Gate In / Gate Out Panel
 # =========================================================
-else:
+elif user["role"] == "security_officer":
+    company_header("🛡️ Security Officer Dashboard — Vehicle Gate Panel")
+    st.caption(f"Logged in as {user['full_name']} — Security Officer")
+
+    tab_out, tab_in = st.tabs(["🚦 Ready to Depart (Approved Trips)", "🔁 Currently On Trip (Inbound Vehicles)"])
+
+    # ---------------- TAB 1: Ready to Depart ----------------
+    with tab_out:
+        st.subheader("Approved Trips Awaiting Gate Out")
+        with st.spinner("Loading approved trips..."):
+            ready_df = fetch_requisitions_by_status("Approved")
+
+        if ready_df.empty:
+            st.info("No trips are currently approved and waiting to depart.")
+        else:
+            for _, r in ready_df.iterrows():
+                approved_time = r["time_of_travel"] if is_blank(r.get("approved_time")) else r.get("approved_time")
+                with st.expander(f"🟢 {r['applicant_name']} ({r['department']}) → {r['destination']}  |  Vehicle: {fmt(r['vehicle_number'], 'N/A')}"):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.write(f"**Applicant Name:** {r['applicant_name']}")
+                        st.write(f"**Department:** {r['department']}")
+                        st.write(f"**Vehicle:** {fmt(r['vehicle_number'], 'N/A')} ({r['vehicle_type']})")
+                    with c2:
+                        st.write(f"**Destination:** {r['destination']}")
+                        st.write(f"**Requested Time:** {r['date_of_travel']} at {r['time_of_travel']}")
+                        st.write(f"**Admin Approved Time:** {approved_time}")
+                    if not is_blank(r.get("admin_note")):
+                        st.caption(f"📝 Admin Notes: {r['admin_note']}")
+
+                    with st.form(f"gateout_{r['request_id']}"):
+                        start_km = st.number_input("Start KM (Odometer Reading) *", min_value=0.0, step=1.0,
+                                                     format="%.1f", key=f"skm_{r['request_id']}")
+                        depart_clicked = st.form_submit_button("🚦 Gate Out / Depart", type="primary", use_container_width=True)
+
+                    if depart_clicked:
+                        try:
+                            update_requisition(r["request_id"], {
+                                "start_km": float(start_km),
+                                "actual_exit_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "status": "On Trip",
+                            })
+                            st.success(f"✅ Gate Out recorded for {r['applicant_name']} — vehicle is now On Trip.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Failed to record Gate Out: {e}")
+
+    # ---------------- TAB 2: Currently On Trip ----------------
+    with tab_in:
+        st.subheader("Vehicles Currently Outside the Gate")
+        with st.spinner("Loading active trips..."):
+            ontrip_df = fetch_requisitions_by_status("On Trip")
+
+        if ontrip_df.empty:
+            st.info("No vehicles are currently on a trip.")
+        else:
+            for _, r in ontrip_df.iterrows():
+                with st.expander(f"🔵 {r['applicant_name']} ({r['department']}) → {r['destination']}  |  Vehicle: {fmt(r['vehicle_number'], 'N/A')}"):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.write(f"**Applicant Name:** {r['applicant_name']}")
+                        st.write(f"**Vehicle:** {fmt(r['vehicle_number'], 'N/A')} ({r['vehicle_type']})")
+                        st.write(f"**Destination:** {r['destination']}")
+                    with c2:
+                        st.write(f"**Gate Out Time:** {fmt(r.get('actual_exit_time'))}")
+                        st.write(f"**Start KM:** {fmt(r.get('start_km'))}")
+
+                    start_km_val = 0.0 if is_blank(r.get("start_km")) else float(r.get("start_km"))
+                    with st.form(f"gatein_{r['request_id']}"):
+                        end_km = st.number_input(
+                            "End KM (Odometer Reading) *", min_value=start_km_val, step=1.0, format="%.1f",
+                            help=f"Must be greater than or equal to Start KM ({start_km_val:.1f}).",
+                            key=f"ekm_{r['request_id']}",
+                        )
+                        return_clicked = st.form_submit_button("🏁 Gate In / Complete", type="primary", use_container_width=True)
+
+                    if return_clicked:
+                        if end_km < start_km_val:
+                            st.error("End KM cannot be less than Start KM.")
+                        else:
+                            total_km = round(float(end_km) - start_km_val, 1)
+                            try:
+                                update_requisition(r["request_id"], {
+                                    "end_km": float(end_km),
+                                    "total_km": total_km,
+                                    "actual_return_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    "status": "Completed",
+                                })
+                                st.success(f"✅ Gate In recorded for {r['applicant_name']}. Total distance: **{total_km} KM**")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"❌ Failed to record Gate In: {e}")
+
+# =========================================================
+# 10. ADMIN DASHBOARD
+# =========================================================
+elif user["role"] == "admin":
     company_header("🔐 Admin Dashboard")
     st.caption(f"Logged in as {user['full_name']} — Admin")
 
@@ -563,10 +794,15 @@ else:
             st.success("🎉 No pending user registrations.")
         else:
             for _, u in pending_users.iterrows():
-                with st.expander(f"👤 {u['full_name']} — @{u['username']} ({u.get('department', '')})"):
-                    st.write(f"**Designation:** {u.get('designation', '')}")
-                    st.write(f"**Employee ID:** {u.get('employee_id', '')}")
-                    st.write(f"**Mobile:** {u.get('mobile', '')}")
+                role_tag = "🛡️ Security Officer" if u.get("role") == "security_officer" else "👤 Employee"
+                with st.expander(f"{role_tag} — {u['full_name']} (@{u['username']})"):
+                    if u.get("role") == "security_officer":
+                        st.write("**Role Requested:** Security Officer")
+                    else:
+                        st.write(f"**Designation:** {u.get('designation', '')}")
+                        st.write(f"**Employee ID:** {u.get('employee_id', '')}")
+                        st.write(f"**Department:** {u.get('department', '')}")
+                        st.write(f"**Mobile:** {u.get('mobile', '')}")
                     st.write(f"**Requested on:** {u.get('created_at', '')}")
                     c1, c2 = st.columns(2)
                     if c1.button("✅ Approve", key=f"appr_{u['username']}", type="primary", use_container_width=True):
@@ -586,8 +822,10 @@ else:
         else:
             display_cols = ["username", "full_name", "designation", "employee_id", "department",
                              "mobile", "role", "status", "created_at"]
-            st.dataframe(users_df[[c for c in display_cols if c in users_df.columns]],
-                         use_container_width=True, hide_index=True, height=300)
+            users_display = users_df[[c for c in display_cols if c in users_df.columns]].copy()
+            if "role" in users_display.columns:
+                users_display["role"] = users_display["role"].map(lambda r: ROLE_DISPLAY.get(r, r))
+            st.dataframe(users_display, use_container_width=True, hide_index=True, height=300)
 
             st.markdown("##### Change a user's role or status")
             approved_usernames = users_df["username"].tolist()
@@ -596,11 +834,13 @@ else:
                 rec = users_df[users_df["username"] == sel_user].iloc[0]
                 c1, c2, c3 = st.columns(3)
                 with c1:
-                    new_role = st.selectbox("Role", ["user", "admin"],
-                                             index=["user", "admin"].index(rec.get("role", "user")))
+                    current_role = rec.get("role", "user")
+                    new_role = st.selectbox("Role", ROLE_OPTIONS,
+                                             index=ROLE_OPTIONS.index(current_role) if current_role in ROLE_OPTIONS else 0,
+                                             format_func=lambda r: ROLE_DISPLAY.get(r, r))
                 with c2:
-                    new_status = st.selectbox("Status", STATUS_OPTIONS,
-                                               index=STATUS_OPTIONS.index(rec.get("status", "Pending")) if rec.get("status") in STATUS_OPTIONS else 0)
+                    new_status = st.selectbox("Status", USER_STATUS_OPTIONS,
+                                               index=USER_STATUS_OPTIONS.index(rec.get("status", "Pending")) if rec.get("status") in USER_STATUS_OPTIONS else 0)
                 with c3:
                     st.write("")
                     st.write("")
@@ -663,6 +903,22 @@ else:
                         with d3:
                             vehicle_number = st.text_input("Vehicle Number", key=f"vn_{r['request_id']}")
 
+                        try:
+                            default_time = datetime.strptime(r["time_of_travel"], "%H:%M").time()
+                        except (ValueError, TypeError):
+                            default_time = datetime.now().time()
+                        approved_time = st.time_input(
+                            "Approved Departure Time",
+                            value=default_time,
+                            help=f"Originally requested for {r['time_of_travel']}. Adjust if rescheduling.",
+                            key=f"atime_{r['request_id']}",
+                        )
+                        admin_note = st.text_area(
+                            "Admin Note / Remarks (optional)",
+                            placeholder="e.g., Rescheduled due to vehicle availability, or reason for rejection",
+                            key=f"note_{r['request_id']}",
+                        )
+
                         b1, b2 = st.columns(2)
                         approve_clicked = b1.form_submit_button("✅ Approve", type="primary", use_container_width=True)
                         reject_clicked = b2.form_submit_button("❌ Reject", use_container_width=True)
@@ -673,14 +929,18 @@ else:
                             st.error("Please fill Driver Name, Driver Contact, and Vehicle Number before approving.")
                         else:
                             try:
-                                update_requisition(r["request_id"], {
+                                updates = {
                                     "status": new_status,
                                     "driver_name": driver_name if approve_clicked else "",
                                     "driver_contact": driver_contact if approve_clicked else "",
                                     "vehicle_number": vehicle_number if approve_clicked else "",
                                     "approved_by": user["full_name"],
                                     "action_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                })
+                                    "admin_note": admin_note.strip(),
+                                }
+                                if approve_clicked:
+                                    updates["approved_time"] = approved_time.strftime("%H:%M")
+                                update_requisition(r["request_id"], updates)
                                 st.success(f"Request {r['request_id']} marked as {new_status}.")
                                 st.rerun()
                             except Exception as e:
@@ -692,11 +952,13 @@ else:
         if df_all.empty:
             st.info("No data yet.")
         else:
-            m1, m2, m3, m4 = st.columns(4)
+            m1, m2, m3, m4, m5, m6 = st.columns(6)
             m1.metric("Total Requests", len(df_all))
-            m2.metric("🟢 Approved", int((df_all["status"] == "Approved").sum()))
-            m3.metric("🔴 Rejected", int((df_all["status"] == "Rejected").sum()))
-            m4.metric("🟡 Pending", int((df_all["status"] == "Pending").sum()))
+            m2.metric("🟡 Pending", int((df_all["status"] == "Pending").sum()))
+            m3.metric("🟢 Approved", int((df_all["status"] == "Approved").sum()))
+            m4.metric("🔵 On Trip", int((df_all["status"] == "On Trip").sum()))
+            m5.metric("✅ Completed", int((df_all["status"] == "Completed").sum()))
+            m6.metric("🔴 Rejected", int((df_all["status"] == "Rejected").sum()))
 
             c1, c2 = st.columns(2)
             with c1:
@@ -711,9 +973,14 @@ else:
                 status_counts.columns = ["Status", "Count"]
                 fig2 = px.pie(status_counts, names="Status", values="Count", hole=0.45, title="Status Breakdown",
                               color="Status",
-                              color_discrete_map={"Approved": "#28a745", "Rejected": "#dc3545", "Pending": "#ffc107"})
+                              color_discrete_map={"Approved": "#28a745", "Rejected": "#dc3545", "Pending": "#ffc107",
+                                                   "On Trip": "#0d6efd", "Completed": "#17a673"})
                 fig2.update_layout(height=380)
                 st.plotly_chart(fig2, use_container_width=True)
+
+            if "total_km" in df_all.columns and df_all["total_km"].notna().any():
+                total_km_all = pd.to_numeric(df_all["total_km"], errors="coerce").dropna().sum()
+                st.metric("🛣️ Total KM Covered (Completed Trips)", f"{total_km_all:.1f} KM")
 
             df_all["_dt"] = pd.to_datetime(df_all["date_of_travel"], errors="coerce")
             monthly = df_all.dropna(subset=["_dt"]).copy()
@@ -734,7 +1001,7 @@ else:
             with f1:
                 dept_filter = st.multiselect("Department", sorted(df_all["department"].dropna().unique().tolist()))
             with f2:
-                status_filter = st.multiselect("Status", STATUS_OPTIONS)
+                status_filter = st.multiselect("Status", REQ_STATUS_OPTIONS)
             with f3:
                 dest_filter = st.text_input("Destination contains")
 
@@ -778,3 +1045,9 @@ else:
                                     file_name="vehicle_requisition_report.pdf",
                                     mime="application/pdf",
                                     use_container_width=True)
+
+# =========================================================
+# 11. FALLBACK — unrecognized role
+# =========================================================
+else:
+    st.error("⚠️ Your account role is not recognized. Please contact the Admin.")
