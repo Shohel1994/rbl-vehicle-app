@@ -29,14 +29,16 @@ COMPANY_NAME = "Renaissaince Barind Ltd."
 COMPANY_ADDRESS = "Ishwardi EPZ, Pakshi, Pabna"
 
 st.set_page_config(
-    page_title=f"{COMPANY_NAME} | Vehicle Management System",
-    page_icon="🚗",
+    page_title="RBL VMS",
+    page_icon="logo.png",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 USERS_TABLE = "users"
 REQUISITIONS_TABLE = "requisitions"
+DRIVERS_TABLE = "drivers"
+VEHICLES_TABLE = "vehicles"
 
 VEHICLE_TYPES = ["Private Car", "HIACE", "Pick-up Van", "Covered Van", "Truck", "Shipment Vehicle", "Other"]
 DEPARTMENTS = [
@@ -269,6 +271,41 @@ def fetch_requisitions_by_status(status: str) -> pd.DataFrame:
         "action_timestamp", "approved_time", "admin_note", "start_km", "end_km", "total_km",
         "actual_exit_time", "actual_return_time",
     ])
+
+
+# ------------------- DRIVERS & VEHICLES TABLE HELPERS -------------------
+# These back the dynamic dropdowns in the requisition-approval form so admins
+# maintain one source of truth instead of retyping names/numbers each time.
+def fetch_all_drivers() -> pd.DataFrame:
+    sb = get_supabase_client()
+    res = sb.table(DRIVERS_TABLE).select("*").order("driver_name").execute()
+    return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=["id", "driver_name", "driver_contact", "created_at"])
+
+
+def add_driver(driver_name: str, driver_contact: str):
+    sb = get_supabase_client()
+    sb.table(DRIVERS_TABLE).insert({"driver_name": driver_name, "driver_contact": driver_contact}).execute()
+
+
+def delete_driver(driver_id):
+    sb = get_supabase_client()
+    sb.table(DRIVERS_TABLE).delete().eq("id", driver_id).execute()
+
+
+def fetch_all_vehicles() -> pd.DataFrame:
+    sb = get_supabase_client()
+    res = sb.table(VEHICLES_TABLE).select("*").order("vehicle_number").execute()
+    return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=["id", "vehicle_number", "created_at"])
+
+
+def add_vehicle(vehicle_number: str):
+    sb = get_supabase_client()
+    sb.table(VEHICLES_TABLE).insert({"vehicle_number": vehicle_number}).execute()
+
+
+def delete_vehicle(vehicle_id):
+    sb = get_supabase_client()
+    sb.table(VEHICLES_TABLE).delete().eq("id", vehicle_id).execute()
 
 
 # =========================================================
@@ -778,9 +815,9 @@ elif user["role"] == "admin":
     company_header("🔐 Admin Dashboard")
     st.caption(f"Logged in as {user['full_name']} — Admin")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "⏳ Pending User Approvals", "👥 All Users", "🚗 Pending Requisitions",
-        "📊 Analytics", "📁 All Requisitions & Export",
+        "📊 Analytics", "📁 All Requisitions & Export", "🚘 Manage Drivers & Vehicles",
     ])
 
     # ---------------- TAB 1: Pending User Approvals ----------------
@@ -879,6 +916,20 @@ elif user["role"] == "admin":
             df_all = fetch_all_requisitions()
         pending_df = df_all[df_all["status"] == "Pending"] if not df_all.empty else df_all
 
+        # Fetched once for this tab render and shared across every pending-request
+        # card below, so each dropdown reflects the same up-to-date driver/vehicle list.
+        drivers_df = fetch_all_drivers()
+        vehicles_df = fetch_all_vehicles()
+        driver_contact_map = dict(zip(drivers_df["driver_name"], drivers_df["driver_contact"])) if not drivers_df.empty else {}
+        driver_options = ["— Select Driver —"] + drivers_df["driver_name"].tolist() if not drivers_df.empty else []
+        vehicle_options = ["— Select Vehicle —"] + vehicles_df["vehicle_number"].tolist() if not vehicles_df.empty else []
+
+        if drivers_df.empty or vehicles_df.empty:
+            st.warning(
+                "⚠️ No drivers and/or vehicles are registered yet. Add them under the "
+                "**🚘 Manage Drivers & Vehicles** tab before you can approve requests."
+            )
+
         if pending_df.empty:
             st.success("🎉 No pending requisitions — all caught up!")
         else:
@@ -894,15 +945,26 @@ elif user["role"] == "admin":
                         st.write(f"**Purpose:** {r['purpose']}")
                         st.write(f"**Special Request:** {r['special_request'] or '—'}")
 
-                    with st.form(f"action_{r['request_id']}"):
-                        d1, d2, d3 = st.columns(3)
-                        with d1:
-                            driver_name = st.text_input("Driver Name", key=f"dn_{r['request_id']}")
-                        with d2:
-                            driver_contact = st.text_input("Driver Contact", key=f"dc_{r['request_id']}")
-                        with d3:
-                            vehicle_number = st.text_input("Vehicle Number", key=f"vn_{r['request_id']}")
+                    # These two selects live OUTSIDE the form on purpose: widgets inside
+                    # an st.form don't rerun the script until submit, so picking a driver
+                    # wouldn't reveal their contact number until after clicking Approve.
+                    # Outside the form, the contact updates the instant a driver is chosen.
+                    d1, d2 = st.columns(2)
+                    with d1:
+                        selected_driver = st.selectbox(
+                            "Driver Name", driver_options or ["No drivers available"],
+                            key=f"drv_{r['request_id']}", disabled=not driver_options,
+                        )
+                    with d2:
+                        bound_contact = driver_contact_map.get(selected_driver, "")
+                        st.text_input("Driver Contact (auto-filled)", value=bound_contact, disabled=True,
+                                      key=f"dc_disp_{r['request_id']}")
+                    selected_vehicle = st.selectbox(
+                        "Vehicle Number", vehicle_options or ["No vehicles available"],
+                        key=f"veh_{r['request_id']}", disabled=not vehicle_options,
+                    )
 
+                    with st.form(f"action_{r['request_id']}"):
                         try:
                             default_time = datetime.strptime(r["time_of_travel"], "%H:%M").time()
                         except (ValueError, TypeError):
@@ -925,15 +987,17 @@ elif user["role"] == "admin":
 
                     if approve_clicked or reject_clicked:
                         new_status = "Approved" if approve_clicked else "Rejected"
-                        if approve_clicked and not (driver_name and driver_contact and vehicle_number):
-                            st.error("Please fill Driver Name, Driver Contact, and Vehicle Number before approving.")
+                        driver_ready = driver_options and selected_driver != "— Select Driver —"
+                        vehicle_ready = vehicle_options and selected_vehicle != "— Select Vehicle —"
+                        if approve_clicked and not (driver_ready and vehicle_ready):
+                            st.error("Please select a Driver and a Vehicle before approving.")
                         else:
                             try:
                                 updates = {
                                     "status": new_status,
-                                    "driver_name": driver_name if approve_clicked else "",
-                                    "driver_contact": driver_contact if approve_clicked else "",
-                                    "vehicle_number": vehicle_number if approve_clicked else "",
+                                    "driver_name": selected_driver if approve_clicked else "",
+                                    "driver_contact": driver_contact_map.get(selected_driver, "") if approve_clicked else "",
+                                    "vehicle_number": selected_vehicle if approve_clicked else "",
                                     "approved_by": user["full_name"],
                                     "action_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                     "admin_note": admin_note.strip(),
@@ -1045,6 +1109,82 @@ elif user["role"] == "admin":
                                     file_name="vehicle_requisition_report.pdf",
                                     mime="application/pdf",
                                     use_container_width=True)
+
+    # ---------------- TAB 6: Manage Drivers & Vehicles ----------------
+    with tab6:
+        st.subheader("🚘 Manage Drivers & Vehicles")
+        st.caption("These lists power the Driver and Vehicle dropdowns admins use when approving requisitions.")
+
+        dcol, vcol = st.columns(2)
+
+        # ---- Drivers ----
+        with dcol:
+            st.markdown("##### 👨‍✈️ Drivers")
+            with st.form("add_driver_form", clear_on_submit=True):
+                new_driver_name = st.text_input("Driver Name *")
+                new_driver_contact = st.text_input("Driver Contact *", placeholder="017XXXXXXXX")
+                add_driver_clicked = st.form_submit_button("➕ Add Driver", type="primary", use_container_width=True)
+
+            if add_driver_clicked:
+                if not new_driver_name.strip() or not new_driver_contact.strip():
+                    st.error("Both Driver Name and Driver Contact are required.")
+                else:
+                    try:
+                        add_driver(new_driver_name.strip(), new_driver_contact.strip())
+                        st.success(f"✅ Driver '{new_driver_name.strip()}' added.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ Failed to add driver: {e}")
+
+            st.markdown("###### Current Drivers")
+            drivers_df_mgmt = fetch_all_drivers()
+            if drivers_df_mgmt.empty:
+                st.info("No drivers added yet.")
+            else:
+                for _, d in drivers_df_mgmt.iterrows():
+                    r1, r2 = st.columns([4, 1])
+                    r1.write(f"**{d['driver_name']}** — {d['driver_contact']}")
+                    if r2.button("🗑️", key=f"del_drv_{d['id']}", help="Delete this driver"):
+                        try:
+                            delete_driver(d["id"])
+                            st.success(f"Deleted driver '{d['driver_name']}'.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Failed to delete driver: {e}")
+
+        # ---- Vehicles ----
+        with vcol:
+            st.markdown("##### 🚐 Vehicles")
+            with st.form("add_vehicle_form", clear_on_submit=True):
+                new_vehicle_number = st.text_input("Vehicle Number *", placeholder="e.g. DHK-METRO-GA-1234")
+                add_vehicle_clicked = st.form_submit_button("➕ Add Vehicle", type="primary", use_container_width=True)
+
+            if add_vehicle_clicked:
+                if not new_vehicle_number.strip():
+                    st.error("Vehicle Number is required.")
+                else:
+                    try:
+                        add_vehicle(new_vehicle_number.strip())
+                        st.success(f"✅ Vehicle '{new_vehicle_number.strip()}' added.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ Failed to add vehicle: {e}")
+
+            st.markdown("###### Current Vehicles")
+            vehicles_df_mgmt = fetch_all_vehicles()
+            if vehicles_df_mgmt.empty:
+                st.info("No vehicles added yet.")
+            else:
+                for _, v in vehicles_df_mgmt.iterrows():
+                    r1, r2 = st.columns([4, 1])
+                    r1.write(f"**{v['vehicle_number']}**")
+                    if r2.button("🗑️", key=f"del_veh_{v['id']}", help="Delete this vehicle"):
+                        try:
+                            delete_vehicle(v["id"])
+                            st.success(f"Deleted vehicle '{v['vehicle_number']}'.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Failed to delete vehicle: {e}")
 
 # =========================================================
 # 11. FALLBACK — unrecognized role
