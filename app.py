@@ -10,12 +10,9 @@ Author: Senior Python Developer (generated for Shohel Rana)
 """
 
 import io
-import os
-import base64
 import hashlib
 import random
-from datetime import datetime, date, timedelta
-from secrets import token_urlsafe
+from datetime import datetime, date
 
 import pandas as pd
 import plotly.express as px
@@ -24,8 +21,6 @@ from supabase import create_client, Client
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 from fpdf.fonts import FontFace
-from streamlit_autorefresh import st_autorefresh
-import extra_streamlit_components as stx
 
 # =========================================================
 # 1. COMPANY INFO & PAGE CONFIG
@@ -34,21 +29,14 @@ COMPANY_NAME = "Renaissaince Barind Ltd."
 COMPANY_ADDRESS = "Ishwardi EPZ, Pakshi, Pabna"
 
 st.set_page_config(
-    page_title="RBL VMS",
-    page_icon="logo.png",
+    page_title=f"{COMPANY_NAME} | Vehicle Management System",
+    page_icon="🚗",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 USERS_TABLE = "users"
 REQUISITIONS_TABLE = "requisitions"
-DRIVERS_TABLE = "drivers"
-VEHICLES_TABLE = "vehicles"
-SESSIONS_TABLE = "sessions"
-
-SESSION_COOKIE_NAME = "rbl_vms_session"
-SESSION_LIFETIME_DAYS = 30
-LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo.png")
 
 VEHICLE_TYPES = ["Private Car", "HIACE", "Pick-up Van", "Covered Van", "Truck", "Shipment Vehicle", "Other"]
 DEPARTMENTS = [
@@ -74,18 +62,6 @@ STATUS_BADGE = {
 # =========================================================
 st.markdown("""
 <style>
-    /* ---- Hide default Streamlit branding/chrome ----
-       Deliberately NOT touching [data-testid="collapsedControl"] (the sidebar
-       hamburger toggle) — that lives outside <header> in current Streamlit
-       versions, so hiding the header/menu/footer/toolbar below does not
-       affect the mobile sidebar-open control. */
-    #MainMenu { visibility: hidden; }
-    footer { visibility: hidden; }
-    header { visibility: hidden; }
-    [data-testid="stToolbar"] { visibility: hidden; }
-    .stDeployButton { display: none; }
-    [data-testid="collapsedControl"] { visibility: visible; }
-
     /* ---- Base (desktop / Windows browser) ---- */
     .main > div { padding-top: 1.2rem; }
     div.stButton > button { border-radius: 8px; font-weight: 600; }
@@ -104,19 +80,9 @@ st.markdown("""
     .company-banner {
         text-align:center; padding: 6px 8px 14px 8px;
     }
-    .company-banner .logo-row {
-        display:flex; align-items:center; justify-content:center; gap:12px; margin-bottom:2px;
-    }
-    .company-banner .logo-row img { height:44px; width:auto; }
-    .company-banner h1 { margin: 0; font-size: 1.9rem; }
+    .company-banner h1 { margin-bottom: 2px; font-size: 1.9rem; }
     .company-banner .addr { color:#555; font-weight:600; margin:0 0 4px 0; }
     .company-banner .tag  { color:#888; margin:0; font-size:0.95rem; }
-
-    .sidebar-brand {
-        display:flex; align-items:center; gap:10px; margin-bottom:4px;
-    }
-    .sidebar-brand img { height:32px; width:auto; }
-    .sidebar-brand span { font-size:1.15rem; font-weight:700; line-height:1.2; }
 
     /* Let wide tables/dataframes scroll horizontally instead of squeezing on small screens */
     .stDataFrame, .stDataEditor { overflow-x: auto; }
@@ -125,7 +91,6 @@ st.markdown("""
     @media (max-width: 640px) {
         .main > div { padding-top: 0.6rem; padding-left: 0.6rem; padding-right: 0.6rem; }
         .company-banner h1 { font-size: 1.35rem; }
-        .company-banner .logo-row img { height:32px; }
         .company-banner .addr { font-size: 0.85rem; }
         .company-banner .tag  { font-size: 0.8rem; }
         .req-card { padding: 10px 12px; font-size: 0.9rem; }
@@ -137,31 +102,12 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-@st.cache_data(show_spinner=False)
-def get_logo_base64():
-    """Read logo.png (same folder as app.py) once and cache it as a base64 data
-    URI, so it can be embedded inline in HTML headers. Returns None if the file
-    isn't present — callers fall back to text-only branding rather than crash
-    or show a broken-image icon."""
-    try:
-        with open(LOGO_PATH, "rb") as f:
-            encoded = base64.b64encode(f.read()).decode("utf-8")
-        return f"data:image/png;base64,{encoded}"
-    except FileNotFoundError:
-        return None
-
-
 def company_header(subtitle: str = ""):
     """Reusable company name + address banner, shown at the top of every dashboard."""
-    logo_uri = get_logo_base64()
-    logo_img = f'<img src="{logo_uri}" alt="logo">' if logo_uri else ""
     st.markdown(
         f"""
         <div class="company-banner">
-            <div class="logo-row">
-                {logo_img}
-                <h1>{COMPANY_NAME}</h1>
-            </div>
+            <h1>🚗 {COMPANY_NAME}</h1>
             <p class="addr">📍 {COMPANY_ADDRESS}</p>
             {f'<p class="tag">{subtitle}</p>' if subtitle else ''}
         </div>
@@ -325,98 +271,6 @@ def fetch_requisitions_by_status(status: str) -> pd.DataFrame:
     ])
 
 
-# ------------------- DRIVERS & VEHICLES TABLE HELPERS -------------------
-# These back the dynamic dropdowns in the requisition-approval form so admins
-# maintain one source of truth instead of retyping names/numbers each time.
-def fetch_all_drivers() -> pd.DataFrame:
-    sb = get_supabase_client()
-    res = sb.table(DRIVERS_TABLE).select("*").order("driver_name").execute()
-    return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=["id", "driver_name", "driver_contact", "created_at"])
-
-
-def add_driver(driver_name: str, driver_contact: str):
-    sb = get_supabase_client()
-    sb.table(DRIVERS_TABLE).insert({"driver_name": driver_name, "driver_contact": driver_contact}).execute()
-
-
-def delete_driver(driver_id):
-    sb = get_supabase_client()
-    sb.table(DRIVERS_TABLE).delete().eq("id", driver_id).execute()
-
-
-def fetch_all_vehicles() -> pd.DataFrame:
-    sb = get_supabase_client()
-    res = sb.table(VEHICLES_TABLE).select("*").order("vehicle_number").execute()
-    return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=["id", "vehicle_number", "created_at"])
-
-
-def add_vehicle(vehicle_number: str):
-    sb = get_supabase_client()
-    sb.table(VEHICLES_TABLE).insert({"vehicle_number": vehicle_number}).execute()
-
-
-def delete_vehicle(vehicle_id):
-    sb = get_supabase_client()
-    sb.table(VEHICLES_TABLE).delete().eq("id", vehicle_id).execute()
-
-
-# ------------------- SESSION (REMEMBER ME) HELPERS -------------------
-# A "remember me" cookie stores only an opaque, unguessable token — never the
-# username or password directly — so a leaked/inspected cookie can't be used
-# to reconstruct credentials. The token maps to a username via this table and
-# expires automatically, and is revoked (deleted) on explicit logout.
-def create_session(username: str) -> str:
-    sb = get_supabase_client()
-    token = token_urlsafe(32)
-    expires_at = (datetime.utcnow() + timedelta(days=SESSION_LIFETIME_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
-    sb.table(SESSIONS_TABLE).insert({
-        "token": token, "username": username, "expires_at": expires_at,
-    }).execute()
-    return token
-
-
-def get_session_username(token: str):
-    """Return the username for a still-valid session token, or None."""
-    if not token:
-        return None
-    sb = get_supabase_client()
-    res = sb.table(SESSIONS_TABLE).select("*").eq("token", token).limit(1).execute()
-    if not res.data:
-        return None
-    row = res.data[0]
-    try:
-        # PostgREST reads timestamptz columns back in ISO 8601 with a 'T'
-        # separator and often a timezone offset (e.g. "...T14:22:30.123+00:00"),
-        # which differs from the space-separated string we wrote on insert —
-        # normalize both shapes before parsing so expiry checks don't silently
-        # fail (and reject) every real session.
-        raw = row["expires_at"].replace("T", " ")
-        expires_at = datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S")
-    except (ValueError, TypeError, KeyError, AttributeError):
-        return None
-    if expires_at < datetime.utcnow():
-        return None
-    return row["username"]
-
-
-def delete_session(token: str):
-    if not token:
-        return
-    sb = get_supabase_client()
-    sb.table(SESSIONS_TABLE).delete().eq("token", token).execute()
-
-
-def get_cookie_manager():
-    """Returns a CookieManager. Deliberately NOT wrapped in st.cache_resource:
-    that cache is shared globally across every visitor's session on the
-    server, and caching a stateful per-browser cookie wrapper there would
-    leak one user's session cookie into another user's script run. Streamlit's
-    component protocol is already session-scoped on its own, so a fresh,
-    cheap instantiation on every rerun is the correct (and documented)
-    pattern for this library."""
-    return stx.CookieManager(key="rbl_vms_cookie_manager")
-
-
 # =========================================================
 # 4. AUTH: SIGN IN + SELF REGISTRATION
 # =========================================================
@@ -429,28 +283,11 @@ def get_bootstrap_admin():
         return None, None
 
 
-def build_bootstrap_user_dict(username: str) -> dict:
-    return {"username": username, "full_name": "Super Admin (Bootstrap)", "role": "admin",
-            "department": "Management", "designation": "System Administrator", "mobile": ""}
-
-
-def build_user_dict(record: dict) -> dict:
-    """Shared by both password login and cookie-based session restore, so the
-    session_state.auth_user shape never drifts between the two paths."""
-    return {
-        "username": record["username"],
-        "full_name": record.get("full_name", record["username"]),
-        "role": record.get("role", "user"),
-        "department": record.get("department", ""),
-        "designation": record.get("designation", ""),
-        "mobile": record.get("mobile", ""),
-    }
-
-
 def attempt_login(username: str, password: str):
     boot_user, boot_pass = get_bootstrap_admin()
     if boot_user and username == boot_user and password == boot_pass:
-        return build_bootstrap_user_dict(username)
+        return {"username": username, "full_name": "Super Admin (Bootstrap)", "role": "admin",
+                "department": "Management", "designation": "System Administrator"}
 
     record = get_user_by_username(username)
     if not record:
@@ -460,20 +297,13 @@ def attempt_login(username: str, password: str):
         return "PENDING"
     if record.get("password") != hash_password(password):
         return None
-    return build_user_dict(record)
-
-
-def restore_user_from_username(username: str):
-    """Used only for cookie-based 'remember me' restore — re-validates the
-    account is still Approved (in case it was later revoked/rejected) before
-    trusting the session token."""
-    boot_user, _ = get_bootstrap_admin()
-    if boot_user and username == boot_user:
-        return build_bootstrap_user_dict(username)
-    record = get_user_by_username(username)
-    if record and record.get("status") == "Approved":
-        return build_user_dict(record)
-    return None
+    return {
+        "username": record["username"],
+        "full_name": record.get("full_name", username),
+        "role": record.get("role", "user"),
+        "department": record.get("department", ""),
+        "designation": record.get("designation", ""),
+    }
 
 
 def login_view():
@@ -497,7 +327,6 @@ def login_view():
             with st.form("login_form"):
                 username = st.text_input("Username")
                 password = st.text_input("Password", type="password")
-                remember_me = st.checkbox("Remember me on this device", value=True)
                 submitted = st.form_submit_button("Login", type="primary", use_container_width=True)
 
             if submitted:
@@ -507,17 +336,6 @@ def login_view():
                 elif result is None:
                     st.error("❌ Invalid username or password.")
                 else:
-                    session_token = None
-                    if remember_me:
-                        try:
-                            session_token = create_session(result["username"])
-                            cookie_manager.set(
-                                SESSION_COOKIE_NAME, session_token, key="set_login_cookie",
-                                expires_at=datetime.now() + timedelta(days=SESSION_LIFETIME_DAYS),
-                            )
-                        except Exception:
-                            session_token = None  # Remember-me is best-effort; login still succeeds without it.
-                    result["session_token"] = session_token
                     st.session_state.auth_user = result
                     st.rerun()
 
@@ -622,16 +440,6 @@ def login_view():
 
 def logout_button():
     if st.sidebar.button("🚪 Logout", use_container_width=True):
-        token = st.session_state.get("auth_user", {}).get("session_token")
-        if token:
-            try:
-                delete_session(token)
-            except Exception:
-                pass  # DB cleanup is best-effort; logout must still proceed either way.
-        try:
-            cookie_manager.delete(SESSION_COOKIE_NAME, key="delete_logout_cookie")
-        except KeyError:
-            pass  # No cookie was ever set for this session — nothing to remove.
         del st.session_state["auth_user"]
         st.rerun()
 
@@ -726,62 +534,26 @@ def build_pdf_report(df: pd.DataFrame, filters_summary: str) -> bytes:
 
 
 # =========================================================
-# 6. SESSION STATE INIT (with "Remember Me" cookie restore)
+# 6. SESSION STATE INIT
 # =========================================================
-# Instantiated exactly once per script run — the underlying component uses a
-# fixed key, and Streamlit errors on duplicate keys within a single run, so
-# every other place in this file that needs cookies reuses this same object
-# rather than calling get_cookie_manager() again.
-cookie_manager = get_cookie_manager()
-
 if "auth_user" not in st.session_state:
-    restored_user = None
-    session_token = cookie_manager.get(SESSION_COOKIE_NAME)
-    if session_token:
-        remembered_username = get_session_username(session_token)
-        if remembered_username:
-            restored_user = restore_user_from_username(remembered_username)
-        if restored_user:
-            restored_user["session_token"] = session_token
-            st.session_state.auth_user = restored_user
-        else:
-            # Token is missing/expired/revoked, or the account is no longer
-            # Approved — clear the stale cookie so we don't keep retrying it.
-            try:
-                cookie_manager.delete(SESSION_COOKIE_NAME, key="delete_stale_cookie")
-            except KeyError:
-                pass
-
-    if "auth_user" not in st.session_state:
-        login_view()
-        st.stop()
+    login_view()
+    st.stop()
 
 user = st.session_state.auth_user
 
 # =========================================================
 # 7. SIDEBAR
 # =========================================================
-logo_uri = get_logo_base64()
-logo_img = f'<img src="{logo_uri}" alt="logo">' if logo_uri else ""
-st.sidebar.markdown(
-    f'<div class="sidebar-brand">{logo_img}<span>{COMPANY_NAME}</span></div>',
-    unsafe_allow_html=True,
-)
+st.sidebar.title(f"🚗 {COMPANY_NAME}")
 st.sidebar.caption(f"📍 {COMPANY_ADDRESS}")
 st.sidebar.markdown("---")
 st.sidebar.markdown(f"**{user['full_name']}**")
 st.sidebar.caption(f"Role: {ROLE_DISPLAY.get(user['role'], user['role'].capitalize())}")
-
-auto_refresh_on = st.sidebar.checkbox("🔄 Auto-refresh every 10s", value=True,
-                                       help="Automatically reloads live data across the app. "
-                                            "Turn off temporarily if you're filling out a long form.")
-if st.sidebar.button("🔄 Refresh Now", use_container_width=True):
+if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
     st.rerun()
 st.sidebar.markdown("---")
 logout_button()
-
-if auto_refresh_on:
-    st_autorefresh(interval=10_000, key="global_autorefresh")
 
 # =========================================================
 # 8. EMPLOYEE DASHBOARD
@@ -798,8 +570,7 @@ if user["role"] == "user":
                 applicant_name = st.text_input("Applicant Name *", value=user["full_name"])
                 department = st.selectbox("Department *", DEPARTMENTS,
                                            index=DEPARTMENTS.index(user["department"]) if user.get("department") in DEPARTMENTS else 0)
-                mobile_number = st.text_input("Mobile Number *", value=user.get("mobile", ""),
-                                               placeholder="01XXXXXXXXX")
+                mobile_number = st.text_input("Mobile Number *", placeholder="01XXXXXXXXX")
                 passenger_count = st.number_input("Passenger Count *", min_value=1, max_value=50, value=1)
             with c2:
                 date_of_travel = st.date_input("Date of Travel *", min_value=date.today())
@@ -1007,9 +778,9 @@ elif user["role"] == "admin":
     company_header("🔐 Admin Dashboard")
     st.caption(f"Logged in as {user['full_name']} — Admin")
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "⏳ Pending User Approvals", "👥 All Users", "🚗 Pending Requisitions",
-        "📊 Analytics", "📁 All Requisitions & Export", "🚘 Manage Drivers & Vehicles",
+        "📊 Analytics", "📁 All Requisitions & Export",
     ])
 
     # ---------------- TAB 1: Pending User Approvals ----------------
@@ -1108,20 +879,6 @@ elif user["role"] == "admin":
             df_all = fetch_all_requisitions()
         pending_df = df_all[df_all["status"] == "Pending"] if not df_all.empty else df_all
 
-        # Fetched once for this tab render and shared across every pending-request
-        # card below, so each dropdown reflects the same up-to-date driver/vehicle list.
-        drivers_df = fetch_all_drivers()
-        vehicles_df = fetch_all_vehicles()
-        driver_contact_map = dict(zip(drivers_df["driver_name"], drivers_df["driver_contact"])) if not drivers_df.empty else {}
-        driver_options = ["— Select Driver —"] + drivers_df["driver_name"].tolist() if not drivers_df.empty else []
-        vehicle_options = ["— Select Vehicle —"] + vehicles_df["vehicle_number"].tolist() if not vehicles_df.empty else []
-
-        if drivers_df.empty or vehicles_df.empty:
-            st.warning(
-                "⚠️ No drivers and/or vehicles are registered yet. Add them under the "
-                "**🚘 Manage Drivers & Vehicles** tab before you can approve requests."
-            )
-
         if pending_df.empty:
             st.success("🎉 No pending requisitions — all caught up!")
         else:
@@ -1137,26 +894,15 @@ elif user["role"] == "admin":
                         st.write(f"**Purpose:** {r['purpose']}")
                         st.write(f"**Special Request:** {r['special_request'] or '—'}")
 
-                    # These two selects live OUTSIDE the form on purpose: widgets inside
-                    # an st.form don't rerun the script until submit, so picking a driver
-                    # wouldn't reveal their contact number until after clicking Approve.
-                    # Outside the form, the contact updates the instant a driver is chosen.
-                    d1, d2 = st.columns(2)
-                    with d1:
-                        selected_driver = st.selectbox(
-                            "Driver Name", driver_options or ["No drivers available"],
-                            key=f"drv_{r['request_id']}", disabled=not driver_options,
-                        )
-                    with d2:
-                        bound_contact = driver_contact_map.get(selected_driver, "")
-                        st.text_input("Driver Contact (auto-filled)", value=bound_contact, disabled=True,
-                                      key=f"dc_disp_{r['request_id']}")
-                    selected_vehicle = st.selectbox(
-                        "Vehicle Number", vehicle_options or ["No vehicles available"],
-                        key=f"veh_{r['request_id']}", disabled=not vehicle_options,
-                    )
-
                     with st.form(f"action_{r['request_id']}"):
+                        d1, d2, d3 = st.columns(3)
+                        with d1:
+                            driver_name = st.text_input("Driver Name", key=f"dn_{r['request_id']}")
+                        with d2:
+                            driver_contact = st.text_input("Driver Contact", key=f"dc_{r['request_id']}")
+                        with d3:
+                            vehicle_number = st.text_input("Vehicle Number", key=f"vn_{r['request_id']}")
+
                         try:
                             default_time = datetime.strptime(r["time_of_travel"], "%H:%M").time()
                         except (ValueError, TypeError):
@@ -1179,17 +925,15 @@ elif user["role"] == "admin":
 
                     if approve_clicked or reject_clicked:
                         new_status = "Approved" if approve_clicked else "Rejected"
-                        driver_ready = driver_options and selected_driver != "— Select Driver —"
-                        vehicle_ready = vehicle_options and selected_vehicle != "— Select Vehicle —"
-                        if approve_clicked and not (driver_ready and vehicle_ready):
-                            st.error("Please select a Driver and a Vehicle before approving.")
+                        if approve_clicked and not (driver_name and driver_contact and vehicle_number):
+                            st.error("Please fill Driver Name, Driver Contact, and Vehicle Number before approving.")
                         else:
                             try:
                                 updates = {
                                     "status": new_status,
-                                    "driver_name": selected_driver if approve_clicked else "",
-                                    "driver_contact": driver_contact_map.get(selected_driver, "") if approve_clicked else "",
-                                    "vehicle_number": selected_vehicle if approve_clicked else "",
+                                    "driver_name": driver_name if approve_clicked else "",
+                                    "driver_contact": driver_contact if approve_clicked else "",
+                                    "vehicle_number": vehicle_number if approve_clicked else "",
                                     "approved_by": user["full_name"],
                                     "action_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                     "admin_note": admin_note.strip(),
@@ -1301,82 +1045,6 @@ elif user["role"] == "admin":
                                     file_name="vehicle_requisition_report.pdf",
                                     mime="application/pdf",
                                     use_container_width=True)
-
-    # ---------------- TAB 6: Manage Drivers & Vehicles ----------------
-    with tab6:
-        st.subheader("🚘 Manage Drivers & Vehicles")
-        st.caption("These lists power the Driver and Vehicle dropdowns admins use when approving requisitions.")
-
-        dcol, vcol = st.columns(2)
-
-        # ---- Drivers ----
-        with dcol:
-            st.markdown("##### 👨‍✈️ Drivers")
-            with st.form("add_driver_form", clear_on_submit=True):
-                new_driver_name = st.text_input("Driver Name *")
-                new_driver_contact = st.text_input("Driver Contact *", placeholder="017XXXXXXXX")
-                add_driver_clicked = st.form_submit_button("➕ Add Driver", type="primary", use_container_width=True)
-
-            if add_driver_clicked:
-                if not new_driver_name.strip() or not new_driver_contact.strip():
-                    st.error("Both Driver Name and Driver Contact are required.")
-                else:
-                    try:
-                        add_driver(new_driver_name.strip(), new_driver_contact.strip())
-                        st.success(f"✅ Driver '{new_driver_name.strip()}' added.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"❌ Failed to add driver: {e}")
-
-            st.markdown("###### Current Drivers")
-            drivers_df_mgmt = fetch_all_drivers()
-            if drivers_df_mgmt.empty:
-                st.info("No drivers added yet.")
-            else:
-                for _, d in drivers_df_mgmt.iterrows():
-                    r1, r2 = st.columns([4, 1])
-                    r1.write(f"**{d['driver_name']}** — {d['driver_contact']}")
-                    if r2.button("🗑️", key=f"del_drv_{d['id']}", help="Delete this driver"):
-                        try:
-                            delete_driver(d["id"])
-                            st.success(f"Deleted driver '{d['driver_name']}'.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"❌ Failed to delete driver: {e}")
-
-        # ---- Vehicles ----
-        with vcol:
-            st.markdown("##### 🚐 Vehicles")
-            with st.form("add_vehicle_form", clear_on_submit=True):
-                new_vehicle_number = st.text_input("Vehicle Number *", placeholder="e.g. DHK-METRO-GA-1234")
-                add_vehicle_clicked = st.form_submit_button("➕ Add Vehicle", type="primary", use_container_width=True)
-
-            if add_vehicle_clicked:
-                if not new_vehicle_number.strip():
-                    st.error("Vehicle Number is required.")
-                else:
-                    try:
-                        add_vehicle(new_vehicle_number.strip())
-                        st.success(f"✅ Vehicle '{new_vehicle_number.strip()}' added.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"❌ Failed to add vehicle: {e}")
-
-            st.markdown("###### Current Vehicles")
-            vehicles_df_mgmt = fetch_all_vehicles()
-            if vehicles_df_mgmt.empty:
-                st.info("No vehicles added yet.")
-            else:
-                for _, v in vehicles_df_mgmt.iterrows():
-                    r1, r2 = st.columns([4, 1])
-                    r1.write(f"**{v['vehicle_number']}**")
-                    if r2.button("🗑️", key=f"del_veh_{v['id']}", help="Delete this vehicle"):
-                        try:
-                            delete_vehicle(v["id"])
-                            st.success(f"Deleted vehicle '{v['vehicle_number']}'.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"❌ Failed to delete vehicle: {e}")
 
 # =========================================================
 # 11. FALLBACK — unrecognized role
