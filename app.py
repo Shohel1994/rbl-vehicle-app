@@ -10,9 +10,12 @@ Author: Senior Python Developer (generated for Shohel Rana)
 """
 
 import io
+import os
+import base64
 import hashlib
 import random
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
+from secrets import token_urlsafe
 
 import pandas as pd
 import plotly.express as px
@@ -21,6 +24,8 @@ from supabase import create_client, Client
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 from fpdf.fonts import FontFace
+from streamlit_autorefresh import st_autorefresh
+import extra_streamlit_components as stx
 
 # =========================================================
 # 1. COMPANY INFO & PAGE CONFIG
@@ -39,6 +44,11 @@ USERS_TABLE = "users"
 REQUISITIONS_TABLE = "requisitions"
 DRIVERS_TABLE = "drivers"
 VEHICLES_TABLE = "vehicles"
+SESSIONS_TABLE = "sessions"
+
+SESSION_COOKIE_NAME = "rbl_vms_session"
+SESSION_LIFETIME_DAYS = 30
+LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo.png")
 
 VEHICLE_TYPES = ["Private Car", "HIACE", "Pick-up Van", "Covered Van", "Truck", "Shipment Vehicle", "Other"]
 DEPARTMENTS = [
@@ -64,6 +74,18 @@ STATUS_BADGE = {
 # =========================================================
 st.markdown("""
 <style>
+    /* ---- Hide default Streamlit branding/chrome ----
+       Deliberately NOT touching [data-testid="collapsedControl"] (the sidebar
+       hamburger toggle) — that lives outside <header> in current Streamlit
+       versions, so hiding the header/menu/footer/toolbar below does not
+       affect the mobile sidebar-open control. */
+    #MainMenu { visibility: hidden; }
+    footer { visibility: hidden; }
+    header { visibility: hidden; }
+    [data-testid="stToolbar"] { visibility: hidden; }
+    .stDeployButton { display: none; }
+    [data-testid="collapsedControl"] { visibility: visible; }
+
     /* ---- Base (desktop / Windows browser) ---- */
     .main > div { padding-top: 1.2rem; }
     div.stButton > button { border-radius: 8px; font-weight: 600; }
@@ -82,9 +104,19 @@ st.markdown("""
     .company-banner {
         text-align:center; padding: 6px 8px 14px 8px;
     }
-    .company-banner h1 { margin-bottom: 2px; font-size: 1.9rem; }
+    .company-banner .logo-row {
+        display:flex; align-items:center; justify-content:center; gap:12px; margin-bottom:2px;
+    }
+    .company-banner .logo-row img { height:44px; width:auto; }
+    .company-banner h1 { margin: 0; font-size: 1.9rem; }
     .company-banner .addr { color:#555; font-weight:600; margin:0 0 4px 0; }
     .company-banner .tag  { color:#888; margin:0; font-size:0.95rem; }
+
+    .sidebar-brand {
+        display:flex; align-items:center; gap:10px; margin-bottom:4px;
+    }
+    .sidebar-brand img { height:32px; width:auto; }
+    .sidebar-brand span { font-size:1.15rem; font-weight:700; line-height:1.2; }
 
     /* Let wide tables/dataframes scroll horizontally instead of squeezing on small screens */
     .stDataFrame, .stDataEditor { overflow-x: auto; }
@@ -93,6 +125,7 @@ st.markdown("""
     @media (max-width: 640px) {
         .main > div { padding-top: 0.6rem; padding-left: 0.6rem; padding-right: 0.6rem; }
         .company-banner h1 { font-size: 1.35rem; }
+        .company-banner .logo-row img { height:32px; }
         .company-banner .addr { font-size: 0.85rem; }
         .company-banner .tag  { font-size: 0.8rem; }
         .req-card { padding: 10px 12px; font-size: 0.9rem; }
@@ -104,12 +137,31 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+@st.cache_data(show_spinner=False)
+def get_logo_base64():
+    """Read logo.png (same folder as app.py) once and cache it as a base64 data
+    URI, so it can be embedded inline in HTML headers. Returns None if the file
+    isn't present — callers fall back to text-only branding rather than crash
+    or show a broken-image icon."""
+    try:
+        with open(LOGO_PATH, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("utf-8")
+        return f"data:image/png;base64,{encoded}"
+    except FileNotFoundError:
+        return None
+
+
 def company_header(subtitle: str = ""):
     """Reusable company name + address banner, shown at the top of every dashboard."""
+    logo_uri = get_logo_base64()
+    logo_img = f'<img src="{logo_uri}" alt="logo">' if logo_uri else ""
     st.markdown(
         f"""
         <div class="company-banner">
-            <h1>🚗 {COMPANY_NAME}</h1>
+            <div class="logo-row">
+                {logo_img}
+                <h1>{COMPANY_NAME}</h1>
+            </div>
             <p class="addr">📍 {COMPANY_ADDRESS}</p>
             {f'<p class="tag">{subtitle}</p>' if subtitle else ''}
         </div>
@@ -308,6 +360,63 @@ def delete_vehicle(vehicle_id):
     sb.table(VEHICLES_TABLE).delete().eq("id", vehicle_id).execute()
 
 
+# ------------------- SESSION (REMEMBER ME) HELPERS -------------------
+# A "remember me" cookie stores only an opaque, unguessable token — never the
+# username or password directly — so a leaked/inspected cookie can't be used
+# to reconstruct credentials. The token maps to a username via this table and
+# expires automatically, and is revoked (deleted) on explicit logout.
+def create_session(username: str) -> str:
+    sb = get_supabase_client()
+    token = token_urlsafe(32)
+    expires_at = (datetime.utcnow() + timedelta(days=SESSION_LIFETIME_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    sb.table(SESSIONS_TABLE).insert({
+        "token": token, "username": username, "expires_at": expires_at,
+    }).execute()
+    return token
+
+
+def get_session_username(token: str):
+    """Return the username for a still-valid session token, or None."""
+    if not token:
+        return None
+    sb = get_supabase_client()
+    res = sb.table(SESSIONS_TABLE).select("*").eq("token", token).limit(1).execute()
+    if not res.data:
+        return None
+    row = res.data[0]
+    try:
+        # PostgREST reads timestamptz columns back in ISO 8601 with a 'T'
+        # separator and often a timezone offset (e.g. "...T14:22:30.123+00:00"),
+        # which differs from the space-separated string we wrote on insert —
+        # normalize both shapes before parsing so expiry checks don't silently
+        # fail (and reject) every real session.
+        raw = row["expires_at"].replace("T", " ")
+        expires_at = datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return None
+    if expires_at < datetime.utcnow():
+        return None
+    return row["username"]
+
+
+def delete_session(token: str):
+    if not token:
+        return
+    sb = get_supabase_client()
+    sb.table(SESSIONS_TABLE).delete().eq("token", token).execute()
+
+
+def get_cookie_manager():
+    """Returns a CookieManager. Deliberately NOT wrapped in st.cache_resource:
+    that cache is shared globally across every visitor's session on the
+    server, and caching a stateful per-browser cookie wrapper there would
+    leak one user's session cookie into another user's script run. Streamlit's
+    component protocol is already session-scoped on its own, so a fresh,
+    cheap instantiation on every rerun is the correct (and documented)
+    pattern for this library."""
+    return stx.CookieManager(key="rbl_vms_cookie_manager")
+
+
 # =========================================================
 # 4. AUTH: SIGN IN + SELF REGISTRATION
 # =========================================================
@@ -320,11 +429,28 @@ def get_bootstrap_admin():
         return None, None
 
 
+def build_bootstrap_user_dict(username: str) -> dict:
+    return {"username": username, "full_name": "Super Admin (Bootstrap)", "role": "admin",
+            "department": "Management", "designation": "System Administrator", "mobile": ""}
+
+
+def build_user_dict(record: dict) -> dict:
+    """Shared by both password login and cookie-based session restore, so the
+    session_state.auth_user shape never drifts between the two paths."""
+    return {
+        "username": record["username"],
+        "full_name": record.get("full_name", record["username"]),
+        "role": record.get("role", "user"),
+        "department": record.get("department", ""),
+        "designation": record.get("designation", ""),
+        "mobile": record.get("mobile", ""),
+    }
+
+
 def attempt_login(username: str, password: str):
     boot_user, boot_pass = get_bootstrap_admin()
     if boot_user and username == boot_user and password == boot_pass:
-        return {"username": username, "full_name": "Super Admin (Bootstrap)", "role": "admin",
-                "department": "Management", "designation": "System Administrator"}
+        return build_bootstrap_user_dict(username)
 
     record = get_user_by_username(username)
     if not record:
@@ -334,13 +460,20 @@ def attempt_login(username: str, password: str):
         return "PENDING"
     if record.get("password") != hash_password(password):
         return None
-    return {
-        "username": record["username"],
-        "full_name": record.get("full_name", username),
-        "role": record.get("role", "user"),
-        "department": record.get("department", ""),
-        "designation": record.get("designation", ""),
-    }
+    return build_user_dict(record)
+
+
+def restore_user_from_username(username: str):
+    """Used only for cookie-based 'remember me' restore — re-validates the
+    account is still Approved (in case it was later revoked/rejected) before
+    trusting the session token."""
+    boot_user, _ = get_bootstrap_admin()
+    if boot_user and username == boot_user:
+        return build_bootstrap_user_dict(username)
+    record = get_user_by_username(username)
+    if record and record.get("status") == "Approved":
+        return build_user_dict(record)
+    return None
 
 
 def login_view():
@@ -364,6 +497,7 @@ def login_view():
             with st.form("login_form"):
                 username = st.text_input("Username")
                 password = st.text_input("Password", type="password")
+                remember_me = st.checkbox("Remember me on this device", value=True)
                 submitted = st.form_submit_button("Login", type="primary", use_container_width=True)
 
             if submitted:
@@ -373,6 +507,17 @@ def login_view():
                 elif result is None:
                     st.error("❌ Invalid username or password.")
                 else:
+                    session_token = None
+                    if remember_me:
+                        try:
+                            session_token = create_session(result["username"])
+                            cookie_manager.set(
+                                SESSION_COOKIE_NAME, session_token, key="set_login_cookie",
+                                expires_at=datetime.now() + timedelta(days=SESSION_LIFETIME_DAYS),
+                            )
+                        except Exception:
+                            session_token = None  # Remember-me is best-effort; login still succeeds without it.
+                    result["session_token"] = session_token
                     st.session_state.auth_user = result
                     st.rerun()
 
@@ -477,6 +622,16 @@ def login_view():
 
 def logout_button():
     if st.sidebar.button("🚪 Logout", use_container_width=True):
+        token = st.session_state.get("auth_user", {}).get("session_token")
+        if token:
+            try:
+                delete_session(token)
+            except Exception:
+                pass  # DB cleanup is best-effort; logout must still proceed either way.
+        try:
+            cookie_manager.delete(SESSION_COOKIE_NAME, key="delete_logout_cookie")
+        except KeyError:
+            pass  # No cookie was ever set for this session — nothing to remove.
         del st.session_state["auth_user"]
         st.rerun()
 
@@ -571,26 +726,62 @@ def build_pdf_report(df: pd.DataFrame, filters_summary: str) -> bytes:
 
 
 # =========================================================
-# 6. SESSION STATE INIT
+# 6. SESSION STATE INIT (with "Remember Me" cookie restore)
 # =========================================================
+# Instantiated exactly once per script run — the underlying component uses a
+# fixed key, and Streamlit errors on duplicate keys within a single run, so
+# every other place in this file that needs cookies reuses this same object
+# rather than calling get_cookie_manager() again.
+cookie_manager = get_cookie_manager()
+
 if "auth_user" not in st.session_state:
-    login_view()
-    st.stop()
+    restored_user = None
+    session_token = cookie_manager.get(SESSION_COOKIE_NAME)
+    if session_token:
+        remembered_username = get_session_username(session_token)
+        if remembered_username:
+            restored_user = restore_user_from_username(remembered_username)
+        if restored_user:
+            restored_user["session_token"] = session_token
+            st.session_state.auth_user = restored_user
+        else:
+            # Token is missing/expired/revoked, or the account is no longer
+            # Approved — clear the stale cookie so we don't keep retrying it.
+            try:
+                cookie_manager.delete(SESSION_COOKIE_NAME, key="delete_stale_cookie")
+            except KeyError:
+                pass
+
+    if "auth_user" not in st.session_state:
+        login_view()
+        st.stop()
 
 user = st.session_state.auth_user
 
 # =========================================================
 # 7. SIDEBAR
 # =========================================================
-st.sidebar.title(f"🚗 {COMPANY_NAME}")
+logo_uri = get_logo_base64()
+logo_img = f'<img src="{logo_uri}" alt="logo">' if logo_uri else ""
+st.sidebar.markdown(
+    f'<div class="sidebar-brand">{logo_img}<span>{COMPANY_NAME}</span></div>',
+    unsafe_allow_html=True,
+)
 st.sidebar.caption(f"📍 {COMPANY_ADDRESS}")
 st.sidebar.markdown("---")
 st.sidebar.markdown(f"**{user['full_name']}**")
 st.sidebar.caption(f"Role: {ROLE_DISPLAY.get(user['role'], user['role'].capitalize())}")
-if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
+
+auto_refresh_on = st.sidebar.checkbox("🔄 Auto-refresh every 10s", value=True,
+                                       help="Automatically reloads live data across the app. "
+                                            "Turn off temporarily if you're filling out a long form.")
+if st.sidebar.button("🔄 Refresh Now", use_container_width=True):
     st.rerun()
 st.sidebar.markdown("---")
 logout_button()
+
+if auto_refresh_on:
+    st_autorefresh(interval=10_000, key="global_autorefresh")
 
 # =========================================================
 # 8. EMPLOYEE DASHBOARD
@@ -607,7 +798,8 @@ if user["role"] == "user":
                 applicant_name = st.text_input("Applicant Name *", value=user["full_name"])
                 department = st.selectbox("Department *", DEPARTMENTS,
                                            index=DEPARTMENTS.index(user["department"]) if user.get("department") in DEPARTMENTS else 0)
-                mobile_number = st.text_input("Mobile Number *", placeholder="01XXXXXXXXX")
+                mobile_number = st.text_input("Mobile Number *", value=user.get("mobile", ""),
+                                               placeholder="01XXXXXXXXX")
                 passenger_count = st.number_input("Passenger Count *", min_value=1, max_value=50, value=1)
             with c2:
                 date_of_travel = st.date_input("Date of Travel *", min_value=date.today())
