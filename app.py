@@ -39,7 +39,8 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
+# সাইডবারে লোগো দেখানোর জন্য
+st.sidebar.image("logo.png", use_container_width=True)
 USERS_TABLE = "users"
 REQUISITIONS_TABLE = "requisitions"
 DRIVERS_TABLE = "drivers"
