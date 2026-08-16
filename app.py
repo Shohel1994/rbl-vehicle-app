@@ -26,6 +26,101 @@ from fpdf.enums import XPos, YPos
 from fpdf.fonts import FontFace
 from streamlit_autorefresh import st_autorefresh
 import extra_streamlit_components as stx
+import requests
+import streamlit as st
+
+
+# =========================================================
+# TELEGRAM NOTIFICATION SYSTEM & HELPER FUNCTIONS
+# =========================================================
+def send_telegram_alert(message: str):
+    """Sends real-time notifications to the Telegram group with secret fallback."""
+    try:
+        # st.secrets থেকে রিড করার সুরক্ষিত পদ্ধতি + ব্যাকআপ মান
+        bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "8868510704:AAGkOS_s70f7ARKpvLbP3OvDDNEzDcutqIY")
+        chat_id = st.secrets.get("TELEGRAM_CHAT_ID", "-1004360578852")
+
+        if not bot_token or not chat_id:
+            return
+
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {
+            "chat_id": str(chat_id),
+            "text": message,
+            "parse_mode": "Markdown"
+        }
+        requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        print(f"Telegram Notification Error: {e}")
+
+
+def insert_requisition(data: dict):
+    sb = get_supabase_client()
+    sb.table(REQUISITIONS_TABLE).insert(data).execute()
+
+    # English Telegram Alert for New Requisition
+    applicant = data.get("applicant_name", "N/A")
+    dept = data.get("department", "N/A")
+    dest = data.get("destination", "N/A")
+    req_id = data.get("request_id", "N/A")
+    date_of_travel = data.get("date_of_travel", "N/A")
+    time_of_travel = data.get("time_of_travel", "N/A")
+    vehicle_type = data.get("vehicle_type", "N/A")
+    passenger_count = data.get("passenger_count", "N/A")
+
+    msg = (
+        f"🚨 **New Vehicle Requisition Submitted!**\n\n"
+        f"🆔 **ID:** #{req_id}\n"
+        f"👤 **Applicant:** {applicant}\n"
+        f"🏢 **Department:** {dept}\n"
+        f"📍 **Destination:** {dest}\n"
+        f"📅 **Date/Time:** {date_of_travel} at {time_of_travel}\n"
+        f"🚐 **Vehicle Type:** {vehicle_type}\n"
+        f"👥 **Passengers:** {passenger_count}"
+    )
+    send_telegram_alert(msg)
+
+
+def update_requisition(request_id: str, updates: dict):
+    sb = get_supabase_client()
+
+    # Look up applicant/destination so the alert is informative even though
+    # `updates` itself usually only carries status-related fields.
+    applicant = ""
+    dest = ""
+    try:
+        existing = sb.table(REQUISITIONS_TABLE).select("applicant_name, destination").eq(
+            "request_id", request_id
+        ).limit(1).execute()
+        if existing.data:
+            applicant = existing.data[0].get("applicant_name", "")
+            dest = existing.data[0].get("destination", "")
+    except Exception:
+        pass  # Alert enrichment is best-effort; the update itself must still proceed.
+
+    sb.table(REQUISITIONS_TABLE).update(updates).eq("request_id", request_id).execute()
+
+    # English Telegram Alert for Status Update
+    status = updates.get("status", "Updated")
+    driver = updates.get("driver_name", "")
+    vehicle = updates.get("vehicle_number", "")
+
+    msg = (
+        f"📢 **Requisition Status Updated!**\n\n"
+        f"🆔 **Requisition ID:** #{request_id}\n"
+    )
+    if applicant:
+        msg += f"👤 **Applicant:** {applicant}\n"
+    if dest:
+        msg += f"📍 **Destination:** {dest}\n"
+    msg += f"📌 **New Status:** {status}"
+    if driver:
+        msg += f"\n👨‍✈️ **Driver:** {driver}"
+    if vehicle:
+        msg += f"\n🚗 **Vehicle:** {vehicle}"
+
+    send_telegram_alert(msg)
+
 
 # =========================================================
 # 1. COMPANY INFO & PAGE CONFIG
@@ -35,7 +130,7 @@ COMPANY_ADDRESS = "Ishwardi EPZ, Pakshi, Pabna"
 
 st.set_page_config(
     page_title="RBL VMS",
-    page_icon="🚗",  # লোগো ফাইলের বদলে ইমোজি ব্যবহার করা হয়েছে
+    page_icon="🚗",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -170,14 +265,13 @@ def generate_request_id() -> str:
     return f"REQ-{datetime.now().strftime('%Y%m%d%H%M%S')}-{random.randint(100, 999)}"
 
 
-def insert_requisition(data: dict):
-    sb = get_supabase_client()
-    sb.table(REQUISITIONS_TABLE).insert(data).execute()
-
-
-def update_requisition(request_id: str, updates: dict):
-    sb = get_supabase_client()
-    sb.table(REQUISITIONS_TABLE).update(updates).eq("request_id", request_id).execute()
+# NOTE: insert_requisition() and update_requisition() are defined once, above,
+# in the "TELEGRAM NOTIFICATION SYSTEM & HELPER FUNCTIONS" section — they
+# perform the Supabase write AND fire the Telegram alert. They are
+# intentionally not redefined here; a second, alert-less definition at this
+# point in the file would silently shadow (override) the ones above and the
+# Telegram notifications would never fire, since Python keeps whichever `def`
+# runs last for a given name.
 
 
 def fetch_all_requisitions() -> pd.DataFrame:
