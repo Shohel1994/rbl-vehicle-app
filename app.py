@@ -727,6 +727,167 @@ def build_pdf_report(df: pd.DataFrame, filters_summary: str) -> bytes:
 
 
 # =========================================================
+# 5B. DUTY TRACKER — EXCEL + PDF REPORT GENERATORS
+# =========================================================
+# These are ADDITIVE helpers for the new "Duty Tracker & Analytics" tab
+# (Section 10B below). They are intentionally separate from
+# build_excel_report() / build_pdf_report() / ReportPDF above so the
+# existing "All Requisitions & Export" tab (Tab 5) keeps behaving exactly
+# as before — nothing here is called from, or changes, that code path.
+
+DUTY_TRACKER_DISPLAY_COLS = [
+    "Vehicle No", "Driver Name", "Start Time", "End Time",
+    "Total KM", "Duty Duration (Hrs)", "Route / Purpose",
+]
+
+
+def sanitize_pdf_text(value) -> str:
+    """Make any string safe to hand to FPDF's core 'Helvetica' font.
+
+    Core (non-embedded) PDF fonts like Helvetica only support the Latin-1
+    character set. Common "smart" punctuation that Python/pandas/Streamlit
+    happily display — em dashes (—), en dashes (–), curly quotes ('' ""),
+    ellipses (…), bullets (•) — falls outside that set and makes fpdf2 raise
+    FPDFUnicodeEncodingException the moment it's written to a cell. This
+    function swaps the common offenders for plain-ASCII equivalents, then
+    uses a Latin-1 encode/decode round-trip as a final safety net so any
+    other unsupported character (e.g. stray emoji, non-Latin scripts such as
+    Bangla typed into a destination/purpose field) degrades to '?' instead of
+    crashing the whole export.
+
+    Note: this keeps the export crash-proof but Latin-1-only. If admin notes,
+    destinations, or driver names need full Bangla/Unicode rendering in the
+    PDF itself, that requires embedding a Unicode TTF font (e.g. via
+    pdf.add_font(...)) instead of the core Helvetica font — a larger change,
+    out of scope for this fix.
+    """
+    if value is None:
+        return ""
+    text = str(value)
+    replacements = {
+        "\u2014": "-",   # — em dash
+        "\u2013": "-",   # – en dash
+        "\u2015": "-",   # ― horizontal bar
+        "\u2018": "'", "\u2019": "'",   # ‘ ’ curly single quotes
+        "\u201c": '"', "\u201d": '"',   # “ ” curly double quotes
+        "\u2026": "...",  # … ellipsis
+        "\u2022": "-",   # • bullet
+        "\u2192": "->",  # → arrow
+        "\u00a0": " ",   # non-breaking space
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    # Final safety net: anything still outside Latin-1 becomes '?' rather
+    # than raising, so the PDF always generates successfully.
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
+def build_duty_tracker_excel(detail_df: pd.DataFrame, summary_metrics: dict) -> bytes:
+    """Formatted .xlsx export for the Duty Tracker: a 'Summary' sheet with the
+    KPI cards' values, plus a 'Duty Log' sheet with the full filtered detail
+    table. Plug in your own detail_df / summary_metrics from the tab below —
+    both are plain pandas / dict objects, nothing Supabase-specific here.
+    """
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        summary_df = pd.DataFrame(
+            [{"Metric": k, "Value": v} for k, v in summary_metrics.items()]
+        )
+        summary_df.to_excel(writer, index=False, sheet_name="Summary")
+        detail_df.to_excel(writer, index=False, sheet_name="Duty Log")
+
+        # Light auto-fit so columns aren't clipped in Excel — purely cosmetic,
+        # safe to remove if you don't want the extra openpyxl dependency calls.
+        from openpyxl.utils import get_column_letter
+        for sheet_name, sheet_df in (("Summary", summary_df), ("Duty Log", detail_df)):
+            ws = writer.sheets[sheet_name]
+            for i, col in enumerate(sheet_df.columns, start=1):
+                width = max(12, min(40, int(sheet_df[col].astype(str).map(len).max() if not sheet_df.empty else 12) + 2))
+                ws.column_dimensions[get_column_letter(i)].width = width
+
+    return buf.getvalue()
+
+
+class DutyTrackerPDF(FPDF):
+    """Separate FPDF subclass (rather than reusing ReportPDF) so this report's
+    title/branding can evolve independently of the existing requisition report."""
+
+    def header(self):
+        self.set_font("Helvetica", "B", 16)
+        self.set_text_color(15, 98, 254)
+        self.cell(0, 9, COMPANY_NAME, align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+        self.set_font("Helvetica", "", 10)
+        self.set_text_color(90, 90, 90)
+        self.cell(0, 6, COMPANY_ADDRESS, align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+        self.set_font("Helvetica", "B", 12)
+        self.set_text_color(0, 0, 0)
+        self.cell(0, 8, "Vehicle & Driver Duty Tracker Report", align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        self.ln(2)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font("Helvetica", "I", 8)
+        self.set_text_color(150, 150, 150)
+        self.cell(0, 10, f"Page {self.page_no()}", align="C")
+
+
+def build_duty_tracker_pdf(detail_df: pd.DataFrame, summary_metrics: dict, filters_summary: str) -> bytes:
+    """PDF containing the KPI summary table followed by the detailed duty log.
+    `detail_df` must already have the DUTY_TRACKER_DISPLAY_COLS columns (see
+    the tab below for how it's built from the requisitions DataFrame).
+
+    Every string written to the PDF is passed through sanitize_pdf_text()
+    first — see that function's docstring for why this is necessary with
+    FPDF's core Helvetica font.
+    """
+    pdf = DutyTrackerPDF(orientation="L", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", size=10)
+    pdf.cell(0, 6, f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+              new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.multi_cell(0, 6, sanitize_pdf_text(filters_summary))
+    pdf.ln(2)
+
+    # ---- KPI Summary block ----
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 8, "Summary Metrics", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font("Helvetica", size=9)
+    pdf.set_fill_color(230, 230, 230)
+    for label, value in summary_metrics.items():
+        safe_label = sanitize_pdf_text(label)
+        safe_value = sanitize_pdf_text(value)
+        pdf.cell(0, 7, f"{safe_label}: {safe_value}", border=1, fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(6)
+
+    # ---- Detailed duty log table ----
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 8, "Detailed Duty Log", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(1)
+
+    headers = DUTY_TRACKER_DISPLAY_COLS
+    col_widths = [30, 28, 34, 34, 18, 26, 107]  # sums to ~277mm, fits A4 landscape
+
+    pdf.set_font("Helvetica", size=7)
+    heading_style = FontFace(emphasis="BOLD", color=(255, 255, 255), fill_color=(15, 98, 254))
+    with pdf.table(col_widths=col_widths, text_align="LEFT", first_row_as_headings=True,
+                   line_height=5, headings_style=heading_style, cell_fill_color=(245, 245, 245),
+                   cell_fill_mode="ROWS") as table:
+        header_row = table.row()
+        for h in headers:
+            header_row.cell(sanitize_pdf_text(h))
+        for _, r in detail_df.iterrows():
+            row = table.row()
+            for col in headers:
+                row.cell(sanitize_pdf_text(fmt(r.get(col, ""), "")))
+
+    return bytes(pdf.output())
+
+
+# =========================================================
 # 6. SESSION STATE INIT (with "Remember Me" cookie restore)
 # =========================================================
 # Instantiated exactly once per script run — the underlying component uses a
@@ -1008,9 +1169,10 @@ elif user["role"] == "admin":
     company_header("🔐 Admin Dashboard")
     st.caption(f"Logged in as {user['full_name']} — Admin")
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "⏳ Pending User Approvals", "👥 All Users", "🚗 Pending Requisitions",
         "📊 Analytics", "📁 All Requisitions & Export", "🚘 Manage Drivers & Vehicles",
+        "🕒 Duty Tracker & Analytics",
     ])
 
     # ---------------- TAB 1: Pending User Approvals ----------------
@@ -1378,6 +1540,233 @@ elif user["role"] == "admin":
                             st.rerun()
                         except Exception as e:
                             st.error(f"❌ Failed to delete vehicle: {e}")
+
+    # ---------------- TAB 7: Duty Tracker & Analytics ----------------
+    with tab7:
+        st.subheader("🕒 Vehicle & Driver Duty Tracker & Analytics Dashboard")
+        st.caption(
+            "Filter any custom date/time window plus a specific vehicle or driver to see live duty "
+            "duration, distance, and trip counts — with CSV / Excel / PDF export."
+        )
+
+        # ---- Reuse the same requisitions dataset already fetched in Tab 3/4 above ----
+        # `df_all` was populated by fetch_all_requisitions() earlier in the Admin
+        # Dashboard block, so we don't hit Supabase again here. Swap this for your
+        # own DataFrame if you wire this tab up standalone.
+        duty_df_raw = df_all.copy()
+
+        if duty_df_raw.empty:
+            st.info("No requisition data yet — the duty tracker will populate once trips are logged.")
+        else:
+            # -------------------------------------------------------------
+            # STEP 0 — Render every filter widget FIRST, before any variable
+            # derived from them is used. This avoids NameError from reading
+            # a widget's value before Streamlit has actually created it.
+            # -------------------------------------------------------------
+            st.markdown("##### 🔎 Filters")
+            fc1, fc2 = st.columns(2)
+            with fc1:
+                st.markdown("**Start of Range**")
+                filter_start_date = st.date_input("Start Date", value=date.today(), key="duty_start_date")
+                filter_start_time = st.time_input("Start Time", value=datetime.strptime("07:00", "%H:%M").time(),
+                                                   key="duty_start_time")
+            with fc2:
+                st.markdown("**End of Range**")
+                filter_end_date = st.date_input("End Date", value=date.today() + timedelta(days=1), key="duty_end_date")
+                filter_end_time = st.time_input("End Time", value=datetime.strptime("06:59", "%H:%M").time(),
+                                                 key="duty_end_time")
+
+            # -------------------------------------------------------------
+            # STEP 1 — Build real start/end datetimes for every trip, as
+            # UTC-aware timestamps. Supabase/PostgREST returns timestamptz
+            # columns as ISO 8601 strings — sometimes with an explicit
+            # offset, sometimes without — so `utc=True` normalizes BOTH
+            # cases onto a single tz-aware ("datetime64[us, UTC]" / similar)
+            # dtype. Without this, mixed naive/aware values make pandas
+            # infer a naive dtype for one column and an aware dtype for
+            # another, and mixing the two later raises exactly the
+            # "Invalid comparison between dtype=datetime64[...,UTC] and
+            # datetime" TypeError.
+            # -------------------------------------------------------------
+            # `format="mixed"` matters as much as `utc=True` here: Supabase/
+            # PostgREST timestamptz values can come back with or without
+            # fractional seconds, or with a trailing "Z" vs "+00:00" offset,
+            # row to row. Without `format="mixed"`, pandas infers a single
+            # format from the first non-null value and silently coerces every
+            # differently-shaped row to NaT (even with errors="coerce") —
+            # which then makes real trips vanish from the tracker with no
+            # error at all. "mixed" parses each value independently.
+            duty_df_raw["_start_dt"] = pd.to_datetime(
+                duty_df_raw.get("actual_exit_time"), errors="coerce", utc=True, format="mixed"
+            )
+            duty_df_raw["_end_dt"] = pd.to_datetime(
+                duty_df_raw.get("actual_return_time"), errors="coerce", utc=True, format="mixed"
+            )
+
+            # A trip only has meaningful "duty duration" once Security has
+            # logged a Gate Out (actual_exit_time). If Gate In hasn't
+            # happened yet (still "On Trip"), treat "now" (in UTC, to match
+            # the column's dtype) as the running end time so in-progress
+            # duty shows up too. Assigning a naive Timestamp into a UTC-aware
+            # column is exactly what triggers the
+            # "Invalid value ... for dtype 'datetime64[us, UTC]'" TypeError,
+            # so we must assign an equally tz-aware Timestamp here.
+            still_out_mask = duty_df_raw["_start_dt"].notna() & duty_df_raw["_end_dt"].isna()
+            duty_df_raw.loc[still_out_mask, "_end_dt"] = pd.Timestamp.now(tz="UTC")
+
+            # Only rows that actually left the gate are real "duty" records.
+            duty_base = duty_df_raw[duty_df_raw["_start_dt"].notna()].copy()
+
+            # -------------------------------------------------------------
+            # STEP 2 — Combine the date/time widgets into naive datetimes,
+            # then localize them to UTC so they can be compared directly
+            # against the tz-aware `_start_dt` / `_end_dt` columns above.
+            # (If your admin users think in a local timezone rather than
+            # UTC, swap "UTC" below for that zone, e.g. "Asia/Dhaka", and
+            # pandas will convert correctly at comparison time.)
+            # -------------------------------------------------------------
+            range_start = pd.Timestamp(datetime.combine(filter_start_date, filter_start_time)).tz_localize("UTC")
+            range_end = pd.Timestamp(datetime.combine(filter_end_date, filter_end_time)).tz_localize("UTC")
+
+            if range_start >= range_end:
+                st.error("⚠️ The start date/time must be earlier than the end date/time.")
+                st.stop()
+
+            fc3, fc4 = st.columns(2)
+            with fc3:
+                vehicle_choices = ["All Vehicles"] + sorted(
+                    v for v in duty_base["vehicle_number"].dropna().unique().tolist() if v
+                )
+                duty_vehicle_filter = st.selectbox("Vehicle Selection", vehicle_choices, key="duty_vehicle_filter")
+            with fc4:
+                driver_choices = ["All Drivers"] + sorted(
+                    d for d in duty_base["driver_name"].dropna().unique().tolist() if d
+                )
+                duty_driver_filter = st.selectbox("Driver Selection", driver_choices, key="duty_driver_filter")
+
+            # -------------------------------------------------------------
+            # STEP 3 — Apply the date/time window + vehicle/driver filters.
+            # A trip is included if its duty window OVERLAPS the selected
+            # range at all (not just if it starts inside it) — this correctly
+            # captures overnight duties like "07:00 today to 06:59 tomorrow".
+            # Both sides are now UTC-aware, so this comparison is safe.
+            # -------------------------------------------------------------
+            duty_filtered = duty_base[
+                (duty_base["_start_dt"] <= range_end) & (duty_base["_end_dt"] >= range_start)
+            ].copy()
+
+            if duty_vehicle_filter != "All Vehicles":
+                duty_filtered = duty_filtered[duty_filtered["vehicle_number"] == duty_vehicle_filter]
+            if duty_driver_filter != "All Drivers":
+                duty_filtered = duty_filtered[duty_filtered["driver_name"] == duty_driver_filter]
+
+            # -------------------------------------------------------------
+            # STEP 4 — Derived fields: duty duration in hours, total KM.
+            # -------------------------------------------------------------
+            duty_filtered["_duration_hrs"] = (
+                (duty_filtered["_end_dt"] - duty_filtered["_start_dt"]).dt.total_seconds() / 3600.0
+            ).round(2)
+            duty_filtered["_km"] = pd.to_numeric(duty_filtered.get("total_km"), errors="coerce").fillna(0.0)
+
+            st.markdown("---")
+            st.markdown("##### 📌 Summary")
+
+            total_km = float(duty_filtered["_km"].sum())
+            total_duration_hrs = float(duty_filtered["_duration_hrs"].sum())
+            total_trips = int(len(duty_filtered))
+            duration_h = int(total_duration_hrs)
+            duration_m = int(round((total_duration_hrs - duration_h) * 60))
+
+            # "Active Driver & Assigned Vehicle" — meaningful only when the
+            # filters have narrowed things down to one driver/vehicle; with
+            # "All Drivers"/"All Vehicles" selected we instead surface the
+            # busiest one within the filtered window.
+            if duty_driver_filter != "All Drivers":
+                active_driver_label = duty_driver_filter
+            elif not duty_filtered.empty and duty_filtered["driver_name"].notna().any():
+                active_driver_label = duty_filtered["driver_name"].value_counts().idxmax()
+            else:
+                active_driver_label = "—"
+
+            if duty_vehicle_filter != "All Vehicles":
+                active_vehicle_label = duty_vehicle_filter
+            elif not duty_filtered.empty and duty_filtered["vehicle_number"].notna().any():
+                active_vehicle_label = duty_filtered["vehicle_number"].value_counts().idxmax()
+            else:
+                active_vehicle_label = "—"
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("🛣️ Total Distance", f"{total_km:.1f} KM")
+            k2.metric("⏱️ Total Duty Duration", f"{duration_h}h {duration_m}m")
+            k3.metric("🚗 Total Trips", total_trips)
+            k4.metric("👨‍✈️ Active Driver / Vehicle", f"{active_driver_label} / {active_vehicle_label}")
+
+            # -------------------------------------------------------------
+            # STEP 5 — Detailed table:
+            # [Vehicle No, Driver Name, Start Time, End Time, Total KM,
+            #  Duty Duration (Hours), Route / Purpose]
+            # -------------------------------------------------------------
+            st.markdown("---")
+            st.markdown("##### 📋 Detailed Duty Log")
+
+            if duty_filtered.empty:
+                st.info("No trips match the selected filters.")
+                detail_display = pd.DataFrame(columns=DUTY_TRACKER_DISPLAY_COLS)
+            else:
+                detail_display = pd.DataFrame({
+                    "Vehicle No": duty_filtered["vehicle_number"].map(lambda v: fmt(v, "—")),
+                    "Driver Name": duty_filtered["driver_name"].map(lambda v: fmt(v, "—")),
+                    "Start Time": duty_filtered["_start_dt"].dt.strftime("%Y-%m-%d %H:%M"),
+                    "End Time": duty_filtered["_end_dt"].dt.strftime("%Y-%m-%d %H:%M"),
+                    "Total KM": duty_filtered["_km"].round(1),
+                    "Duty Duration (Hrs)": duty_filtered["_duration_hrs"],
+                    "Route / Purpose": duty_filtered["destination"].fillna("").astype(str)
+                                        + " — " + duty_filtered["purpose"].fillna("").astype(str),
+                }).reset_index(drop=True)
+                st.dataframe(detail_display, use_container_width=True, hide_index=True, height=340)
+
+            # -------------------------------------------------------------
+            # STEP 6 — Multi-format export: CSV / Excel / PDF.
+            # summary_metrics feeds both the Excel "Summary" sheet and the
+            # PDF's KPI block — plug in any additional metrics here as needed.
+            # -------------------------------------------------------------
+            summary_metrics = {
+                "Date/Time Range": f"{range_start.strftime('%Y-%m-%d %H:%M')} to {range_end.strftime('%Y-%m-%d %H:%M')}",
+                "Vehicle Filter": duty_vehicle_filter,
+                "Driver Filter": duty_driver_filter,
+                "Total Distance (KM)": f"{total_km:.1f}",
+                "Total Duty Duration": f"{duration_h}h {duration_m}m",
+                "Total Trips": total_trips,
+                "Active Driver": active_driver_label,
+                "Assigned Vehicle": active_vehicle_label,
+            }
+            filters_summary_text = (
+                f"Range: {summary_metrics['Date/Time Range']} | Vehicle: {duty_vehicle_filter} | "
+                f"Driver: {duty_driver_filter}"
+            )
+
+            st.markdown("---")
+            st.markdown("##### ⬇️ Export Duty Report")
+            e1, e2, e3 = st.columns(3)
+            with e1:
+                csv_bytes = detail_display.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "⬇️ Download CSV", data=csv_bytes, file_name="duty_tracker_report.csv",
+                    mime="text/csv", use_container_width=True,
+                )
+            with e2:
+                duty_excel_bytes = build_duty_tracker_excel(detail_display, summary_metrics)
+                st.download_button(
+                    "⬇️ Download Excel (.xlsx)", data=duty_excel_bytes, file_name="duty_tracker_report.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            with e3:
+                duty_pdf_bytes = build_duty_tracker_pdf(detail_display, summary_metrics, filters_summary_text)
+                st.download_button(
+                    "⬇️ Download PDF (.pdf)", data=duty_pdf_bytes, file_name="duty_tracker_report.pdf",
+                    mime="application/pdf", use_container_width=True,
+                )
 
 # =========================================================
 # 11. FALLBACK — unrecognized role
