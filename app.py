@@ -14,6 +14,7 @@ import os
 import base64
 import hashlib
 import random
+import time
 from datetime import datetime, date, timedelta
 from secrets import token_urlsafe
 
@@ -516,6 +517,16 @@ def login_view():
                                 SESSION_COOKIE_NAME, session_token, key="set_login_cookie",
                                 expires_at=datetime.now() + timedelta(days=SESSION_LIFETIME_DAYS),
                             )
+                            # IMPORTANT: cookie_manager.set() only *dispatches* a message
+                            # to the browser's cookie-manager iframe component asking it
+                            # to write document.cookie — it does not write synchronously.
+                            # If we st.rerun() immediately, Streamlit tears the page down
+                            # before the browser JS has a chance to actually persist the
+                            # cookie, so "Remember me" silently never works. A short pause
+                            # here gives the component time to finish the write before the
+                            # rerun happens.
+                            with st.spinner("Setting up your session..."):
+                                time.sleep(1.0)
                         except Exception:
                             session_token = None  # Remember-me is best-effort; login still succeeds without it.
                     result["session_token"] = session_token
@@ -897,8 +908,26 @@ def build_duty_tracker_pdf(detail_df: pd.DataFrame, summary_metrics: dict, filte
 cookie_manager = get_cookie_manager()
 
 if "auth_user" not in st.session_state:
+    # extra_streamlit_components's CookieManager runs inside a browser iframe
+    # component. On the very first script run after a fresh page load, that
+    # component hasn't finished round-tripping "here are the browser's
+    # cookies" back to Python yet — cookie_manager.get_all() returns None
+    # (NOT an empty dict) while it's still waiting. If we treat that None as
+    # "no cookie exists" and immediately show the login form, the remembered
+    # session is thrown away on every single page load, which is exactly the
+    # "Remember me doesn't work" symptom. An empty dict {} — as opposed to
+    # None — genuinely means "component is ready, browser has no cookie".
+    all_cookies = cookie_manager.get_all()
+
+    if all_cookies is None and not st.session_state.get("_cookie_bootstrap_done"):
+        st.session_state["_cookie_bootstrap_done"] = True
+        # Give the cookie component a brief moment to finish loading, then
+        # force exactly one rerun so we re-check with real cookie data.
+        st_autorefresh(interval=300, limit=1, key="cookie_bootstrap_refresh")
+        st.stop()
+
     restored_user = None
-    session_token = cookie_manager.get(SESSION_COOKIE_NAME)
+    session_token = (all_cookies or {}).get(SESSION_COOKIE_NAME)
     if session_token:
         remembered_username = get_session_username(session_token)
         if remembered_username:
