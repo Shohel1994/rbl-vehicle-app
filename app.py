@@ -154,8 +154,13 @@ DEPARTMENTS = [
 
 # Account status (users table) — approval workflow for logins
 USER_STATUS_OPTIONS = ["Pending", "Approved", "Rejected"]
-ROLE_OPTIONS = ["user", "security_officer", "admin"]
-ROLE_DISPLAY = {"user": "Employee", "security_officer": "Security Officer", "admin": "Admin"}
+ROLE_OPTIONS = ["user", "security_officer", "driver", "admin"]
+ROLE_DISPLAY = {
+    "user": "Employee",
+    "security_officer": "Security Officer",
+    "driver": "Driver",
+    "admin": "Admin",
+}
 
 # Requisition status (requisitions table) — full trip lifecycle
 REQ_STATUS_OPTIONS = ["Pending", "Approved", "Rejected", "On Trip", "Completed"]
@@ -202,6 +207,30 @@ def is_blank(val) -> bool:
 
 def fmt(val, default: str = "—") -> str:
     return default if is_blank(val) else str(val)
+
+
+def fmt_time_12h(value, default: str = "—") -> str:
+    """Render a stored time/timestamp string in 12-hour AM/PM format
+    (Bangladesh local convention). Storage format in Supabase is UNCHANGED —
+    still 24-hour '%H:%M' or '%Y-%m-%d %H:%M:%S' — this only changes what's
+    *displayed* on screen, in exports, and in the Duty Tracker table.
+
+    Accepts bare 'HH:MM' / 'HH:MM:SS' (time_of_travel, approved_time) or full
+    'YYYY-MM-DD HH:MM:SS' (actual_exit_time, actual_return_time,
+    action_timestamp). If the value doesn't match a known shape (e.g. it has
+    already been converted, or is genuinely something else), it's returned
+    unchanged rather than raising — exports must never crash on this.
+    """
+    if is_blank(value):
+        return default
+    s = str(value).strip().replace("T", " ")
+    for f in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%H:%M:%S", "%H:%M"):
+        try:
+            dt = datetime.strptime(s, f)
+        except ValueError:
+            continue
+        return dt.strftime("%Y-%m-%d %I:%M %p") if "%Y" in f else dt.strftime("%I:%M %p")
+    return s
 
 
 def hash_password(raw: str) -> str:
@@ -283,7 +312,7 @@ def fetch_all_requisitions() -> pd.DataFrame:
         "date_of_travel", "time_of_travel", "destination", "passenger_count", "vehicle_type", "purpose",
         "special_request", "status", "driver_name", "driver_contact", "vehicle_number", "approved_by",
         "action_timestamp", "approved_time", "admin_note", "start_km", "end_km", "total_km",
-        "actual_exit_time", "actual_return_time",
+        "actual_exit_time", "actual_return_time", "driver_start_km", "driver_end_km", "driver_km_updated_at",
     ])
 
 
@@ -302,7 +331,7 @@ def fetch_requisitions_by_user(username: str) -> pd.DataFrame:
         "date_of_travel", "time_of_travel", "destination", "passenger_count", "vehicle_type", "purpose",
         "special_request", "status", "driver_name", "driver_contact", "vehicle_number", "approved_by",
         "action_timestamp", "approved_time", "admin_note", "start_km", "end_km", "total_km",
-        "actual_exit_time", "actual_return_time",
+        "actual_exit_time", "actual_return_time", "driver_start_km", "driver_end_km", "driver_km_updated_at",
     ])
 
 
@@ -323,8 +352,86 @@ def fetch_requisitions_by_status(status: str) -> pd.DataFrame:
         "date_of_travel", "time_of_travel", "destination", "passenger_count", "vehicle_type", "purpose",
         "special_request", "status", "driver_name", "driver_contact", "vehicle_number", "approved_by",
         "action_timestamp", "approved_time", "admin_note", "start_km", "end_km", "total_km",
-        "actual_exit_time", "actual_return_time",
+        "actual_exit_time", "actual_return_time", "driver_start_km", "driver_end_km", "driver_km_updated_at",
     ])
+
+
+# ------------------- DRIVER-SUBMITTED KM HELPERS (NEW) -------------------
+# Additive helpers backing the Driver Dashboard (role branch, Section 9B) and
+# the Admin's KM Variance Report (Tab 8). These never touch Security's
+# start_km / end_km / total_km fields — they read/write the separate
+# driver_start_km / driver_end_km / driver_km_updated_at columns only.
+def fetch_requisitions_by_driver(driver_name: str) -> pd.DataFrame:
+    """All trips assigned to this driver (matched by driver_name, the same
+    value set from the Admin's driver dropdown in requisitions.driver_name)."""
+    sb = get_supabase_client()
+    res = (
+        sb.table(REQUISITIONS_TABLE)
+        .select("*")
+        .eq("driver_name", driver_name)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=[
+        "id", "request_id", "created_at", "username", "applicant_name", "department", "mobile_number",
+        "date_of_travel", "time_of_travel", "destination", "passenger_count", "vehicle_type", "purpose",
+        "special_request", "status", "driver_name", "driver_contact", "vehicle_number", "approved_by",
+        "action_timestamp", "approved_time", "admin_note", "start_km", "end_km", "total_km",
+        "actual_exit_time", "actual_return_time", "driver_start_km", "driver_end_km", "driver_km_updated_at",
+    ])
+
+
+def get_last_driver_end_km(driver_name: str, vehicle_number: str) -> float:
+    """The driver's own most recent End KM for this specific vehicle — used
+    to auto-fill their next Start KM (still fully editable). Returns 0.0 if
+    no prior driver-submitted End KM exists yet for this driver+vehicle."""
+    if is_blank(vehicle_number):
+        return 0.0
+    sb = get_supabase_client()
+    res = (
+        sb.table(REQUISITIONS_TABLE)
+        .select("driver_end_km, created_at")
+        .eq("driver_name", driver_name)
+        .eq("vehicle_number", vehicle_number)
+        .not_.is_("driver_end_km", "null")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if res.data and res.data[0].get("driver_end_km") is not None:
+        return float(res.data[0]["driver_end_km"])
+    return 0.0
+
+
+def submit_driver_km(request_id: str, driver_start_km=None, driver_end_km=None):
+    """Raw Supabase update — deliberately bypasses update_requisition() (and
+    its Telegram alert). A driver logging their own KM isn't a trip-status
+    change and shouldn't fire the same 'Requisition Status Updated!' group
+    alert as Approve/Reject/Gate-In/Gate-Out."""
+    sb = get_supabase_client()
+    updates = {"driver_km_updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    if driver_start_km is not None:
+        updates["driver_start_km"] = float(driver_start_km)
+    if driver_end_km is not None:
+        updates["driver_end_km"] = float(driver_end_km)
+    sb.table(REQUISITIONS_TABLE).update(updates).eq("request_id", request_id).execute()
+
+
+def effective_km_fields(row) -> tuple:
+    """(start_km, end_km, total_km) using the Driver's own odometer entries
+    as the PRIMARY source of truth for standard distance reports and duty
+    tracking, falling back to Security's Gate-Out/Gate-In readings only when
+    the driver hasn't logged their own numbers for that trip yet. Security's
+    start_km/end_km columns are never modified by this — read-only helper."""
+    d_start, d_end = row.get("driver_start_km"), row.get("driver_end_km")
+    if not is_blank(d_start) and not is_blank(d_end):
+        s, e = float(d_start), float(d_end)
+        return s, e, round(e - s, 1)
+    s_start, s_end = row.get("start_km"), row.get("end_km")
+    if not is_blank(s_start) and not is_blank(s_end):
+        s, e = float(s_start), float(s_end)
+        return s, e, round(e - s, 1)
+    return None, None, 0.0
 
 
 # ------------------- DRIVERS & VEHICLES TABLE HELPERS -------------------
@@ -534,11 +641,11 @@ def login_view():
                     st.rerun()
 
         with tab_register:
-            st.caption("New employees or Security Officers can request an account here. "
+            st.caption("New employees, Security Officers, or Drivers can request an account here. "
                        "An admin must approve your account before you can log in.")
 
             reg_role = st.radio(
-                "Register as", ["Employee", "Security Officer"],
+                "Register as", ["Employee", "Security Officer", "Driver"],
                 horizontal=True, key="reg_role_choice",
             )
             st.markdown("---")
@@ -587,7 +694,7 @@ def login_view():
                             f"**Employee ID ({employee_id.strip()})**. Please wait for admin approval before signing in."
                         )
 
-            else:  # Security Officer registration — same simple flow as normal users
+            elif reg_role == "Security Officer":
                 st.caption("Choose your own username and password below, just like a regular account.")
                 with st.form("register_security_form", clear_on_submit=True):
                     sec_full_name = st.text_input("Full Name *", key="sec_full_name")
@@ -628,6 +735,55 @@ def login_view():
                         })
                         st.success(
                             "✅ Your Security Officer account request has been submitted! "
+                            "Please wait for admin approval before signing in."
+                        )
+
+            else:  # reg_role == "Driver"
+                st.caption(
+                    "Choose your own username and password below. **Important:** enter your Full "
+                    "Name exactly as it appears (or will appear) in the Admin's **Manage Drivers & "
+                    "Vehicles** list — your assigned trips are matched by this name, so a mismatch "
+                    "means your trips won't show up in your Driver Dashboard."
+                )
+                with st.form("register_driver_form", clear_on_submit=True):
+                    drv_full_name = st.text_input("Full Name *", key="drv_full_name")
+                    drv_username = st.text_input("Username *", key="drv_username")
+                    drv_password = st.text_input("Password *", type="password", key="drv_password")
+                    drv_password_confirm = st.text_input("Confirm Password *", type="password", key="drv_password_confirm")
+                    drv_submitted = st.form_submit_button("Submit Request", type="primary", use_container_width=True)
+
+                if drv_submitted:
+                    errors = []
+                    if not drv_full_name.strip():
+                        errors.append("Full Name is required.")
+                    if not drv_username.strip():
+                        errors.append("Username is required.")
+                    if not drv_password:
+                        errors.append("Password is required.")
+                    elif len(drv_password) < 4:
+                        errors.append("Password must be at least 4 characters.")
+                    elif drv_password != drv_password_confirm:
+                        errors.append("Passwords do not match.")
+                    if not errors and get_user_by_username(drv_username.strip()):
+                        errors.append("This username is already taken. Please choose another.")
+
+                    if errors:
+                        for e in errors:
+                            st.error(e)
+                    else:
+                        register_user({
+                            "username": drv_username.strip(),
+                            "password": hash_password(drv_password),
+                            "full_name": drv_full_name.strip(),
+                            "designation": "Driver",
+                            "employee_id": "",
+                            "department": "Transport",
+                            "mobile": "",
+                            "role": "driver",
+                            "status": "Pending",
+                        })
+                        st.success(
+                            "✅ Your Driver account request has been submitted! "
                             "Please wait for admin approval before signing in."
                         )
 
@@ -686,7 +842,7 @@ def build_pdf_report(df: pd.DataFrame, filters_summary: str) -> bytes:
     pdf.add_page()
 
     pdf.set_font("Helvetica", size=10)
-    pdf.cell(0, 6, f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+    pdf.cell(0, 6, f"Generated on: {datetime.now().strftime('%Y-%m-%d %I:%M %p')}",
               new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.multi_cell(0, 6, filters_summary)
     pdf.ln(2)
@@ -732,7 +888,10 @@ def build_pdf_report(df: pd.DataFrame, filters_summary: str) -> bytes:
         for _, r in df.iterrows():
             row = table.row()
             for col in cols:
-                row.cell(fmt(r.get(col, ""), ""))
+                val = r.get(col, "")
+                if col == "time_of_travel":
+                    val = fmt_time_12h(val, "")
+                row.cell(fmt(val, ""))
 
     return bytes(pdf.output())
 
@@ -858,7 +1017,7 @@ def build_duty_tracker_pdf(detail_df: pd.DataFrame, summary_metrics: dict, filte
     pdf.add_page()
 
     pdf.set_font("Helvetica", size=10)
-    pdf.cell(0, 6, f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+    pdf.cell(0, 6, f"Generated on: {datetime.now().strftime('%Y-%m-%d %I:%M %p')}",
               new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.multi_cell(0, 6, sanitize_pdf_text(filters_summary))
     pdf.ln(2)
@@ -1057,7 +1216,7 @@ if user["role"] == "user":
                     st.markdown(f"""
                     <div class="req-card">
                         <b>{r['request_id']}</b> &nbsp;|&nbsp; {r['destination']} &nbsp;|&nbsp;
-                        {r['date_of_travel']} at {r['time_of_travel']} &nbsp;&nbsp;
+                        {r['date_of_travel']} at {fmt_time_12h(r['time_of_travel'])} &nbsp;&nbsp;
                         <span class="{badge_class(r['status'])}">{STATUS_BADGE.get(r['status'], r['status'])}</span>
                     </div>
                     """, unsafe_allow_html=True)
@@ -1070,7 +1229,7 @@ if user["role"] == "user":
                         if r["status"] in ("Approved", "On Trip", "Completed"):
                             approved_time = r["time_of_travel"] if is_blank(r.get("approved_time")) else r.get("approved_time")
                             time_note = (
-                                f" (rescheduled from {r['time_of_travel']})"
+                                f" (rescheduled from {fmt_time_12h(r['time_of_travel'])})"
                                 if not is_blank(r.get("approved_time")) and r.get("approved_time") != r["time_of_travel"]
                                 else ""
                             )
@@ -1079,16 +1238,16 @@ if user["role"] == "user":
                             🚘 <b>Driver:</b> {fmt(r['driver_name'], 'TBD')} &nbsp;|&nbsp;
                             📞 <b>Contact:</b> {fmt(r['driver_contact'], 'TBD')} &nbsp;|&nbsp;
                             🔢 <b>Vehicle No.:</b> {fmt(r['vehicle_number'], 'TBD')} &nbsp;|&nbsp;
-                            🕒 <b>Approved Departure Time:</b> {approved_time}{time_note}
+                            🕒 <b>Approved Departure Time:</b> {fmt_time_12h(approved_time)}{time_note}
                             </div>
                             """, unsafe_allow_html=True)
                             if not is_blank(r.get("admin_note")):
                                 st.caption(f"📝 Admin Note: {r['admin_note']}")
 
                         if r["status"] in ("On Trip", "Completed"):
-                            st.write(f"**Gate Out (Actual Exit):** {fmt(r.get('actual_exit_time'))}  |  **Start KM:** {fmt(r.get('start_km'))}")
+                            st.write(f"**Gate Out (Actual Exit):** {fmt_time_12h(r.get('actual_exit_time'))}  |  **Start KM:** {fmt(r.get('start_km'))}")
                         if r["status"] == "Completed":
-                            st.write(f"**Gate In (Actual Return):** {fmt(r.get('actual_return_time'))}  |  **End KM:** {fmt(r.get('end_km'))}  |  **Total KM:** {fmt(r.get('total_km'))}")
+                            st.write(f"**Gate In (Actual Return):** {fmt_time_12h(r.get('actual_return_time'))}  |  **End KM:** {fmt(r.get('end_km'))}  |  **Total KM:** {fmt(r.get('total_km'))}")
 
                         if r["status"] == "Rejected":
                             st.error("This request was rejected by the admin.")
@@ -1123,8 +1282,8 @@ elif user["role"] == "security_officer":
                         st.write(f"**Vehicle:** {fmt(r['vehicle_number'], 'N/A')} ({r['vehicle_type']})")
                     with c2:
                         st.write(f"**Destination:** {r['destination']}")
-                        st.write(f"**Requested Time:** {r['date_of_travel']} at {r['time_of_travel']}")
-                        st.write(f"**Admin Approved Time:** {approved_time}")
+                        st.write(f"**Requested Time:** {r['date_of_travel']} at {fmt_time_12h(r['time_of_travel'])}")
+                        st.write(f"**Admin Approved Time:** {fmt_time_12h(approved_time)}")
                     if not is_blank(r.get("admin_note")):
                         st.caption(f"📝 Admin Notes: {r['admin_note']}")
 
@@ -1162,7 +1321,7 @@ elif user["role"] == "security_officer":
                         st.write(f"**Vehicle:** {fmt(r['vehicle_number'], 'N/A')} ({r['vehicle_type']})")
                         st.write(f"**Destination:** {r['destination']}")
                     with c2:
-                        st.write(f"**Gate Out Time:** {fmt(r.get('actual_exit_time'))}")
+                        st.write(f"**Gate Out Time:** {fmt_time_12h(r.get('actual_exit_time'))}")
                         st.write(f"**Start KM:** {fmt(r.get('start_km'))}")
 
                     start_km_val = 0.0 if is_blank(r.get("start_km")) else float(r.get("start_km"))
@@ -1192,51 +1351,206 @@ elif user["role"] == "security_officer":
                                 st.error(f"❌ Failed to record Gate In: {e}")
 
 # =========================================================
+# 9B. DRIVER DASHBOARD — My Assigned Trips & Odometer Entry (NEW)
+# =========================================================
+elif user["role"] == "driver":
+    company_header("🚙 Driver Dashboard — My Assigned Trips")
+    st.caption(f"Logged in as {user['full_name']} — Driver")
+    st.info(
+        "This view only shows trips where the **Driver Name** on the requisition "
+        "matches your registered Full Name. If a trip you drove isn't listed here, "
+        "ask an Admin to check the name spelling in **Manage Drivers & Vehicles**."
+    )
+
+    with st.spinner("Loading your assigned trips..."):
+        my_trips = fetch_requisitions_by_driver(user["full_name"])
+
+    approved_trips = my_trips[my_trips["status"] == "Approved"] if not my_trips.empty else my_trips
+
+    if approved_trips.empty:
+        st.info("You have no Approved trips waiting for KM entry right now.")
+    else:
+        for _, r in approved_trips.iterrows():
+            auto_start = get_last_driver_end_km(user["full_name"], r.get("vehicle_number", ""))
+            existing_start = r.get("driver_start_km")
+            existing_end = r.get("driver_end_km")
+            prefill_start = float(existing_start) if not is_blank(existing_start) else auto_start
+
+            with st.expander(
+                f"🟢 {r['request_id']} — {r['destination']}  |  Vehicle: {fmt(r.get('vehicle_number'), 'N/A')}"
+            ):
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.write(f"**Applicant:** {r['applicant_name']} ({r['department']})")
+                    st.write(f"**Date/Time:** {r['date_of_travel']} at {fmt_time_12h(r['time_of_travel'])}")
+                with c2:
+                    approved_time = r["time_of_travel"] if is_blank(r.get("approved_time")) else r.get("approved_time")
+                    st.write(f"**Approved Departure Time:** {fmt_time_12h(approved_time)}")
+                    st.write(f"**Vehicle Type:** {r['vehicle_type']}")
+
+                if not is_blank(auto_start) and auto_start > 0 and is_blank(existing_start):
+                    st.caption(
+                        f"↩️ Auto-filled Start KM ({auto_start:.1f}) from your last logged End KM for "
+                        f"**{fmt(r.get('vehicle_number'))}** — change it below if needed."
+                    )
+
+                with st.form(f"driver_km_{r['request_id']}"):
+                    d_start_km = st.number_input(
+                        "Start KM (editable) *", min_value=0.0, step=1.0, format="%.1f",
+                        value=float(prefill_start), key=f"dstart_{r['request_id']}",
+                    )
+                    d_end_km = st.number_input(
+                        "End KM (leave as 0 if you haven't returned yet)",
+                        min_value=0.0, step=1.0, format="%.1f",
+                        value=float(existing_end) if not is_blank(existing_end) else 0.0,
+                        key=f"dend_{r['request_id']}",
+                    )
+                    save_clicked = st.form_submit_button(
+                        "💾 Save My KM Entry", type="primary", use_container_width=True
+                    )
+
+                if save_clicked:
+                    if d_end_km and d_end_km < d_start_km:
+                        st.error("End KM cannot be less than Start KM.")
+                    else:
+                        try:
+                            submit_driver_km(
+                                r["request_id"],
+                                driver_start_km=d_start_km,
+                                driver_end_km=d_end_km if d_end_km > 0 else None,
+                            )
+                            st.success("✅ Your KM entry has been saved.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Failed to save your KM entry: {e}")
+
+# =========================================================
 # 10. ADMIN DASHBOARD
 # =========================================================
 elif user["role"] == "admin":
     company_header("🔐 Admin Dashboard")
     st.caption(f"Logged in as {user['full_name']} — Admin")
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "⏳ Pending User Approvals", "👥 All Users", "🚗 Pending Requisitions",
-        "📊 Analytics", "📁 All Requisitions & Export", "🚘 Manage Drivers & Vehicles",
-        "🕒 Duty Tracker & Analytics",
-    ])
+    # Reordered per business requirement: "Pending Requests" is now the first
+    # (default) tab an admin sees. Visual order comes purely from this label
+    # list — each variable below is named for what it holds, not its position,
+    # so the underlying tab bodies didn't need to be reshuffled in the file.
+    tab_pending_req, tab_users, tab_pending_users, tab_analytics, tab_export, \
+        tab_fleet, tab_duty, tab_variance = st.tabs([
+            "🚗 Pending Requests", "👥 User List", "⏳ ID Requests", "📊 Analytics",
+            "📁 All Requisitions & Export", "🚘 Manage Drivers & Vehicles",
+            "🕒 Duty Tracker & Analytics", "📈 KM Variance Report",
+        ])
 
-    # ---------------- TAB 1: Pending User Approvals ----------------
-    with tab1:
-        st.subheader("New Account Requests")
-        with st.spinner("Loading users..."):
-            users_df = fetch_all_users()
-        pending_users = users_df[users_df["status"] == "Pending"] if not users_df.empty else users_df
+    # Hoisted above every tab body so both users_df and df_all are guaranteed
+    # ready regardless of which tab runs first in code — previously these
+    # were only fetched inside specific tab bodies (old Tab 1 / old Tab 3),
+    # which would have broken once those tabs were reordered.
+    with st.spinner("Loading users and requisitions..."):
+        users_df = fetch_all_users()
+        df_all = fetch_all_requisitions()
 
-        if pending_users.empty:
-            st.success("🎉 No pending user registrations.")
+    # ---------------- Pending Requests (was Tab 3) ----------------
+    with tab_pending_req:
+        st.subheader("Requisitions Awaiting Action")
+        pending_df = df_all[df_all["status"] == "Pending"] if not df_all.empty else df_all
+
+        # Fetched once for this tab render and shared across every pending-request
+        # card below, so each dropdown reflects the same up-to-date driver/vehicle list.
+        drivers_df = fetch_all_drivers()
+        vehicles_df = fetch_all_vehicles()
+        driver_contact_map = dict(zip(drivers_df["driver_name"], drivers_df["driver_contact"])) if not drivers_df.empty else {}
+        driver_options = ["— Select Driver —"] + drivers_df["driver_name"].tolist() if not drivers_df.empty else []
+        vehicle_options = ["— Select Vehicle —"] + vehicles_df["vehicle_number"].tolist() if not vehicles_df.empty else []
+
+        if drivers_df.empty or vehicles_df.empty:
+            st.warning(
+                "⚠️ No drivers and/or vehicles are registered yet. Add them under the "
+                "**🚘 Manage Drivers & Vehicles** tab before you can approve requests."
+            )
+
+        if pending_df.empty:
+            st.success("🎉 No pending requisitions — all caught up!")
         else:
-            for _, u in pending_users.iterrows():
-                role_tag = "🛡️ Security Officer" if u.get("role") == "security_officer" else "👤 Employee"
-                with st.expander(f"{role_tag} — {u['full_name']} (@{u['username']})"):
-                    if u.get("role") == "security_officer":
-                        st.write("**Role Requested:** Security Officer")
-                    else:
-                        st.write(f"**Designation:** {u.get('designation', '')}")
-                        st.write(f"**Employee ID:** {u.get('employee_id', '')}")
-                        st.write(f"**Department:** {u.get('department', '')}")
-                        st.write(f"**Mobile:** {u.get('mobile', '')}")
-                    st.write(f"**Requested on:** {u.get('created_at', '')}")
+            for _, r in pending_df.iterrows():
+                with st.expander(f"🟡 {r['request_id']} — {r['applicant_name']} ({r['department']}) → {r['destination']}"):
                     c1, c2 = st.columns(2)
-                    if c1.button("✅ Approve", key=f"appr_{u['username']}", type="primary", use_container_width=True):
-                        update_user(u["username"], {"status": "Approved"})
-                        st.success(f"{u['full_name']} approved.")
-                        st.rerun()
-                    if c2.button("❌ Reject", key=f"rej_{u['username']}", use_container_width=True):
-                        update_user(u["username"], {"status": "Rejected"})
-                        st.warning(f"{u['full_name']} rejected.")
-                        st.rerun()
+                    with c1:
+                        st.write(f"**Mobile:** {r['mobile_number']}")
+                        st.write(f"**Date/Time:** {r['date_of_travel']} at {fmt_time_12h(r['time_of_travel'])}")
+                        st.write(f"**Passengers:** {r['passenger_count']}")
+                    with c2:
+                        st.write(f"**Vehicle Type:** {r['vehicle_type']}")
+                        st.write(f"**Purpose:** {r['purpose']}")
+                        st.write(f"**Special Request:** {r['special_request'] or '—'}")
 
-    # ---------------- TAB 2: All Users (management) ----------------
-    with tab2:
+                    # These two selects live OUTSIDE the form on purpose: widgets inside
+                    # an st.form don't rerun the script until submit, so picking a driver
+                    # wouldn't reveal their contact number until after clicking Approve.
+                    # Outside the form, the contact updates the instant a driver is chosen.
+                    d1, d2 = st.columns(2)
+                    with d1:
+                        selected_driver = st.selectbox(
+                            "Driver Name", driver_options or ["No drivers available"],
+                            key=f"drv_{r['request_id']}", disabled=not driver_options,
+                        )
+                    with d2:
+                        bound_contact = driver_contact_map.get(selected_driver, "")
+                        st.text_input("Driver Contact (auto-filled)", value=bound_contact, disabled=True,
+                                      key=f"dc_disp_{r['request_id']}")
+                    selected_vehicle = st.selectbox(
+                        "Vehicle Number", vehicle_options or ["No vehicles available"],
+                        key=f"veh_{r['request_id']}", disabled=not vehicle_options,
+                    )
+
+                    with st.form(f"action_{r['request_id']}"):
+                        try:
+                            default_time = datetime.strptime(r["time_of_travel"], "%H:%M").time()
+                        except (ValueError, TypeError):
+                            default_time = datetime.now().time()
+                        approved_time = st.time_input(
+                            "Approved Departure Time",
+                            value=default_time,
+                            help=f"Originally requested for {fmt_time_12h(r['time_of_travel'])}. Adjust if rescheduling.",
+                            key=f"atime_{r['request_id']}",
+                        )
+                        admin_note = st.text_area(
+                            "Admin Note / Remarks (optional)",
+                            placeholder="e.g., Rescheduled due to vehicle availability, or reason for rejection",
+                            key=f"note_{r['request_id']}",
+                        )
+
+                        b1, b2 = st.columns(2)
+                        approve_clicked = b1.form_submit_button("✅ Approve", type="primary", use_container_width=True)
+                        reject_clicked = b2.form_submit_button("❌ Reject", use_container_width=True)
+
+                    if approve_clicked or reject_clicked:
+                        new_status = "Approved" if approve_clicked else "Rejected"
+                        driver_ready = driver_options and selected_driver != "— Select Driver —"
+                        vehicle_ready = vehicle_options and selected_vehicle != "— Select Vehicle —"
+                        if approve_clicked and not (driver_ready and vehicle_ready):
+                            st.error("Please select a Driver and a Vehicle before approving.")
+                        else:
+                            try:
+                                updates = {
+                                    "status": new_status,
+                                    "driver_name": selected_driver if approve_clicked else "",
+                                    "driver_contact": driver_contact_map.get(selected_driver, "") if approve_clicked else "",
+                                    "vehicle_number": selected_vehicle if approve_clicked else "",
+                                    "approved_by": user["full_name"],
+                                    "action_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    "admin_note": admin_note.strip(),
+                                }
+                                if approve_clicked:
+                                    updates["approved_time"] = approved_time.strftime("%H:%M")
+                                update_requisition(r["request_id"], updates)
+                                st.success(f"Request {r['request_id']} marked as {new_status}.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"❌ Update failed: {e}")
+
+    # ---------------- User List (was Tab 2) ----------------
+    with tab_users:
         st.subheader("All User Accounts")
         if users_df.empty:
             st.info("No users yet.")
@@ -1293,109 +1607,43 @@ elif user["role"] == "admin":
                         except Exception as e:
                             st.error(f"❌ Failed to delete user: {e}")
 
-    # ---------------- TAB 3: Pending Requisitions ----------------
-    with tab3:
-        st.subheader("Requisitions Awaiting Action")
-        with st.spinner("Loading requisitions..."):
-            df_all = fetch_all_requisitions()
-        pending_df = df_all[df_all["status"] == "Pending"] if not df_all.empty else df_all
+    # ---------------- ID Requests (was Tab 1) ----------------
+    with tab_pending_users:
+        st.subheader("New Account Requests")
+        pending_users = users_df[users_df["status"] == "Pending"] if not users_df.empty else users_df
 
-        # Fetched once for this tab render and shared across every pending-request
-        # card below, so each dropdown reflects the same up-to-date driver/vehicle list.
-        drivers_df = fetch_all_drivers()
-        vehicles_df = fetch_all_vehicles()
-        driver_contact_map = dict(zip(drivers_df["driver_name"], drivers_df["driver_contact"])) if not drivers_df.empty else {}
-        driver_options = ["— Select Driver —"] + drivers_df["driver_name"].tolist() if not drivers_df.empty else []
-        vehicle_options = ["— Select Vehicle —"] + vehicles_df["vehicle_number"].tolist() if not vehicles_df.empty else []
-
-        if drivers_df.empty or vehicles_df.empty:
-            st.warning(
-                "⚠️ No drivers and/or vehicles are registered yet. Add them under the "
-                "**🚘 Manage Drivers & Vehicles** tab before you can approve requests."
-            )
-
-        if pending_df.empty:
-            st.success("🎉 No pending requisitions — all caught up!")
+        if pending_users.empty:
+            st.success("🎉 No pending user registrations.")
         else:
-            for _, r in pending_df.iterrows():
-                with st.expander(f"🟡 {r['request_id']} — {r['applicant_name']} ({r['department']}) → {r['destination']}"):
+            for _, u in pending_users.iterrows():
+                role_req = u.get("role")
+                if role_req == "security_officer":
+                    role_tag = "🛡️ Security Officer"
+                elif role_req == "driver":
+                    role_tag = "🚙 Driver"
+                else:
+                    role_tag = "👤 Employee"
+                with st.expander(f"{role_tag} — {u['full_name']} (@{u['username']})"):
+                    if role_req in ("security_officer", "driver"):
+                        st.write(f"**Role Requested:** {ROLE_DISPLAY.get(role_req, role_req)}")
+                    else:
+                        st.write(f"**Designation:** {u.get('designation', '')}")
+                        st.write(f"**Employee ID:** {u.get('employee_id', '')}")
+                        st.write(f"**Department:** {u.get('department', '')}")
+                        st.write(f"**Mobile:** {u.get('mobile', '')}")
+                    st.write(f"**Requested on:** {fmt_time_12h(u.get('created_at', ''), u.get('created_at', ''))}")
                     c1, c2 = st.columns(2)
-                    with c1:
-                        st.write(f"**Mobile:** {r['mobile_number']}")
-                        st.write(f"**Date/Time:** {r['date_of_travel']} at {r['time_of_travel']}")
-                        st.write(f"**Passengers:** {r['passenger_count']}")
-                    with c2:
-                        st.write(f"**Vehicle Type:** {r['vehicle_type']}")
-                        st.write(f"**Purpose:** {r['purpose']}")
-                        st.write(f"**Special Request:** {r['special_request'] or '—'}")
+                    if c1.button("✅ Approve", key=f"appr_{u['username']}", type="primary", use_container_width=True):
+                        update_user(u["username"], {"status": "Approved"})
+                        st.success(f"{u['full_name']} approved.")
+                        st.rerun()
+                    if c2.button("❌ Reject", key=f"rej_{u['username']}", use_container_width=True):
+                        update_user(u["username"], {"status": "Rejected"})
+                        st.warning(f"{u['full_name']} rejected.")
+                        st.rerun()
 
-                    # These two selects live OUTSIDE the form on purpose: widgets inside
-                    # an st.form don't rerun the script until submit, so picking a driver
-                    # wouldn't reveal their contact number until after clicking Approve.
-                    # Outside the form, the contact updates the instant a driver is chosen.
-                    d1, d2 = st.columns(2)
-                    with d1:
-                        selected_driver = st.selectbox(
-                            "Driver Name", driver_options or ["No drivers available"],
-                            key=f"drv_{r['request_id']}", disabled=not driver_options,
-                        )
-                    with d2:
-                        bound_contact = driver_contact_map.get(selected_driver, "")
-                        st.text_input("Driver Contact (auto-filled)", value=bound_contact, disabled=True,
-                                      key=f"dc_disp_{r['request_id']}")
-                    selected_vehicle = st.selectbox(
-                        "Vehicle Number", vehicle_options or ["No vehicles available"],
-                        key=f"veh_{r['request_id']}", disabled=not vehicle_options,
-                    )
-
-                    with st.form(f"action_{r['request_id']}"):
-                        try:
-                            default_time = datetime.strptime(r["time_of_travel"], "%H:%M").time()
-                        except (ValueError, TypeError):
-                            default_time = datetime.now().time()
-                        approved_time = st.time_input(
-                            "Approved Departure Time",
-                            value=default_time,
-                            help=f"Originally requested for {r['time_of_travel']}. Adjust if rescheduling.",
-                            key=f"atime_{r['request_id']}",
-                        )
-                        admin_note = st.text_area(
-                            "Admin Note / Remarks (optional)",
-                            placeholder="e.g., Rescheduled due to vehicle availability, or reason for rejection",
-                            key=f"note_{r['request_id']}",
-                        )
-
-                        b1, b2 = st.columns(2)
-                        approve_clicked = b1.form_submit_button("✅ Approve", type="primary", use_container_width=True)
-                        reject_clicked = b2.form_submit_button("❌ Reject", use_container_width=True)
-
-                    if approve_clicked or reject_clicked:
-                        new_status = "Approved" if approve_clicked else "Rejected"
-                        driver_ready = driver_options and selected_driver != "— Select Driver —"
-                        vehicle_ready = vehicle_options and selected_vehicle != "— Select Vehicle —"
-                        if approve_clicked and not (driver_ready and vehicle_ready):
-                            st.error("Please select a Driver and a Vehicle before approving.")
-                        else:
-                            try:
-                                updates = {
-                                    "status": new_status,
-                                    "driver_name": selected_driver if approve_clicked else "",
-                                    "driver_contact": driver_contact_map.get(selected_driver, "") if approve_clicked else "",
-                                    "vehicle_number": selected_vehicle if approve_clicked else "",
-                                    "approved_by": user["full_name"],
-                                    "action_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                    "admin_note": admin_note.strip(),
-                                }
-                                if approve_clicked:
-                                    updates["approved_time"] = approved_time.strftime("%H:%M")
-                                update_requisition(r["request_id"], updates)
-                                st.success(f"Request {r['request_id']} marked as {new_status}.")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"❌ Update failed: {e}")
-
-    # ---------------- TAB 4: Analytics ----------------
-    with tab4:
+    # ---------------- Analytics (was Tab 4) ----------------
+    with tab_analytics:
         st.subheader("📊 Visual Analytics")
         if df_all.empty:
             st.info("No data yet.")
@@ -1426,9 +1674,17 @@ elif user["role"] == "admin":
                 fig2.update_layout(height=380)
                 st.plotly_chart(fig2, use_container_width=True)
 
-            if "total_km" in df_all.columns and df_all["total_km"].notna().any():
-                total_km_all = pd.to_numeric(df_all["total_km"], errors="coerce").dropna().sum()
-                st.metric("🛣️ Total KM Covered (Completed Trips)", f"{total_km_all:.1f} KM")
+            # Driver-verified KM (falls back to Security's Gate-In/Out
+            # readings only when a driver hasn't logged their own numbers)
+            # is now the primary source for this metric, per business
+            # requirement — the metric itself is unchanged, only its source.
+            completed_trips = df_all[df_all["status"] == "Completed"].copy()
+            if not completed_trips.empty:
+                completed_trips["_eff_km"] = completed_trips.apply(
+                    lambda row: effective_km_fields(row)[2], axis=1
+                )
+                total_km_all = float(completed_trips["_eff_km"].sum())
+                st.metric("🛣️ Total KM Covered (Completed Trips — Driver-verified)", f"{total_km_all:.1f} KM")
 
             df_all["_dt"] = pd.to_datetime(df_all["date_of_travel"], errors="coerce")
             monthly = df_all.dropna(subset=["_dt"]).copy()
@@ -1439,8 +1695,8 @@ elif user["role"] == "admin":
                 fig3.update_layout(height=350)
                 st.plotly_chart(fig3, use_container_width=True)
 
-    # ---------------- TAB 5: All Requisitions + Filters + Export ----------------
-    with tab5:
+    # ---------------- All Requisitions & Export (was Tab 5) ----------------
+    with tab_export:
         st.subheader("📁 All Requisitions — Search, Filter & Export")
         if df_all.empty:
             st.info("No data yet.")
@@ -1471,7 +1727,11 @@ elif user["role"] == "admin":
                 start_d, end_d = date_range
                 filtered = filtered[(filtered["_dt"] >= pd.Timestamp(start_d)) & (filtered["_dt"] <= pd.Timestamp(end_d))]
 
-            filtered_display = filtered.drop(columns=["_dt"], errors="ignore")
+            filtered_display = filtered.drop(columns=["_dt"], errors="ignore").copy()
+            if "time_of_travel" in filtered_display.columns:
+                filtered_display["time_of_travel"] = filtered_display["time_of_travel"].apply(
+                    lambda v: fmt_time_12h(v, v)
+                )
             st.dataframe(filtered_display, use_container_width=True, hide_index=True, height=340)
 
             filters_summary = (
@@ -1494,8 +1754,8 @@ elif user["role"] == "admin":
                                     mime="application/pdf",
                                     use_container_width=True)
 
-    # ---------------- TAB 6: Manage Drivers & Vehicles ----------------
-    with tab6:
+    # ---------------- Manage Drivers & Vehicles (was Tab 6) ----------------
+    with tab_fleet:
         st.subheader("🚘 Manage Drivers & Vehicles")
         st.caption("These lists power the Driver and Vehicle dropdowns admins use when approving requisitions.")
 
@@ -1570,18 +1830,18 @@ elif user["role"] == "admin":
                         except Exception as e:
                             st.error(f"❌ Failed to delete vehicle: {e}")
 
-    # ---------------- TAB 7: Duty Tracker & Analytics ----------------
-    with tab7:
+    # ---------------- Duty Tracker & Analytics (was Tab 7) ----------------
+    with tab_duty:
         st.subheader("🕒 Vehicle & Driver Duty Tracker & Analytics Dashboard")
         st.caption(
             "Filter any custom date/time window plus a specific vehicle or driver to see live duty "
             "duration, distance, and trip counts — with CSV / Excel / PDF export."
         )
 
-        # ---- Reuse the same requisitions dataset already fetched in Tab 3/4 above ----
-        # `df_all` was populated by fetch_all_requisitions() earlier in the Admin
-        # Dashboard block, so we don't hit Supabase again here. Swap this for your
-        # own DataFrame if you wire this tab up standalone.
+        # ---- Reuse the same requisitions dataset already fetched above ----
+        # `df_all` is now hoisted above every admin tab, so we don't hit
+        # Supabase again here. Swap this for your own DataFrame if you wire
+        # this tab up standalone.
         duty_df_raw = df_all.copy()
 
         if duty_df_raw.empty:
@@ -1691,11 +1951,16 @@ elif user["role"] == "admin":
 
             # -------------------------------------------------------------
             # STEP 4 — Derived fields: duty duration in hours, total KM.
+            # Total KM now comes from effective_km_fields(), which prefers
+            # the Driver's own logged Start/End KM and falls back to
+            # Security's Gate-Out/Gate-In readings only when the driver
+            # hasn't submitted their own numbers yet (business requirement:
+            # Driver KM is the primary baseline metric for duty tracking).
             # -------------------------------------------------------------
             duty_filtered["_duration_hrs"] = (
                 (duty_filtered["_end_dt"] - duty_filtered["_start_dt"]).dt.total_seconds() / 3600.0
             ).round(2)
-            duty_filtered["_km"] = pd.to_numeric(duty_filtered.get("total_km"), errors="coerce").fillna(0.0)
+            duty_filtered["_km"] = duty_filtered.apply(lambda row: effective_km_fields(row)[2], axis=1)
 
             st.markdown("---")
             st.markdown("##### 📌 Summary")
@@ -1745,8 +2010,8 @@ elif user["role"] == "admin":
                 detail_display = pd.DataFrame({
                     "Vehicle No": duty_filtered["vehicle_number"].map(lambda v: fmt(v, "—")),
                     "Driver Name": duty_filtered["driver_name"].map(lambda v: fmt(v, "—")),
-                    "Start Time": duty_filtered["_start_dt"].dt.strftime("%Y-%m-%d %H:%M"),
-                    "End Time": duty_filtered["_end_dt"].dt.strftime("%Y-%m-%d %H:%M"),
+                    "Start Time": duty_filtered["_start_dt"].dt.strftime("%Y-%m-%d %I:%M %p"),
+                    "End Time": duty_filtered["_end_dt"].dt.strftime("%Y-%m-%d %I:%M %p"),
                     "Total KM": duty_filtered["_km"].round(1),
                     "Duty Duration (Hrs)": duty_filtered["_duration_hrs"],
                     "Route / Purpose": duty_filtered["destination"].fillna("").astype(str)
@@ -1760,7 +2025,7 @@ elif user["role"] == "admin":
             # PDF's KPI block — plug in any additional metrics here as needed.
             # -------------------------------------------------------------
             summary_metrics = {
-                "Date/Time Range": f"{range_start.strftime('%Y-%m-%d %H:%M')} to {range_end.strftime('%Y-%m-%d %H:%M')}",
+                "Date/Time Range": f"{range_start.strftime('%Y-%m-%d %I:%M %p')} to {range_end.strftime('%Y-%m-%d %I:%M %p')}",
                 "Vehicle Filter": duty_vehicle_filter,
                 "Driver Filter": duty_driver_filter,
                 "Total Distance (KM)": f"{total_km:.1f}",
@@ -1796,6 +2061,77 @@ elif user["role"] == "admin":
                     "⬇️ Download PDF (.pdf)", data=duty_pdf_bytes, file_name="duty_tracker_report.pdf",
                     mime="application/pdf", use_container_width=True,
                 )
+
+    # ---------------- KM Variance Report (NEW) ----------------
+    with tab_variance:
+        st.subheader("📈 KM Variance Report — Driver vs Security Readings")
+        st.caption(
+            "Compares the Driver's self-logged odometer readings against the "
+            "Security Officer's Gate-Out/Gate-In readings for the same trip. "
+            "Variance = (Driver End − Driver Start) − (Security End − Security Start)."
+        )
+
+        if df_all.empty or "driver_start_km" not in df_all.columns:
+            st.info(
+                "No driver-submitted KM data yet. This report populates once Drivers "
+                "start logging their Start/End KM from the Driver Dashboard."
+            )
+        else:
+            variance_source = df_all[df_all["driver_start_km"].notna()].copy()
+
+            if variance_source.empty:
+                st.info(
+                    "No driver-submitted KM entries yet. This report populates once "
+                    "Drivers start logging their Start/End KM from the Driver Dashboard."
+                )
+            else:
+                def _driver_dist(row):
+                    if is_blank(row.get("driver_start_km")) or is_blank(row.get("driver_end_km")):
+                        return None
+                    return round(float(row["driver_end_km"]) - float(row["driver_start_km"]), 1)
+
+                def _security_dist(row):
+                    if is_blank(row.get("start_km")) or is_blank(row.get("end_km")):
+                        return None
+                    return round(float(row["end_km"]) - float(row["start_km"]), 1)
+
+                rows = []
+                for _, r in variance_source.iterrows():
+                    d_dist = _driver_dist(r)
+                    s_dist = _security_dist(r)
+                    variance = round(d_dist - s_dist, 1) if (d_dist is not None and s_dist is not None) else None
+                    rows.append({
+                        "Trip ID": r.get("request_id", ""),
+                        "Vehicle No": fmt(r.get("vehicle_number")),
+                        "Driver Name": fmt(r.get("driver_name")),
+                        "Driver Start KM": fmt(r.get("driver_start_km")),
+                        "Driver End KM": fmt(r.get("driver_end_km")),
+                        "Security Start KM": fmt(r.get("start_km")),
+                        "Security End KM": fmt(r.get("end_km")),
+                        "Variance (KM)": variance if variance is not None else "—",
+                    })
+
+                # Plain, standard st.dataframe — no background colors or
+                # highlight styling, per requirement.
+                variance_df = pd.DataFrame(rows)
+                st.dataframe(variance_df, use_container_width=True, hide_index=True, height=400)
+
+                colA, colB = st.columns(2)
+                with colA:
+                    var_excel = build_excel_report(variance_df)
+                    st.download_button(
+                        "⬇️ Export to Excel (.xlsx)", data=var_excel,
+                        file_name="km_variance_report.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+                with colB:
+                    csv_bytes = variance_df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "⬇️ Export to CSV (.csv)", data=csv_bytes,
+                        file_name="km_variance_report.csv", mime="text/csv",
+                        use_container_width=True,
+                    )
 
 # =========================================================
 # 11. FALLBACK — unrecognized role
