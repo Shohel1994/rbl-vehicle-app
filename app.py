@@ -145,7 +145,7 @@ SESSIONS_TABLE = "sessions"
 SESSION_COOKIE_NAME = "rbl_vms_session"
 SESSION_LIFETIME_DAYS = 30
 
-VEHICLE_TYPES = ["Private Car", "HIACE", "Pick-up Van", "Covered Van", "Truck", "Shipment Vehicle", "Other"]
+VEHICLE_TYPES = ["HIACE", "Private Car", "Pick-up Van", "Covered Van", "Truck", "Shipment Vehicle", "Other"]
 DEPARTMENTS = [
     "Accounts", "Warehouse", "Factory Merchandising", "Commercial", "Floor Operation",
     "TSD", "QMS", "Production Planning & Control", "Cutting", "R & D", "Admin",
@@ -154,12 +154,13 @@ DEPARTMENTS = [
 
 # Account status (users table) — approval workflow for logins
 USER_STATUS_OPTIONS = ["Pending", "Approved", "Rejected"]
-ROLE_OPTIONS = ["user", "security_officer", "driver", "admin"]
+ROLE_OPTIONS = ["user", "security_officer", "driver", "admin", "executive"]
 ROLE_DISPLAY = {
     "user": "Employee",
     "security_officer": "Security Officer",
     "driver": "Driver",
     "admin": "Admin",
+    "executive": "Executive / Management",
 }
 
 # Requisition status (requisitions table) — full trip lifecycle
@@ -235,6 +236,34 @@ def fmt_time_12h(value, default: str = "—") -> str:
 
 def hash_password(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def time_input_12h(label: str, key_prefix: str, default_time=None):
+    """A 12-hour AM/PM time-entry widget built from three selectboxes
+    (Hour / Minute / AM-PM), since st.time_input has no AM/PM display mode
+    of its own. Returns a plain datetime.time object — exactly what
+    st.time_input returns — so every existing call site that does
+    `.strftime('%H:%M')` on the result keeps working unchanged."""
+    if default_time is None:
+        default_time = datetime.now().time()
+    default_12h = default_time.strftime("%I:%M %p")  # e.g. "09:05 AM"
+    d_hour, d_rest = default_12h.split(":")
+    d_minute, d_ampm = d_rest.split(" ")
+    hours = [f"{h:02d}" for h in range(1, 13)]
+    minutes = [f"{m:02d}" for m in range(0, 60)]
+
+    st.markdown(f"**{label}**")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        h = st.selectbox("Hour", hours, index=hours.index(d_hour) if d_hour in hours else 0,
+                          key=f"{key_prefix}_hour")
+    with c2:
+        m = st.selectbox("Minute", minutes, index=minutes.index(d_minute) if d_minute in minutes else 0,
+                          key=f"{key_prefix}_minute")
+    with c3:
+        ap = st.selectbox("AM/PM", ["AM", "PM"], index=0 if d_ampm == "AM" else 1,
+                           key=f"{key_prefix}_ampm")
+    return datetime.strptime(f"{h}:{m} {ap}", "%I:%M %p").time()
 
 
 # =========================================================
@@ -403,18 +432,53 @@ def get_last_driver_end_km(driver_name: str, vehicle_number: str) -> float:
     return 0.0
 
 
-def submit_driver_km(request_id: str, driver_start_km=None, driver_end_km=None):
-    """Raw Supabase update — deliberately bypasses update_requisition() (and
-    its Telegram alert). A driver logging their own KM isn't a trip-status
-    change and shouldn't fire the same 'Requisition Status Updated!' group
-    alert as Approve/Reject/Gate-In/Gate-Out."""
-    sb = get_supabase_client()
-    updates = {"driver_km_updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+def submit_driver_km(row: dict, driver_start_km=None, driver_end_km=None):
+    """Saves the driver's own odometer entry AND drives the trip's lifecycle
+    status — per business requirement, the Driver's KM entries are now what
+    move a trip forward, not just Security's Gate panel:
+      - Start KM only  -> status Approved -> On Trip. actual_exit_time is
+        stamped now (only if Security hasn't already logged one).
+      - End KM present -> status -> Completed. actual_return_time is stamped
+        now (only if Security hasn't already logged one), and total_km is
+        filled from the driver's own distance if Security hasn't recorded
+        one.
+    This reuses update_requisition() (rather than a raw Supabase call) so the
+    Telegram alert keeps the EXACT same "📢 Requisition Status Updated!"
+    format that Security's Gate Out/Gate In has always used — only the
+    trigger has moved, from Security's entry to the Driver's own entry.
+    `row` is the full existing requisition dict (from
+    fetch_requisitions_by_driver), used only so we never clobber a timestamp
+    or total Security has already logged — Security's own start_km/end_km
+    columns are never written here, and Security can still Gate Out/Gate In
+    independently at any time for cross-verification (see the KM Variance
+    Report tab)."""
+    request_id = row["request_id"]
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    updates = {
+        "driver_km_updated_at": now_str,
+        # Re-affirm these (unchanged) values so update_requisition()'s
+        # Telegram alert includes the Driver/Vehicle lines exactly like it
+        # always has for Security-triggered updates.
+        "driver_name": row.get("driver_name", ""),
+        "vehicle_number": row.get("vehicle_number", ""),
+    }
     if driver_start_km is not None:
         updates["driver_start_km"] = float(driver_start_km)
     if driver_end_km is not None:
         updates["driver_end_km"] = float(driver_end_km)
-    sb.table(REQUISITIONS_TABLE).update(updates).eq("request_id", request_id).execute()
+
+    if driver_end_km is not None:
+        updates["status"] = "Completed"
+        if is_blank(row.get("actual_return_time")):
+            updates["actual_return_time"] = now_str
+        if is_blank(row.get("total_km")) and driver_start_km is not None:
+            updates["total_km"] = round(float(driver_end_km) - float(driver_start_km), 1)
+    elif driver_start_km is not None and row.get("status") == "Approved":
+        updates["status"] = "On Trip"
+        if is_blank(row.get("actual_exit_time")):
+            updates["actual_exit_time"] = now_str
+
+    update_requisition(request_id, updates)
 
 
 def effective_km_fields(row) -> tuple:
@@ -432,6 +496,36 @@ def effective_km_fields(row) -> tuple:
         s, e = float(s_start), float(s_end)
         return s, e, round(e - s, 1)
     return None, None, 0.0
+
+
+def compute_duty_hours(row) -> float:
+    """How long a vehicle was actually out for a given trip, in hours.
+
+    Uses the same Security-logged Gate-Out/Gate-In timestamps
+    (actual_exit_time / actual_return_time) as the Duty Tracker tab, so the
+    numbers here always agree with that tab. A trip that hasn't Gated Out
+    yet contributes 0 hours; a trip that's still 'On Trip' (Gated Out but
+    not yet Gated In) counts up to right now, so an in-progress duty still
+    shows up in live totals instead of being ignored until it's Completed.
+    Read-only helper — never writes anything back to Supabase.
+    """
+    start_raw = row.get("actual_exit_time")
+    if is_blank(start_raw):
+        return 0.0
+    start_dt = pd.to_datetime(start_raw, errors="coerce", utc=True, format="mixed")
+    if pd.isna(start_dt):
+        return 0.0
+
+    end_raw = row.get("actual_return_time")
+    if is_blank(end_raw):
+        end_dt = pd.Timestamp.now(tz="UTC")
+    else:
+        end_dt = pd.to_datetime(end_raw, errors="coerce", utc=True, format="mixed")
+        if pd.isna(end_dt):
+            end_dt = pd.Timestamp.now(tz="UTC")
+
+    hours = (end_dt - start_dt).total_seconds() / 3600.0
+    return round(max(hours, 0.0), 2)
 
 
 # ------------------- DRIVERS & VEHICLES TABLE HELPERS -------------------
@@ -972,7 +1066,7 @@ def build_duty_tracker_excel(detail_df: pd.DataFrame, summary_metrics: dict) -> 
         for sheet_name, sheet_df in (("Summary", summary_df), ("Duty Log", detail_df)):
             ws = writer.sheets[sheet_name]
             for i, col in enumerate(sheet_df.columns, start=1):
-                width = max(12, min(40, int(sheet_df[col].astype(str).map(len).max() if not sheet_df.empty else 12) + 2))
+                width = max(12, min(40, int(sheet_df[col].astype(str).str.len().max() if not sheet_df.empty else 12) + 2))
                 ws.column_dimensions[get_column_letter(i)].width = width
 
     return buf.getvalue()
@@ -1055,6 +1149,329 @@ def build_duty_tracker_pdf(detail_df: pd.DataFrame, summary_metrics: dict, filte
                 row.cell(sanitize_pdf_text(fmt(r.get(col, ""), "")))
 
     return bytes(pdf.output())
+
+
+# =========================================================
+# 5C. MANAGEMENT / EXECUTIVE DASHBOARD — EXCEL + PDF REPORT GENERATORS
+# =========================================================
+# ADDITIVE helpers backing the new "Management Dashboard" (Section 10C).
+# Deliberately kept separate from every export helper above so nothing here
+# touches, shadows, or changes the behaviour of the existing Admin exports
+# (Tab 5 "All Requisitions & Export", the Duty Tracker, or the KM Variance
+# Report). This dashboard is READ-ONLY: it never calls insert_requisition(),
+# update_requisition(), or any Supabase write helper.
+
+def build_management_excel(kpis: dict, dept_df: pd.DataFrame, detail_df: pd.DataFrame,
+                            dept_duty_df: pd.DataFrame = None) -> bytes:
+    """Formatted .xlsx export for the Management Dashboard: a 'KPI Summary'
+    sheet, a 'Department Usage' sheet, an optional 'Department Duty Summary'
+    sheet (requests/completed/KM/duty-hours per department), and a
+    'Detailed Data' sheet with the full filtered requisition rows for the
+    selected date range. `dept_duty_df` is optional and defaults to None so
+    any existing caller that doesn't pass it keeps working unchanged."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        kpi_df = pd.DataFrame([{"Metric": k, "Value": v} for k, v in kpis.items()])
+        kpi_df.to_excel(writer, index=False, sheet_name="KPI Summary")
+        dept_df.to_excel(writer, index=False, sheet_name="Department Usage")
+        sheets = [("KPI Summary", kpi_df), ("Department Usage", dept_df)]
+        if dept_duty_df is not None:
+            dept_duty_df.to_excel(writer, index=False, sheet_name="Department Duty Summary")
+            sheets.append(("Department Duty Summary", dept_duty_df))
+        detail_df.to_excel(writer, index=False, sheet_name="Detailed Data")
+        sheets.append(("Detailed Data", detail_df))
+
+        from openpyxl.utils import get_column_letter
+        for sheet_name, sheet_df in sheets:
+            ws = writer.sheets[sheet_name]
+            for i, col in enumerate(sheet_df.columns, start=1):
+                width = max(12, min(40, int(sheet_df[col].astype(str).str.len().max() if not sheet_df.empty else 12) + 2))
+                ws.column_dimensions[get_column_letter(i)].width = width
+
+    return buf.getvalue()
+
+
+class ManagementPDF(FPDF):
+    """Separate FPDF subclass so the Executive summary report's branding can
+    evolve independently of the other report types in this file."""
+
+    def header(self):
+        self.set_font("Helvetica", "B", 16)
+        self.set_text_color(15, 98, 254)
+        self.cell(0, 9, COMPANY_NAME, align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+        self.set_font("Helvetica", "", 10)
+        self.set_text_color(90, 90, 90)
+        self.cell(0, 6, COMPANY_ADDRESS, align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+        self.set_font("Helvetica", "B", 12)
+        self.set_text_color(0, 0, 0)
+        self.cell(0, 8, "Executive Summary Report", align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        self.ln(2)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font("Helvetica", "I", 8)
+        self.set_text_color(150, 150, 150)
+        self.cell(0, 10, f"Page {self.page_no()}", align="C")
+
+
+def build_management_pdf(kpis: dict, dept_df: pd.DataFrame, filters_summary: str,
+                          dept_duty_df: pd.DataFrame = None) -> bytes:
+    """Summary-focused PDF: generation timestamp + active filters, a KPI
+    block (Total Requisitions / Completed / Pending / Total KM / etc.), a
+    Department-wise Usage table, and — when provided — a Department Duty
+    Summary table (requests, completed trips, total KM, and total duty
+    hours per department). `dept_duty_df` is optional and defaults to None
+    so any existing caller that doesn't pass it keeps working unchanged.
+    Kept deliberately light (no full row-level dump) since this is meant as
+    an at-a-glance Executive summary — full detail is in the Excel export."""
+    pdf = ManagementPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", size=10)
+    pdf.cell(0, 6, f"Generated on: {datetime.now().strftime('%Y-%m-%d %I:%M %p')}",
+              new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.multi_cell(0, 6, sanitize_pdf_text(filters_summary))
+    pdf.ln(2)
+
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 8, "Key Performance Indicators", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font("Helvetica", size=10)
+    pdf.set_fill_color(230, 230, 230)
+    for label, value in kpis.items():
+        pdf.cell(0, 8, sanitize_pdf_text(f"{label}: {value}"), border=1, fill=True,
+                  new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(6)
+
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 8, "Department-wise Vehicle Usage", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(1)
+
+    if dept_df is not None and not dept_df.empty:
+        pdf.set_font("Helvetica", size=9)
+        heading_style = FontFace(emphasis="BOLD", color=(255, 255, 255), fill_color=(15, 98, 254))
+        with pdf.table(col_widths=[110, 60], text_align="LEFT", first_row_as_headings=True,
+                       line_height=6, headings_style=heading_style, cell_fill_color=(245, 245, 245),
+                       cell_fill_mode="ROWS") as table:
+            header_row = table.row()
+            header_row.cell("Department")
+            header_row.cell("Requests")
+            for _, r in dept_df.iterrows():
+                row = table.row()
+                row.cell(sanitize_pdf_text(r.get("Department", "")))
+                row.cell(sanitize_pdf_text(r.get("Requests", "")))
+    else:
+        pdf.set_font("Helvetica", size=10)
+        pdf.cell(0, 8, "No data available for the selected date range.",
+                  new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    if dept_duty_df is not None:
+        pdf.ln(6)
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, "Department Duty & Distance Summary", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(1)
+
+        if not dept_duty_df.empty:
+            pdf.set_font("Helvetica", size=9)
+            heading_style = FontFace(emphasis="BOLD", color=(255, 255, 255), fill_color=(15, 98, 254))
+            cols = ["Department", "Total Requests", "Completed Trips", "Total KM", "Total Duty Hours"]
+            with pdf.table(col_widths=[52, 32, 32, 30, 34], text_align="LEFT", first_row_as_headings=True,
+                           line_height=6, headings_style=heading_style, cell_fill_color=(245, 245, 245),
+                           cell_fill_mode="ROWS") as table:
+                header_row = table.row()
+                for h in cols:
+                    header_row.cell(h)
+                for _, r in dept_duty_df.iterrows():
+                    row = table.row()
+                    for c in cols:
+                        row.cell(sanitize_pdf_text(r.get(c, "")))
+        else:
+            pdf.set_font("Helvetica", size=10)
+            pdf.cell(0, 8, "No duty data available for the selected date range.",
+                      new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    return bytes(pdf.output())
+
+
+def render_management_dashboard(df_all: pd.DataFrame):
+    """Read-only Executive/Management overview: a live 'today' snapshot,
+    top-level KPI cards, department-wise usage & duty-time breakdown, a
+    date-range filter, and Excel/PDF export buttons. Shared by both the
+    Admin Dashboard's 'Management Dashboard' tab and the standalone
+    'executive' role view — same function, same numbers, so the two roles
+    never see different totals for the same range."""
+    st.subheader("📈 Executive / Management Overview")
+
+    if df_all.empty:
+        st.info("No requisition data available yet.")
+        return
+
+    # ---------------------------------------------------------------
+    # LIVE "TODAY" SNAPSHOT — always reflects the current moment, using the
+    # full unfiltered dataset, regardless of whatever date range is picked
+    # below. This answers "what's happening right now / today" separately
+    # from the historical, range-filtered KPIs further down.
+    # ---------------------------------------------------------------
+    today = date.today()
+    st.markdown(f"##### 📅 Today's Live Snapshot — {today.strftime('%A, %d %B %Y')}")
+    st.caption("These counts are live and independent of the date-range filter below.")
+
+    created_dt = pd.to_datetime(df_all.get("created_at"), errors="coerce", utc=True, format="mixed")
+    return_dt = pd.to_datetime(df_all.get("actual_return_time"), errors="coerce", utc=True, format="mixed")
+    today_utc = pd.Timestamp.now(tz="UTC").normalize()
+
+    pending_now = int((df_all["status"] == "Pending").sum())
+    on_trip_now = int((df_all["status"] == "On Trip").sum())
+    requested_today = int((created_dt.dt.normalize() == today_utc).sum())
+    completed_today = int((return_dt.dt.normalize() == today_utc).sum())
+
+    t1, t2, t3, t4 = st.columns(4)
+    t1.metric("🟡 Pending Right Now", pending_now)
+    t2.metric("🔵 Vehicles On Trip Now", on_trip_now)
+    t3.metric("📥 Requests Submitted Today", requested_today)
+    t4.metric("✅ Trips Completed Today", completed_today)
+
+    work_df = df_all.copy()
+    work_df["_dt"] = pd.to_datetime(work_df["date_of_travel"], errors="coerce")
+    min_d = work_df["_dt"].min()
+    max_d = work_df["_dt"].max()
+    default_start = min_d.date() if pd.notnull(min_d) else date.today()
+    default_end = max_d.date() if pd.notnull(max_d) else date.today()
+
+    st.markdown("---")
+    st.markdown("##### 🔎 Date Range Filter")
+    dc1, dc2 = st.columns(2)
+    with dc1:
+        mgmt_start = st.date_input("Start Date", value=default_start, key="mgmt_start_date")
+    with dc2:
+        mgmt_end = st.date_input("End Date", value=default_end, key="mgmt_end_date")
+
+    if mgmt_start > mgmt_end:
+        st.error("⚠️ Start Date must be on or before End Date.")
+        return
+
+    filtered = work_df[
+        (work_df["_dt"] >= pd.Timestamp(mgmt_start)) & (work_df["_dt"] <= pd.Timestamp(mgmt_end))
+    ].copy()
+
+    total_requisitions = len(filtered)
+    completed_trips = int((filtered["status"] == "Completed").sum()) if not filtered.empty else 0
+    pending_requests = int((filtered["status"] == "Pending").sum()) if not filtered.empty else 0
+
+    if not filtered.empty:
+        completed_rows = filtered[filtered["status"] == "Completed"]
+        total_distance = (
+            float(completed_rows.apply(lambda row: effective_km_fields(row)[2], axis=1).sum())
+            if not completed_rows.empty else 0.0
+        )
+    else:
+        total_distance = 0.0
+
+    st.markdown("---")
+    st.markdown("##### 📌 Key Performance Indicators")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("📋 Total Requisitions", total_requisitions)
+    k2.metric("✅ Completed Trips", completed_trips)
+    k3.metric("🟡 Pending Requests", pending_requests)
+    k4.metric("🛣️ Total Distance (KM)", f"{total_distance:.1f}")
+
+    st.markdown("---")
+    st.markdown("##### 📊 Department-wise Vehicle Usage")
+    if filtered.empty:
+        st.info("No data available for the selected date range.")
+        dept_counts = pd.DataFrame(columns=["Department", "Requests"])
+    else:
+        dept_counts = filtered["department"].value_counts().reset_index()
+        dept_counts.columns = ["Department", "Requests"]
+        fig = px.bar(dept_counts, x="Department", y="Requests", color="Department", text="Requests",
+                     title="Department-wise Vehicle Usage")
+        fig.update_layout(showlegend=False, height=380)
+        st.plotly_chart(fig, use_container_width=True, key="mgmt_dept_chart")
+
+    # ---------------------------------------------------------------
+    # DEPARTMENT-WISE DUTY TIME — how many requests each department made,
+    # how many completed, how much distance was covered, and how long
+    # vehicles were actually out (duty hours) for that department, within
+    # the selected date range. Duty hours use the same actual_exit_time /
+    # actual_return_time fields as the Duty Tracker tab (compute_duty_hours),
+    # so an in-progress ("On Trip") duty still counts up to right now.
+    # ---------------------------------------------------------------
+    st.markdown("---")
+    st.markdown("##### ⏱️ Department-wise Vehicle Usage Time (Duty Hours)")
+
+    if filtered.empty:
+        st.info("No data available for the selected date range.")
+        dept_duty_df = pd.DataFrame(columns=["Department", "Total Requests", "Completed Trips",
+                                              "Total KM", "Total Duty Hours"])
+    else:
+        calc = filtered.copy()
+        calc["_km"] = calc.apply(lambda row: effective_km_fields(row)[2], axis=1)
+        calc["_hrs"] = calc.apply(compute_duty_hours, axis=1)
+        dept_duty_df = (
+            calc.groupby("department")
+            .agg(
+                **{
+                    "Total Requests": ("request_id", "count"),
+                    "Completed Trips": ("status", lambda s: int((s == "Completed").sum())),
+                    "Total KM": ("_km", "sum"),
+                    "Total Duty Hours": ("_hrs", "sum"),
+                }
+            )
+            .reset_index()
+            .rename(columns={"department": "Department"})
+        )
+        dept_duty_df["Total KM"] = dept_duty_df["Total KM"].round(1)
+        dept_duty_df["Total Duty Hours"] = dept_duty_df["Total Duty Hours"].round(1)
+        dept_duty_df = dept_duty_df.sort_values("Total Requests", ascending=False).reset_index(drop=True)
+
+        b1, b2 = st.columns(2)
+        busiest_dept = dept_duty_df.loc[dept_duty_df["Total Requests"].idxmax(), "Department"]
+        most_hours_dept = dept_duty_df.loc[dept_duty_df["Total Duty Hours"].idxmax(), "Department"]
+        b1.metric("🏆 Busiest Department (by Requests)", busiest_dept)
+        b2.metric("⏱️ Most Vehicle-Hours Department", most_hours_dept)
+
+        st.dataframe(dept_duty_df, use_container_width=True, hide_index=True, height=280)
+
+        fig_hrs = px.bar(dept_duty_df, x="Department", y="Total Duty Hours", color="Department",
+                          text="Total Duty Hours", title="Department-wise Vehicle Duty Hours")
+        fig_hrs.update_layout(showlegend=False, height=380)
+        st.plotly_chart(fig_hrs, use_container_width=True, key="mgmt_dept_duty_chart")
+
+    st.markdown("---")
+    st.markdown("##### ⬇️ Download Reports")
+
+    filtered_display = filtered.drop(columns=["_dt"], errors="ignore").copy()
+    if "time_of_travel" in filtered_display.columns:
+        filtered_display["time_of_travel"] = filtered_display["time_of_travel"].apply(lambda v: fmt_time_12h(v, v))
+
+    kpis = {
+        "Date Range": f"{mgmt_start.strftime('%Y-%m-%d')} to {mgmt_end.strftime('%Y-%m-%d')}",
+        "Total Requisitions": total_requisitions,
+        "Completed Trips": completed_trips,
+        "Pending Requests": pending_requests,
+        "Total Distance (KM)": f"{total_distance:.1f}",
+    }
+    filters_summary = f"Date Range: {mgmt_start.strftime('%Y-%m-%d')} to {mgmt_end.strftime('%Y-%m-%d')}"
+
+    e1, e2 = st.columns(2)
+    with e1:
+        mgmt_excel = build_management_excel(kpis, dept_counts, filtered_display, dept_duty_df)
+        st.download_button(
+            "⬇️ Download Detailed Excel Report (.xlsx)", data=mgmt_excel,
+            file_name="management_report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True, key="mgmt_excel_dl",
+        )
+    with e2:
+        mgmt_pdf = build_management_pdf(kpis, dept_counts, filters_summary, dept_duty_df)
+        st.download_button(
+            "⬇️ Download Summary PDF Report (.pdf)", data=mgmt_pdf,
+            file_name="management_summary_report.pdf",
+            mime="application/pdf",
+            use_container_width=True, key="mgmt_pdf_dl",
+        )
 
 
 # =========================================================
@@ -1142,18 +1559,29 @@ if user["role"] == "user":
 
     with tab1:
         st.subheader("Submit a New Vehicle Requisition")
+        st.caption(
+            "👤 Applicant Name, Department, and Mobile Number are auto-filled from your "
+            "profile — no need to re-select or re-type them every time. You can still "
+            "adjust them below if this trip needs different details."
+        )
         with st.form("req_form", clear_on_submit=True):
             c1, c2 = st.columns(2)
             with c1:
-                applicant_name = st.text_input("Applicant Name *", value=user["full_name"])
-                department = st.selectbox("Department *", DEPARTMENTS,
-                                           index=DEPARTMENTS.index(user["department"]) if user.get("department") in DEPARTMENTS else 0)
+                # Auto-filled directly from the logged-in session's profile data
+                # (st.session_state.auth_user) so employees never have to
+                # re-select their department or retype their name/mobile number
+                # for every new requisition.
+                applicant_name = st.text_input("Applicant Name *", value=user.get("full_name", ""))
+                department = st.selectbox(
+                    "Department *", DEPARTMENTS,
+                    index=DEPARTMENTS.index(user["department"]) if user.get("department") in DEPARTMENTS else 0,
+                )
                 mobile_number = st.text_input("Mobile Number *", value=user.get("mobile", ""),
                                                placeholder="01XXXXXXXXX")
                 passenger_count = st.number_input("Passenger Count *", min_value=1, max_value=50, value=1)
             with c2:
                 date_of_travel = st.date_input("Date of Travel *", min_value=date.today())
-                time_of_travel = st.time_input("Time of Travel *")
+                time_of_travel = time_input_12h("Time of Travel *", key_prefix="new_req_tt")
                 destination = st.text_input("Destination *")
                 vehicle_type = st.selectbox("Vehicle Type Required *", VEHICLE_TYPES)
 
@@ -1353,6 +1781,12 @@ elif user["role"] == "security_officer":
 # =========================================================
 # 9B. DRIVER DASHBOARD — My Assigned Trips & Odometer Entry (NEW)
 # =========================================================
+# Mirrors the Security Officer panel's two-tab design exactly: a "Start
+# Trip" tab (like Security's Gate Out) that only takes Start KM, and a
+# separate "End Trip" tab (like Security's Gate In) that only takes End KM
+# once the driver is back — instead of one combined form. Submitting Start
+# KM alone moves the trip Approved -> On Trip; submitting End KM later moves
+# it -> Completed (see submit_driver_km()).
 elif user["role"] == "driver":
     company_header("🚙 Driver Dashboard — My Assigned Trips")
     st.caption(f"Logged in as {user['full_name']} — Driver")
@@ -1362,67 +1796,140 @@ elif user["role"] == "driver":
         "ask an Admin to check the name spelling in **Manage Drivers & Vehicles**."
     )
 
+    tab_depart, tab_return = st.tabs(["🚦 Start Trip (Approved)", "🏁 End Trip (Return)"])
+
     with st.spinner("Loading your assigned trips..."):
         my_trips = fetch_requisitions_by_driver(user["full_name"])
 
-    approved_trips = my_trips[my_trips["status"] == "Approved"] if not my_trips.empty else my_trips
+    # ---------------- TAB 1: Start Trip (Start KM only) ----------------
+    with tab_depart:
+        st.subheader("Approved Trips Awaiting Your Start KM")
+        start_trips = my_trips[my_trips["status"] == "Approved"] if not my_trips.empty else my_trips
 
-    if approved_trips.empty:
-        st.info("You have no Approved trips waiting for KM entry right now.")
-    else:
-        for _, r in approved_trips.iterrows():
-            auto_start = get_last_driver_end_km(user["full_name"], r.get("vehicle_number", ""))
-            existing_start = r.get("driver_start_km")
-            existing_end = r.get("driver_end_km")
-            prefill_start = float(existing_start) if not is_blank(existing_start) else auto_start
+        if start_trips.empty:
+            st.info("You have no Approved trips waiting to start.")
+        else:
+            for _, r in start_trips.iterrows():
+                auto_start = get_last_driver_end_km(user["full_name"], r.get("vehicle_number", ""))
+                with st.expander(
+                    f"🟢 {r['request_id']} — {r['destination']}  |  Vehicle: {fmt(r.get('vehicle_number'), 'N/A')}"
+                ):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.write(f"**Applicant:** {r['applicant_name']} ({r['department']})")
+                        st.write(f"**Date/Time:** {r['date_of_travel']} at {fmt_time_12h(r['time_of_travel'])}")
+                    with c2:
+                        approved_time = r["time_of_travel"] if is_blank(r.get("approved_time")) else r.get("approved_time")
+                        st.write(f"**Approved Departure Time:** {fmt_time_12h(approved_time)}")
+                        st.write(f"**Vehicle Type:** {r['vehicle_type']}")
+                    if not is_blank(r.get("admin_note")):
+                        st.caption(f"📝 Admin Notes: {r['admin_note']}")
 
-            with st.expander(
-                f"🟢 {r['request_id']} — {r['destination']}  |  Vehicle: {fmt(r.get('vehicle_number'), 'N/A')}"
-            ):
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.write(f"**Applicant:** {r['applicant_name']} ({r['department']})")
-                    st.write(f"**Date/Time:** {r['date_of_travel']} at {fmt_time_12h(r['time_of_travel'])}")
-                with c2:
-                    approved_time = r["time_of_travel"] if is_blank(r.get("approved_time")) else r.get("approved_time")
-                    st.write(f"**Approved Departure Time:** {fmt_time_12h(approved_time)}")
-                    st.write(f"**Vehicle Type:** {r['vehicle_type']}")
+                    if auto_start and auto_start > 0:
+                        st.caption(
+                            f"↩️ Auto-filled from your last logged End KM for "
+                            f"**{fmt(r.get('vehicle_number'))}** — change it below if needed."
+                        )
 
-                if not is_blank(auto_start) and auto_start > 0 and is_blank(existing_start):
-                    st.caption(
-                        f"↩️ Auto-filled Start KM ({auto_start:.1f}) from your last logged End KM for "
-                        f"**{fmt(r.get('vehicle_number'))}** — change it below if needed."
-                    )
+                    with st.form(f"driver_start_{r['request_id']}"):
+                        d_start_km = st.number_input(
+                            "Start KM (Odometer Reading) *", min_value=0.0, step=1.0, format="%.1f",
+                            value=float(auto_start), key=f"dstart_{r['request_id']}",
+                        )
+                        depart_clicked = st.form_submit_button(
+                            "🚦 Start Trip / Depart", type="primary", use_container_width=True
+                        )
 
-                with st.form(f"driver_km_{r['request_id']}"):
-                    d_start_km = st.number_input(
-                        "Start KM (editable) *", min_value=0.0, step=1.0, format="%.1f",
-                        value=float(prefill_start), key=f"dstart_{r['request_id']}",
-                    )
-                    d_end_km = st.number_input(
-                        "End KM (leave as 0 if you haven't returned yet)",
-                        min_value=0.0, step=1.0, format="%.1f",
-                        value=float(existing_end) if not is_blank(existing_end) else 0.0,
-                        key=f"dend_{r['request_id']}",
-                    )
-                    save_clicked = st.form_submit_button(
-                        "💾 Save My KM Entry", type="primary", use_container_width=True
-                    )
-
-                if save_clicked:
-                    if d_end_km and d_end_km < d_start_km:
-                        st.error("End KM cannot be less than Start KM.")
-                    else:
+                    if depart_clicked:
                         try:
-                            submit_driver_km(
-                                r["request_id"],
-                                driver_start_km=d_start_km,
-                                driver_end_km=d_end_km if d_end_km > 0 else None,
+                            submit_driver_km(r.to_dict(), driver_start_km=d_start_km, driver_end_km=None)
+                            st.success(
+                                f"✅ Trip started for {r['applicant_name']} — status is now On Trip. "
+                                "A Telegram alert has been sent."
                             )
-                            st.success("✅ Your KM entry has been saved.")
                             st.rerun()
                         except Exception as e:
-                            st.error(f"❌ Failed to save your KM entry: {e}")
+                            st.error(f"❌ Failed to record Start KM: {e}")
+
+    # ---------------- TAB 2: End Trip (End KM only) ----------------
+    with tab_return:
+        st.subheader("Trips Currently On the Road")
+
+        def _needs_end(row):
+            if row.get("status") == "On Trip":
+                return True
+            # Also surface trips Security already marked Completed via their
+            # own Gate-In, as long as the driver hasn't logged their own End
+            # KM yet — so a fast Security entry never locks the driver out
+            # of finishing their own log (needed for the KM Variance Report
+            # to have both sides).
+            if row.get("status") == "Completed" and is_blank(row.get("driver_end_km")):
+                return True
+            return False
+
+        end_trips = my_trips[my_trips.apply(_needs_end, axis=1)] if not my_trips.empty else my_trips
+
+        if end_trips.empty:
+            st.info("No trips are currently waiting for your End KM.")
+        else:
+            for _, r in end_trips.iterrows():
+                start_km_val = 0.0 if is_blank(r.get("driver_start_km")) else float(r.get("driver_start_km"))
+                with st.expander(
+                    f"🔵 {r['request_id']} — {r['destination']}  |  Vehicle: {fmt(r.get('vehicle_number'), 'N/A')}"
+                ):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.write(f"**Applicant:** {r['applicant_name']} ({r['department']})")
+                        st.write(f"**Vehicle:** {fmt(r.get('vehicle_number'), 'N/A')} ({r['vehicle_type']})")
+                        st.write(f"**Destination:** {r['destination']}")
+                    with c2:
+                        st.write(f"**Your Start KM:** {fmt(r.get('driver_start_km'))}")
+                        st.write(f"**Trip Started:** {fmt_time_12h(r.get('actual_exit_time'))}")
+
+                    with st.form(f"driver_end_{r['request_id']}"):
+                        d_end_km = st.number_input(
+                            "End KM (Odometer Reading) *", min_value=start_km_val, step=1.0, format="%.1f",
+                            help=f"Must be greater than or equal to your Start KM ({start_km_val:.1f}).",
+                            key=f"dend_{r['request_id']}",
+                        )
+                        return_clicked = st.form_submit_button(
+                            "🏁 Complete Trip / Return", type="primary", use_container_width=True
+                        )
+
+                    if return_clicked:
+                        if d_end_km < start_km_val:
+                            st.error("End KM cannot be less than Start KM.")
+                        else:
+                            try:
+                                submit_driver_km(
+                                    r.to_dict(),
+                                    driver_start_km=r.get("driver_start_km"),
+                                    driver_end_km=d_end_km,
+                                )
+                                st.success(
+                                    f"✅ Trip completed for {r['applicant_name']}. "
+                                    f"Distance: **{d_end_km - start_km_val:.1f} KM**. "
+                                    "A Telegram alert has been sent."
+                                )
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"❌ Failed to record End KM: {e}")
+
+# =========================================================
+# 9C. EXECUTIVE / MANAGEMENT DASHBOARD (NEW)
+# =========================================================
+# Standalone, READ-ONLY role for senior management: top-level KPI cards,
+# department-wise usage chart, a date-range filter, and Excel/PDF export
+# buttons — reusing render_management_dashboard() so 'executive' and
+# 'admin' (via the "Management Dashboard" tab below) always see identical
+# numbers for the same filters. Executives get none of the approve/reject,
+# user-management, or fleet-management capabilities of the Admin Dashboard.
+elif user["role"] == "executive":
+    company_header("📈 Executive Dashboard")
+    st.caption(f"Logged in as {user['full_name']} — Executive / Management")
+    with st.spinner("Loading requisition data..."):
+        exec_df_all = fetch_all_requisitions()
+    render_management_dashboard(exec_df_all)
 
 # =========================================================
 # 10. ADMIN DASHBOARD
@@ -1436,10 +1943,11 @@ elif user["role"] == "admin":
     # list — each variable below is named for what it holds, not its position,
     # so the underlying tab bodies didn't need to be reshuffled in the file.
     tab_pending_req, tab_users, tab_pending_users, tab_analytics, tab_export, \
-        tab_fleet, tab_duty, tab_variance = st.tabs([
+        tab_fleet, tab_duty, tab_variance, tab_management = st.tabs([
             "🚗 Pending Requests", "👥 User List", "⏳ ID Requests", "📊 Analytics",
             "📁 All Requisitions & Export", "🚘 Manage Drivers & Vehicles",
             "🕒 Duty Tracker & Analytics", "📈 KM Variance Report",
+            "🏆 Management Dashboard",
         ])
 
     # Hoisted above every tab body so both users_df and df_all are guaranteed
@@ -1508,11 +2016,10 @@ elif user["role"] == "admin":
                             default_time = datetime.strptime(r["time_of_travel"], "%H:%M").time()
                         except (ValueError, TypeError):
                             default_time = datetime.now().time()
-                        approved_time = st.time_input(
-                            "Approved Departure Time",
-                            value=default_time,
-                            help=f"Originally requested for {fmt_time_12h(r['time_of_travel'])}. Adjust if rescheduling.",
-                            key=f"atime_{r['request_id']}",
+                        approved_time = time_input_12h(
+                            f"Approved Departure Time (originally requested {fmt_time_12h(r['time_of_travel'])})",
+                            key_prefix=f"atime_{r['request_id']}",
+                            default_time=default_time,
                         )
                         admin_note = st.text_area(
                             "Admin Note / Remarks (optional)",
@@ -1663,7 +2170,7 @@ elif user["role"] == "admin":
                 fig1 = px.bar(dept_counts, x="Department", y="Requests", color="Department", text="Requests",
                               title="Department-wise Vehicle Usage")
                 fig1.update_layout(showlegend=False, height=380)
-                st.plotly_chart(fig1, use_container_width=True)
+                st.plotly_chart(fig1, use_container_width=True, key="analytics_dept_chart")
             with c2:
                 status_counts = df_all["status"].value_counts().reset_index()
                 status_counts.columns = ["Status", "Count"]
@@ -1672,7 +2179,7 @@ elif user["role"] == "admin":
                               color_discrete_map={"Approved": "#28a745", "Rejected": "#dc3545", "Pending": "#ffc107",
                                                    "On Trip": "#0d6efd", "Completed": "#17a673"})
                 fig2.update_layout(height=380)
-                st.plotly_chart(fig2, use_container_width=True)
+                st.plotly_chart(fig2, use_container_width=True, key="analytics_status_pie")
 
             # Driver-verified KM (falls back to Security's Gate-In/Out
             # readings only when a driver hasn't logged their own numbers)
@@ -1693,7 +2200,7 @@ elif user["role"] == "admin":
                 monthly_counts = monthly.groupby("Month").size().reset_index(name="Requests")
                 fig3 = px.line(monthly_counts, x="Month", y="Requests", markers=True, title="Monthly Request Trend")
                 fig3.update_layout(height=350)
-                st.plotly_chart(fig3, use_container_width=True)
+                st.plotly_chart(fig3, use_container_width=True, key="analytics_monthly_trend")
 
     # ---------------- All Requisitions & Export (was Tab 5) ----------------
     with tab_export:
@@ -2132,6 +2639,13 @@ elif user["role"] == "admin":
                         file_name="km_variance_report.csv", mime="text/csv",
                         use_container_width=True,
                     )
+
+    # ---------------- Management Dashboard (NEW) ----------------
+    with tab_management:
+        # Admins get the same Executive/Management overview as the
+        # standalone 'executive' role, reusing the exact same function so
+        # both roles always see identical KPI numbers for the same filters.
+        render_management_dashboard(df_all)
 
 # =========================================================
 # 11. FALLBACK — unrecognized role
