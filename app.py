@@ -82,24 +82,40 @@ def insert_requisition(data: dict):
     send_telegram_alert(msg)
 
 
-def update_requisition(request_id: str, updates: dict):
+def update_requisition(request_id: str, updates: dict, notify: bool = True):
+    """Writes `updates` to the requisitions row for `request_id`.
+
+    `notify` controls whether this call fires the Telegram "Status Updated"
+    alert (default True, unchanged from before). Set notify=False for
+    updates that should stay silent — currently used by the Security
+    Officer's Gate Out / Gate In panel, since KM entries there are meant to
+    be quiet record-keeping (Admin can always pull a report/export), while
+    the Driver's own Start/End KM entries (via submit_driver_km) and Admin's
+    Approve/Reject actions keep sending the alert as before.
+    """
     sb = get_supabase_client()
 
-    # Look up applicant/destination so the alert is informative even though
-    # `updates` itself usually only carries status-related fields.
     applicant = ""
     dest = ""
-    try:
-        existing = sb.table(REQUISITIONS_TABLE).select("applicant_name, destination").eq(
-            "request_id", request_id
-        ).limit(1).execute()
-        if existing.data:
-            applicant = existing.data[0].get("applicant_name", "")
-            dest = existing.data[0].get("destination", "")
-    except Exception:
-        pass  # Alert enrichment is best-effort; the update itself must still proceed.
+    if notify:
+        # Look up applicant/destination so the alert is informative even
+        # though `updates` itself usually only carries status-related
+        # fields. Skipped entirely when notify=False since nothing here is
+        # needed if we're not sending a message.
+        try:
+            existing = sb.table(REQUISITIONS_TABLE).select("applicant_name, destination").eq(
+                "request_id", request_id
+            ).limit(1).execute()
+            if existing.data:
+                applicant = existing.data[0].get("applicant_name", "")
+                dest = existing.data[0].get("destination", "")
+        except Exception:
+            pass  # Alert enrichment is best-effort; the update itself must still proceed.
 
     sb.table(REQUISITIONS_TABLE).update(updates).eq("request_id", request_id).execute()
+
+    if not notify:
+        return
 
     # English Telegram Alert for Status Update
     status = updates.get("status", "Updated")
@@ -390,45 +406,79 @@ def fetch_requisitions_by_status(status: str) -> pd.DataFrame:
 # the Admin's KM Variance Report (Tab 8). These never touch Security's
 # start_km / end_km / total_km fields — they read/write the separate
 # driver_start_km / driver_end_km / driver_km_updated_at columns only.
+def _normalize_driver_name(name) -> str:
+    """Case-insensitive, whitespace-collapsed key for matching a Driver's own
+    registered full_name against the Admin-assigned requisitions.driver_name.
+    Both are free-typed by different people (the driver at registration, the
+    admin when adding them under Manage Drivers & Vehicles / approving a
+    request) — without this normalization, something as small as an extra
+    space, a missing space (e.g. "Mr. Yusuf" vs "Mr.Yusuf"), or a different
+    capitalization makes Supabase's exact .eq() match silently return
+    nothing, and the driver's approved trips simply never appear on their
+    own dashboard. ALL whitespace is stripped (not just leading/trailing),
+    so any spacing variation around punctuation like "Mr." still matches."""
+    if is_blank(name):
+        return ""
+    return "".join(str(name).casefold().split())
+
+
 def fetch_requisitions_by_driver(driver_name: str) -> pd.DataFrame:
-    """All trips assigned to this driver (matched by driver_name, the same
-    value set from the Admin's driver dropdown in requisitions.driver_name)."""
+    """All trips assigned to this driver, matched case-insensitively and
+    ignoring leading/trailing whitespace (see _normalize_driver_name) —
+    so a mismatch like "Yusuf" vs "yusuf " no longer hides trips from the
+    Driver Dashboard. Fetches every requisition with a driver assigned and
+    filters client-side rather than relying on Supabase's exact-match .eq(),
+    since PostgREST has no case-insensitive-and-trimmed equality operator."""
     sb = get_supabase_client()
     res = (
         sb.table(REQUISITIONS_TABLE)
         .select("*")
-        .eq("driver_name", driver_name)
+        .not_.is_("driver_name", "null")
         .order("created_at", desc=True)
         .execute()
     )
-    return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=[
+    cols = [
         "id", "request_id", "created_at", "username", "applicant_name", "department", "mobile_number",
         "date_of_travel", "time_of_travel", "destination", "passenger_count", "vehicle_type", "purpose",
         "special_request", "status", "driver_name", "driver_contact", "vehicle_number", "approved_by",
         "action_timestamp", "approved_time", "admin_note", "start_km", "end_km", "total_km",
         "actual_exit_time", "actual_return_time", "driver_start_km", "driver_end_km", "driver_km_updated_at",
-    ])
+    ]
+    if not res.data:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(res.data)
+    target = _normalize_driver_name(driver_name)
+    matched = df[df["driver_name"].map(_normalize_driver_name) == target]
+    return matched.reset_index(drop=True)
 
 
 def get_last_driver_end_km(driver_name: str, vehicle_number: str) -> float:
     """The driver's own most recent End KM for this specific vehicle — used
     to auto-fill their next Start KM (still fully editable). Returns 0.0 if
-    no prior driver-submitted End KM exists yet for this driver+vehicle."""
+    no prior driver-submitted End KM exists yet for this driver+vehicle.
+    Driver name is matched case-insensitively and ignoring leading/trailing
+    whitespace (same normalization as fetch_requisitions_by_driver) so a
+    stray capitalization/space difference doesn't silently break the
+    auto-fill either. Vehicle number is still matched exactly, since it's
+    always chosen from the same fixed Manage Vehicles dropdown everywhere,
+    so it can't drift the way a free-typed name can."""
     if is_blank(vehicle_number):
         return 0.0
     sb = get_supabase_client()
     res = (
         sb.table(REQUISITIONS_TABLE)
-        .select("driver_end_km, created_at")
-        .eq("driver_name", driver_name)
+        .select("driver_name, driver_end_km, created_at")
         .eq("vehicle_number", vehicle_number)
         .not_.is_("driver_end_km", "null")
         .order("created_at", desc=True)
-        .limit(1)
         .execute()
     )
-    if res.data and res.data[0].get("driver_end_km") is not None:
-        return float(res.data[0]["driver_end_km"])
+    if not res.data:
+        return 0.0
+    target = _normalize_driver_name(driver_name)
+    for row in res.data:
+        if _normalize_driver_name(row.get("driver_name")) == target and row.get("driver_end_km") is not None:
+            return float(row["driver_end_km"])
     return 0.0
 
 
@@ -1726,7 +1776,7 @@ elif user["role"] == "security_officer":
                                 "start_km": float(start_km),
                                 "actual_exit_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                 "status": "On Trip",
-                            })
+                            }, notify=False)
                             st.success(f"✅ Gate Out recorded for {r['applicant_name']} — vehicle is now On Trip.")
                             st.rerun()
                         except Exception as e:
@@ -1772,7 +1822,7 @@ elif user["role"] == "security_officer":
                                     "total_km": total_km,
                                     "actual_return_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                     "status": "Completed",
-                                })
+                                }, notify=False)
                                 st.success(f"✅ Gate In recorded for {r['applicant_name']}. Total distance: **{total_km} KM**")
                                 st.rerun()
                             except Exception as e:
@@ -2430,14 +2480,26 @@ elif user["role"] == "admin":
 
             fc3, fc4 = st.columns(2)
             with fc3:
+                # Sourced from the Manage Drivers & Vehicles master list (not
+                # from whatever vehicle_number values happen to appear in
+                # historical requisition rows), so this dropdown always
+                # matches the same fleet list used everywhere else in the app
+                # (e.g. the Admin's Pending Requests approval dropdown).
+                duty_vehicles_df = fetch_all_vehicles()
                 vehicle_choices = ["All Vehicles"] + sorted(
-                    v for v in duty_base["vehicle_number"].dropna().unique().tolist() if v
-                )
+                    v for v in duty_vehicles_df["vehicle_number"].dropna().unique().tolist() if v
+                ) if not duty_vehicles_df.empty else ["All Vehicles"]
                 duty_vehicle_filter = st.selectbox("Vehicle Selection", vehicle_choices, key="duty_vehicle_filter")
             with fc4:
+                # Same idea for drivers: pulled from the Manage Drivers &
+                # Vehicles master list rather than the trip data, so it's
+                # the single source of truth for driver identity everywhere
+                # (Duty Tracker, Pending Requests approval, KM Variance, and
+                # the Driver Dashboard's own trip matching).
+                duty_drivers_df = fetch_all_drivers()
                 driver_choices = ["All Drivers"] + sorted(
-                    d for d in duty_base["driver_name"].dropna().unique().tolist() if d
-                )
+                    d for d in duty_drivers_df["driver_name"].dropna().unique().tolist() if d
+                ) if not duty_drivers_df.empty else ["All Drivers"]
                 duty_driver_filter = st.selectbox("Driver Selection", driver_choices, key="duty_driver_filter")
 
             # -------------------------------------------------------------
@@ -2452,9 +2514,17 @@ elif user["role"] == "admin":
             ].copy()
 
             if duty_vehicle_filter != "All Vehicles":
-                duty_filtered = duty_filtered[duty_filtered["vehicle_number"] == duty_vehicle_filter]
+                duty_filtered = duty_filtered[
+                    duty_filtered["vehicle_number"].astype(str).str.strip() == duty_vehicle_filter.strip()
+                ]
             if duty_driver_filter != "All Drivers":
-                duty_filtered = duty_filtered[duty_filtered["driver_name"] == duty_driver_filter]
+                # Case/whitespace-insensitive match (same normalization as
+                # the Driver Dashboard) so picking a name from the master
+                # list above reliably matches trip rows even if a requisition
+                # was saved with a slightly different capitalization/spacing.
+                duty_filtered = duty_filtered[
+                    duty_filtered["driver_name"].map(_normalize_driver_name) == _normalize_driver_name(duty_driver_filter)
+                ]
 
             # -------------------------------------------------------------
             # STEP 4 — Derived fields: duty duration in hours, total KM.
