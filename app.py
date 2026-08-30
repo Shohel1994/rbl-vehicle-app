@@ -1112,11 +1112,19 @@ def build_duty_tracker_excel(detail_df: pd.DataFrame, summary_metrics: dict) -> 
 
         # Light auto-fit so columns aren't clipped in Excel — purely cosmetic,
         # safe to remove if you don't want the extra openpyxl dependency calls.
+        # `fillna("")` BEFORE `.astype(str)` matters on pandas >= 3.0: that
+        # version stopped converting NaN/None to the literal string "nan" on
+        # astype(str), leaving real NaN behind instead. A column that's
+        # partially or entirely blank (e.g. admin_note with no note yet)
+        # would then make .str.len().max() return NaN, and int(NaN) raises
+        # "ValueError: cannot convert float NaN to integer" — filling blanks
+        # with "" first guarantees every length is a real integer (0 for
+        # blank cells).
         from openpyxl.utils import get_column_letter
         for sheet_name, sheet_df in (("Summary", summary_df), ("Duty Log", detail_df)):
             ws = writer.sheets[sheet_name]
             for i, col in enumerate(sheet_df.columns, start=1):
-                width = max(12, min(40, int(sheet_df[col].astype(str).str.len().max() if not sheet_df.empty else 12) + 2))
+                width = max(12, min(40, int(sheet_df[col].fillna("").astype(str).str.len().max() if not sheet_df.empty else 12) + 2))
                 ws.column_dimensions[get_column_letter(i)].width = width
 
     return buf.getvalue()
@@ -1231,11 +1239,20 @@ def build_management_excel(kpis: dict, dept_df: pd.DataFrame, detail_df: pd.Data
         detail_df.to_excel(writer, index=False, sheet_name="Detailed Data")
         sheets.append(("Detailed Data", detail_df))
 
+        # `fillna("")` BEFORE `.astype(str)` matters on pandas >= 3.0: that
+        # version stopped converting NaN/None to the literal string "nan" on
+        # astype(str), leaving real NaN behind instead. A column that's
+        # partially or entirely blank (e.g. admin_note, or numeric fields
+        # like total_km before any trip is Completed) would then make
+        # .str.len().max() return NaN, and int(NaN) raises
+        # "ValueError: cannot convert float NaN to integer" — exactly the
+        # error this fixes. Filling blanks with "" first guarantees every
+        # length is a real integer (0 for blank cells).
         from openpyxl.utils import get_column_letter
         for sheet_name, sheet_df in sheets:
             ws = writer.sheets[sheet_name]
             for i, col in enumerate(sheet_df.columns, start=1):
-                width = max(12, min(40, int(sheet_df[col].astype(str).str.len().max() if not sheet_df.empty else 12) + 2))
+                width = max(12, min(40, int(sheet_df[col].fillna("").astype(str).str.len().max() if not sheet_df.empty else 12) + 2))
                 ws.column_dimensions[get_column_letter(i)].width = width
 
     return buf.getvalue()
@@ -2442,12 +2459,26 @@ elif user["role"] == "admin":
             # differently-shaped row to NaT (even with errors="coerce") —
             # which then makes real trips vanish from the tracker with no
             # error at all. "mixed" parses each value independently.
+            #
+            # `.astype("datetime64[ns, UTC]")` right after parsing pins both
+            # columns to a FIXED, known time-unit resolution. Without this,
+            # pandas infers the unit from whatever data is present: a column
+            # that is entirely blank (e.g. brand-new "Pending" requisitions
+            # that have never been Gated Out — exactly what you get right
+            # after a fresh data reset) comes back as second-resolution
+            # ("datetime64[s, UTC]"), while pd.Timestamp.now() below defaults
+            # to microsecond resolution. pandas 3.x treats that mismatch as
+            # an unsafe implicit upcast and raises
+            # "TypeError: Invalid value '...' for dtype 'datetime64[s, UTC]'"
+            # the moment we assign into it — pinning both columns to "ns"
+            # up front means the later assignment always matches exactly,
+            # whether the underlying data is empty, partial, or full.
             duty_df_raw["_start_dt"] = pd.to_datetime(
                 duty_df_raw.get("actual_exit_time"), errors="coerce", utc=True, format="mixed"
-            )
+            ).astype("datetime64[ns, UTC]")
             duty_df_raw["_end_dt"] = pd.to_datetime(
                 duty_df_raw.get("actual_return_time"), errors="coerce", utc=True, format="mixed"
-            )
+            ).astype("datetime64[ns, UTC]")
 
             # A trip only has meaningful "duty duration" once Security has
             # logged a Gate Out (actual_exit_time). If Gate In hasn't
