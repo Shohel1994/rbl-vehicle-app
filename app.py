@@ -14,6 +14,7 @@ import os
 import base64
 import hashlib
 import random
+import re
 import time
 from datetime import datetime, date, timedelta
 from secrets import token_urlsafe
@@ -157,26 +158,28 @@ REQUISITIONS_TABLE = "requisitions"
 DRIVERS_TABLE = "drivers"
 VEHICLES_TABLE = "vehicles"
 SESSIONS_TABLE = "sessions"
+SHUTTLE_TEMPLATES_TABLE = "shuttle_templates"
 
 SESSION_COOKIE_NAME = "rbl_vms_session"
 SESSION_LIFETIME_DAYS = 30
 
-VEHICLE_TYPES = ["HIACE", "Private Car", "Pick-up Van", "Covered Van", "Truck", "Shipment Vehicle", "Other"]
+VEHICLE_TYPES = ["HIACE", "Private Car", "Pick-up Van", "Covered Van", "Truck", "Shipment Vehicle", "Ambulance", "Other"]
 DEPARTMENTS = [
     "Accounts", "Warehouse", "Factory Merchandising", "Commercial", "Floor Operation",
     "TSD", "QMS", "Production Planning & Control", "Cutting", "R & D", "Admin",
-    "Technical", "Finishing", "Quality", "IE", "HR & Compliance", "Other",
+    "Technical", "Finishing", "Quality", "IE", "HR & Compliance", "Medical", "Other",
 ]
 
 # Account status (users table) — approval workflow for logins
 USER_STATUS_OPTIONS = ["Pending", "Approved", "Rejected"]
-ROLE_OPTIONS = ["user", "security_officer", "driver", "admin", "executive"]
+ROLE_OPTIONS = ["user", "security_officer", "driver", "admin", "executive", "nurse"]
 ROLE_DISPLAY = {
     "user": "Employee",
     "security_officer": "Security Officer",
     "driver": "Driver",
     "admin": "Admin",
     "executive": "Executive / Management",
+    "nurse": "Nurse / Senior Nurse",
 }
 
 # Requisition status (requisitions table) — full trip lifecycle
@@ -234,19 +237,30 @@ def fmt_time_12h(value, default: str = "—") -> str:
 
     Accepts bare 'HH:MM' / 'HH:MM:SS' (time_of_travel, approved_time) or full
     'YYYY-MM-DD HH:MM:SS' (actual_exit_time, actual_return_time,
-    action_timestamp). If the value doesn't match a known shape (e.g. it has
-    already been converted, or is genuinely something else), it's returned
+    action_timestamp). timestamptz columns come back from Supabase/PostgREST
+    as ISO 8601 with a trailing UTC/offset marker and often fractional
+    seconds (e.g. "2026-08-30T09:25:19.123456+00:00") — that suffix is
+    stripped here before parsing so the driver/employee-facing display shows
+    a clean 12-hour time instead of the raw timestamp. This is purely
+    cosmetic reformatting of the same wall-clock numbers that were written
+    (no timezone conversion/math is applied). If the value doesn't match a
+    known shape (e.g. it's genuinely something else), it's returned
     unchanged rather than raising — exports must never crash on this.
     """
     if is_blank(value):
         return default
     s = str(value).strip().replace("T", " ")
-    for f in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%H:%M:%S", "%H:%M"):
-        try:
-            dt = datetime.strptime(s, f)
-        except ValueError:
-            continue
-        return dt.strftime("%Y-%m-%d %I:%M %p") if "%Y" in f else dt.strftime("%I:%M %p")
+    # Strip a trailing timezone offset ("+00:00", "+06:00", "-05:00", "Z")
+    # and any fractional seconds, e.g. "2026-08-30 09:25:19.123456+00:00"
+    # -> "2026-08-30 09:25:19". Keeps the exact numbers as stored/typed.
+    s_clean = re.sub(r"(\.\d+)?(Z|[+-]\d{2}:?\d{2})$", "", s, flags=re.IGNORECASE).strip()
+    for candidate in (s_clean, s):
+        for f in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%H:%M:%S", "%H:%M"):
+            try:
+                dt = datetime.strptime(candidate, f)
+            except ValueError:
+                continue
+            return dt.strftime("%Y-%m-%d %I:%M %p") if "%Y" in f else dt.strftime("%I:%M %p")
     return s
 
 
@@ -255,31 +269,44 @@ def hash_password(raw: str) -> str:
 
 
 def time_input_12h(label: str, key_prefix: str, default_time=None):
-    """A 12-hour AM/PM time-entry widget built from three selectboxes
-    (Hour / Minute / AM-PM), since st.time_input has no AM/PM display mode
-    of its own. Returns a plain datetime.time object — exactly what
-    st.time_input returns — so every existing call site that does
-    `.strftime('%H:%M')` on the result keeps working unchanged."""
+    """A 12-hour AM/PM time-entry widget: one 'H:MM' text field plus an
+    AM/PM dropdown (2 inputs total, down from 3 separate Hour/Minute/AM-PM
+    selectboxes) — fewer things to click through to set an arbitrary time,
+    e.g. type "4:45" and pick "PM" instead of opening three dropdowns.
+    Returns a plain datetime.time object — exactly what st.time_input
+    returns — so every existing call site that does `.strftime('%H:%M')`
+    on the result keeps working unchanged. Invalid typed input falls back
+    to `default_time` with an inline warning rather than crashing the form."""
     if default_time is None:
         default_time = datetime.now().time()
     default_12h = default_time.strftime("%I:%M %p")  # e.g. "09:05 AM"
-    d_hour, d_rest = default_12h.split(":")
-    d_minute, d_ampm = d_rest.split(" ")
-    hours = [f"{h:02d}" for h in range(1, 13)]
-    minutes = [f"{m:02d}" for m in range(0, 60)]
+    d_hm, d_ampm = default_12h.rsplit(" ", 1)  # -> "09:05", "AM"
 
     st.markdown(f"**{label}**")
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns([2, 1])
     with c1:
-        h = st.selectbox("Hour", hours, index=hours.index(d_hour) if d_hour in hours else 0,
-                          key=f"{key_prefix}_hour")
+        hm_text = st.text_input(
+            "Hour:Minute", value=d_hm, key=f"{key_prefix}_hm",
+            placeholder="e.g. 4:45",
+            help="Type the time as H:MM or HH:MM on a 12-hour clock, then pick AM or PM.",
+        )
     with c2:
-        m = st.selectbox("Minute", minutes, index=minutes.index(d_minute) if d_minute in minutes else 0,
-                          key=f"{key_prefix}_minute")
-    with c3:
         ap = st.selectbox("AM/PM", ["AM", "PM"], index=0 if d_ampm == "AM" else 1,
                            key=f"{key_prefix}_ampm")
-    return datetime.strptime(f"{h}:{m} {ap}", "%I:%M %p").time()
+
+    # Accept "4:45", "04:45", or common mistyped separators like "4.45" /
+    # "4 45" by normalizing to "H:MM" before parsing.
+    raw = hm_text.strip()
+    normalized = re.sub(r"^(\d{1,2})[.\s](\d{2})$", r"\1:\2", raw)
+    try:
+        parsed = datetime.strptime(normalized, "%I:%M")
+        return datetime.strptime(f"{parsed.strftime('%I:%M')} {ap}", "%I:%M %p").time()
+    except ValueError:
+        st.error(
+            f"⚠️ Couldn't understand '{hm_text}' as a time (expected H:MM, e.g. 4:45) — "
+            f"using {d_hm} {d_ampm} for now."
+        )
+        return default_time
 
 
 # =========================================================
@@ -347,6 +374,17 @@ def generate_request_id() -> str:
 # point in the file would silently shadow (override) the ones above and the
 # Telegram notifications would never fire, since Python keeps whichever `def`
 # runs last for a given name.
+
+
+def delete_requisition(request_id: str):
+    """Permanently removes a requisition row. Used only by the Admin's
+    Edit/Delete Trip tab for correcting outright mistakes — e.g. a
+    duplicate entry, a test submission, or a request that should never
+    have existed. This is NOT part of the normal trip lifecycle
+    (Pending -> Approved -> On Trip -> Completed), which never deletes
+    rows; use status changes for that instead."""
+    sb = get_supabase_client()
+    sb.table(REQUISITIONS_TABLE).delete().eq("request_id", request_id).execute()
 
 
 def fetch_all_requisitions() -> pd.DataFrame:
@@ -613,6 +651,33 @@ def delete_vehicle(vehicle_id):
     sb.table(VEHICLES_TABLE).delete().eq("id", vehicle_id).execute()
 
 
+# ------------------- SHUTTLE TEMPLATE HELPERS (NEW) -------------------
+# Backs the "🚌 Staff Shuttle" Admin tab: for recurring fixed-schedule
+# routes (e.g. the 2 daily HIACE staff shuttle runs), Admin saves the
+# route/purpose/vehicle-type/default driver+vehicle ONCE as a named
+# template, then quick-submits today's trip in a couple of clicks instead
+# of retyping everything every day. Independent of drivers/vehicles/
+# requisitions tables — never modifies them.
+def fetch_all_shuttle_templates() -> pd.DataFrame:
+    sb = get_supabase_client()
+    res = sb.table(SHUTTLE_TEMPLATES_TABLE).select("*").order("template_name").execute()
+    return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=[
+        "id", "template_name", "applicant_name", "department", "destination", "purpose",
+        "vehicle_type", "passenger_count", "default_time", "default_driver_name",
+        "default_vehicle_number", "created_at",
+    ])
+
+
+def add_shuttle_template(data: dict):
+    sb = get_supabase_client()
+    sb.table(SHUTTLE_TEMPLATES_TABLE).insert(data).execute()
+
+
+def delete_shuttle_template(template_id):
+    sb = get_supabase_client()
+    sb.table(SHUTTLE_TEMPLATES_TABLE).delete().eq("id", template_id).execute()
+
+
 # ------------------- SESSION (REMEMBER ME) HELPERS -------------------
 # A "remember me" cookie stores only an opaque, unguessable token — never the
 # username or password directly — so a leaked/inspected cookie can't be used
@@ -785,11 +850,11 @@ def login_view():
                     st.rerun()
 
         with tab_register:
-            st.caption("New employees, Security Officers, or Drivers can request an account here. "
-                       "An admin must approve your account before you can log in.")
+            st.caption("New employees, Security Officers, Drivers, or Medical staff can request an "
+                       "account here. An admin must approve your account before you can log in.")
 
             reg_role = st.radio(
-                "Register as", ["Employee", "Security Officer", "Driver"],
+                "Register as", ["Employee", "Security Officer", "Driver", "Nurse / Senior Nurse"],
                 horizontal=True, key="reg_role_choice",
             )
             st.markdown("---")
@@ -882,7 +947,7 @@ def login_view():
                             "Please wait for admin approval before signing in."
                         )
 
-            else:  # reg_role == "Driver"
+            elif reg_role == "Driver":
                 st.caption(
                     "Choose your own username and password below. **Important:** enter your Full "
                     "Name exactly as it appears (or will appear) in the Admin's **Manage Drivers & "
@@ -928,6 +993,58 @@ def login_view():
                         })
                         st.success(
                             "✅ Your Driver account request has been submitted! "
+                            "Please wait for admin approval before signing in."
+                        )
+
+            else:  # reg_role == "Nurse / Senior Nurse"
+                st.caption(
+                    "Choose your own username and password below. Once approved, you'll get a "
+                    "simple one-click Emergency dashboard for arranging a vehicle to carry a patient."
+                )
+                with st.form("register_nurse_form", clear_on_submit=True):
+                    nur_full_name = st.text_input("Full Name *", key="nur_full_name")
+                    nur_designation = st.radio("Designation *", ["Nurse", "Senior Nurse"],
+                                                horizontal=True, key="nur_designation")
+                    nur_username = st.text_input("Username *", key="nur_username")
+                    nur_mobile = st.text_input("Mobile Number *", key="nur_mobile", placeholder="01XXXXXXXXX")
+                    nur_password = st.text_input("Password *", type="password", key="nur_password")
+                    nur_password_confirm = st.text_input("Confirm Password *", type="password", key="nur_password_confirm")
+                    nur_submitted = st.form_submit_button("Submit Request", type="primary", use_container_width=True)
+
+                if nur_submitted:
+                    errors = []
+                    if not nur_full_name.strip():
+                        errors.append("Full Name is required.")
+                    if not nur_username.strip():
+                        errors.append("Username is required.")
+                    if not nur_mobile.strip():
+                        errors.append("Mobile Number is required.")
+                    if not nur_password:
+                        errors.append("Password is required.")
+                    elif len(nur_password) < 4:
+                        errors.append("Password must be at least 4 characters.")
+                    elif nur_password != nur_password_confirm:
+                        errors.append("Passwords do not match.")
+                    if not errors and get_user_by_username(nur_username.strip()):
+                        errors.append("This username is already taken. Please choose another.")
+
+                    if errors:
+                        for e in errors:
+                            st.error(e)
+                    else:
+                        register_user({
+                            "username": nur_username.strip(),
+                            "password": hash_password(nur_password),
+                            "full_name": nur_full_name.strip(),
+                            "designation": nur_designation,
+                            "employee_id": "",
+                            "department": "Medical",
+                            "mobile": nur_mobile.strip(),
+                            "role": "nurse",
+                            "status": "Pending",
+                        })
+                        st.success(
+                            f"✅ Your {nur_designation} account request has been submitted! "
                             "Please wait for admin approval before signing in."
                         )
 
@@ -1394,11 +1511,72 @@ def render_management_dashboard(df_all: pd.DataFrame):
     requested_today = int((created_dt.dt.normalize() == today_utc).sum())
     completed_today = int((return_dt.dt.normalize() == today_utc).sum())
 
+    # Each metric is paired with an expander right below it — clicking it
+    # reveals the actual requisitions behind that number, since a plain
+    # st.metric can't be clicked directly in Streamlit.
     t1, t2, t3, t4 = st.columns(4)
-    t1.metric("🟡 Pending Right Now", pending_now)
-    t2.metric("🔵 Vehicles On Trip Now", on_trip_now)
-    t3.metric("📥 Requests Submitted Today", requested_today)
-    t4.metric("✅ Trips Completed Today", completed_today)
+
+    with t1:
+        st.metric("🟡 Pending Right Now", pending_now)
+        with st.expander(f"🔍 View {pending_now} pending"):
+            pending_rows = df_all[df_all["status"] == "Pending"]
+            if pending_rows.empty:
+                st.caption("No pending requisitions right now.")
+            else:
+                cols = ["request_id", "applicant_name", "department", "destination",
+                        "date_of_travel", "time_of_travel", "purpose"]
+                disp = pending_rows[[c for c in cols if c in pending_rows.columns]].copy()
+                if "time_of_travel" in disp.columns:
+                    disp["time_of_travel"] = disp["time_of_travel"].apply(lambda v: fmt_time_12h(v, v))
+                st.dataframe(disp, use_container_width=True, hide_index=True,
+                             height=min(320, 45 + 35 * len(disp)))
+
+    with t2:
+        st.metric("🔵 Vehicles On Trip Now", on_trip_now)
+        with st.expander(f"🔍 View {on_trip_now} on trip"):
+            on_trip_rows = df_all[df_all["status"] == "On Trip"]
+            if on_trip_rows.empty:
+                st.caption("No vehicles are currently on a trip.")
+            else:
+                cols = ["request_id", "applicant_name", "driver_name", "vehicle_number",
+                        "destination", "actual_exit_time"]
+                disp = on_trip_rows[[c for c in cols if c in on_trip_rows.columns]].copy()
+                if "actual_exit_time" in disp.columns:
+                    disp["actual_exit_time"] = disp["actual_exit_time"].apply(lambda v: fmt_time_12h(v, v))
+                st.dataframe(disp, use_container_width=True, hide_index=True,
+                             height=min(320, 45 + 35 * len(disp)))
+
+    with t3:
+        st.metric("📥 Requests Submitted Today", requested_today)
+        with st.expander(f"🔍 View {requested_today} submitted today"):
+            submitted_today_rows = df_all[created_dt.dt.normalize() == today_utc]
+            if submitted_today_rows.empty:
+                st.caption("No requests submitted yet today.")
+            else:
+                cols = ["request_id", "applicant_name", "department", "destination",
+                        "status", "created_at"]
+                disp = submitted_today_rows[[c for c in cols if c in submitted_today_rows.columns]].copy()
+                if "created_at" in disp.columns:
+                    disp["created_at"] = disp["created_at"].apply(lambda v: fmt_time_12h(v, v))
+                st.dataframe(disp, use_container_width=True, hide_index=True,
+                             height=min(320, 45 + 35 * len(disp)))
+
+    with t4:
+        st.metric("✅ Trips Completed Today", completed_today)
+        with st.expander(f"🔍 View {completed_today} completed today"):
+            completed_today_rows = df_all[return_dt.dt.normalize() == today_utc]
+            if completed_today_rows.empty:
+                st.caption("No trips completed yet today.")
+            else:
+                disp = completed_today_rows.copy()
+                disp["Total KM"] = disp.apply(lambda row: effective_km_fields(row)[2], axis=1)
+                cols = ["request_id", "applicant_name", "driver_name", "vehicle_number",
+                        "destination", "actual_return_time", "Total KM"]
+                disp = disp[[c for c in cols if c in disp.columns]].copy()
+                if "actual_return_time" in disp.columns:
+                    disp["actual_return_time"] = disp["actual_return_time"].apply(lambda v: fmt_time_12h(v, v))
+                st.dataframe(disp, use_container_width=True, hide_index=True,
+                             height=min(320, 45 + 35 * len(disp)))
 
     work_df = df_all.copy()
     work_df["_dt"] = pd.to_datetime(work_df["date_of_travel"], errors="coerce")
@@ -1983,7 +2161,110 @@ elif user["role"] == "driver":
                                 st.error(f"❌ Failed to record End KM: {e}")
 
 # =========================================================
-# 9C. EXECUTIVE / MANAGEMENT DASHBOARD (NEW)
+# 9C. NURSE / SENIOR NURSE — EMERGENCY DASHBOARD (NEW)
+# =========================================================
+# A deliberately minimal dashboard: Medical staff need to arrange a vehicle
+# for a patient FAST, not fill out a multi-field form. The Emergency tab is
+# a single button — one click submits a fully pre-filled Pending
+# requisition (today's date/time, "Hospital / Emergency" destination,
+# "Ambulance" vehicle type, 1 passenger) and fires an extra high-visibility
+# Telegram alert on top of the normal "New Requisition" one, so Admin/
+# Security notice it immediately. It reuses insert_requisition() (not a raw
+# Supabase call) so it still shows up in Admin's Pending Requests queue for
+# driver/vehicle assignment exactly like any other request.
+elif user["role"] == "nurse":
+    company_header("🚨 Medical Emergency Vehicle Request")
+    st.caption(f"Logged in as {user['full_name']} — {user.get('designation') or 'Nurse'}")
+
+    tab_emergency, tab_my_emergency_requests = st.tabs(
+        ["🚨 Emergency Request", "📍 My Requests / Live Status"]
+    )
+
+    with tab_emergency:
+        st.markdown("### 🚑 Need a vehicle right now to carry a patient?")
+        st.write(
+            "Tap the button below to submit an emergency vehicle request immediately — "
+            "no form to fill in. Admin and Security are notified right away to arrange a "
+            "driver and vehicle."
+        )
+        if st.button("🚨 EMERGENCY — Request Vehicle for Patient Carry", type="primary",
+                      use_container_width=True):
+            request_id = generate_request_id()
+            now = datetime.now()
+            data = {
+                "request_id": request_id,
+                "username": user["username"],
+                "applicant_name": user.get("full_name", ""),
+                "department": user.get("department") or "Medical",
+                "mobile_number": user.get("mobile", ""),
+                "date_of_travel": str(now.date()),
+                "time_of_travel": now.strftime("%H:%M"),
+                "destination": "Hospital / Emergency",
+                "passenger_count": 1,
+                "vehicle_type": "Ambulance",
+                "purpose": "🚨 EMERGENCY — Patient Carry",
+                "special_request": "",
+                "status": "Pending",
+                "driver_name": "",
+                "driver_contact": "",
+                "vehicle_number": "",
+                "approved_by": "",
+            }
+            with st.spinner("Sending emergency request..."):
+                try:
+                    insert_requisition(data)
+                    # Extra, high-visibility alert on top of insert_requisition()'s
+                    # normal "New Vehicle Requisition Submitted!" message, so an
+                    # emergency doesn't blend in with routine requests.
+                    send_telegram_alert(
+                        "🚨🚑 **EMERGENCY VEHICLE REQUEST — PATIENT CARRY** 🚑🚨\n\n"
+                        f"🆔 **ID:** #{request_id}\n"
+                        f"👤 **Requested by:** {user.get('full_name', '')} "
+                        f"({user.get('designation') or 'Nurse'})\n"
+                        f"📞 **Contact:** {user.get('mobile', '')}\n"
+                        f"⏰ **Time:** {now.strftime('%Y-%m-%d %I:%M %p')}\n\n"
+                        "⚡ Please arrange a driver and vehicle IMMEDIATELY."
+                    )
+                    st.success(
+                        f"✅ Emergency request **{request_id}** sent! Admin/Security have been alerted."
+                    )
+                    st.balloons()
+                except Exception as e:
+                    st.error(f"❌ Failed to send emergency request: {e}")
+
+    with tab_my_emergency_requests:
+        st.subheader("My Requests — Live Status")
+        with st.spinner("Loading your requests..."):
+            my_df = fetch_requisitions_by_user(user["username"])
+        if my_df.empty:
+            st.info("You haven't submitted any requests yet.")
+        else:
+            for _, r in my_df.iterrows():
+                with st.container():
+                    st.markdown(f"""
+                    <div class="req-card">
+                        <b>{r['request_id']}</b> &nbsp;|&nbsp; {r['destination']} &nbsp;|&nbsp;
+                        {r['date_of_travel']} at {fmt_time_12h(r['time_of_travel'])} &nbsp;&nbsp;
+                        <span class="{badge_class(r['status'])}">{STATUS_BADGE.get(r['status'], r['status'])}</span>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    with st.expander("View details"):
+                        st.write(f"**Purpose:** {r['purpose']}")
+                        if r["status"] in ("Approved", "On Trip", "Completed"):
+                            st.markdown(f"""
+                            <div class="driver-box">
+                            🚘 <b>Driver:</b> {fmt(r['driver_name'], 'TBD')} &nbsp;|&nbsp;
+                            📞 <b>Contact:</b> {fmt(r['driver_contact'], 'TBD')} &nbsp;|&nbsp;
+                            🔢 <b>Vehicle No.:</b> {fmt(r['vehicle_number'], 'TBD')}
+                            </div>
+                            """, unsafe_allow_html=True)
+                        if r["status"] == "Rejected":
+                            st.error("This request was rejected by the admin.")
+                            if not is_blank(r.get("admin_note")):
+                                st.caption(f"📝 Reason: {r['admin_note']}")
+
+# =========================================================
+# 9D. EXECUTIVE / MANAGEMENT DASHBOARD (NEW)
 # =========================================================
 # Standalone, READ-ONLY role for senior management: top-level KPI cards,
 # department-wise usage chart, a date-range filter, and Excel/PDF export
@@ -2009,10 +2290,11 @@ elif user["role"] == "admin":
     # (default) tab an admin sees. Visual order comes purely from this label
     # list — each variable below is named for what it holds, not its position,
     # so the underlying tab bodies didn't need to be reshuffled in the file.
-    tab_pending_req, tab_users, tab_pending_users, tab_analytics, tab_export, \
-        tab_fleet, tab_duty, tab_variance, tab_management = st.tabs([
-            "🚗 Pending Requests", "👥 User List", "⏳ ID Requests", "📊 Analytics",
-            "📁 All Requisitions & Export", "🚘 Manage Drivers & Vehicles",
+    tab_pending_req, tab_create_req, tab_shuttle, tab_users, tab_pending_users, tab_analytics, tab_export, \
+        tab_edit_trip, tab_fleet, tab_duty, tab_variance, tab_management = st.tabs([
+            "🚗 Pending Requests", "➕ Create Requisition", "🚌 Staff Shuttle", "👥 User List", "⏳ ID Requests",
+            "📊 Analytics", "📁 All Requisitions & Export", "✏️ Edit / Delete Trip",
+            "🚘 Manage Drivers & Vehicles",
             "🕒 Duty Tracker & Analytics", "📈 KM Variance Report",
             "🏆 Management Dashboard",
         ])
@@ -2123,6 +2405,324 @@ elif user["role"] == "admin":
                             except Exception as e:
                                 st.error(f"❌ Update failed: {e}")
 
+    # ---------------- Create Requisition (Admin) — NEW ----------------
+    with tab_create_req:
+        st.subheader("➕ Create a Requisition Directly (Admin)")
+        st.caption(
+            "Use this when you need to arrange a vehicle for someone yourself — a walk-in request, "
+            "a phone call, or any case that didn't come through the normal Employee 'New "
+            "Requisition' form. This creates the requisition **already Approved**, with the Driver "
+            "and Vehicle assigned in the same step — it skips the Pending queue entirely."
+        )
+
+        create_drivers_df = fetch_all_drivers()
+        create_vehicles_df = fetch_all_vehicles()
+        create_driver_contact_map = dict(zip(create_drivers_df["driver_name"], create_drivers_df["driver_contact"])) if not create_drivers_df.empty else {}
+        create_driver_options = ["— Select Driver —"] + create_drivers_df["driver_name"].tolist() if not create_drivers_df.empty else []
+        create_vehicle_options = ["— Select Vehicle —"] + create_vehicles_df["vehicle_number"].tolist() if not create_vehicles_df.empty else []
+
+        if create_drivers_df.empty or create_vehicles_df.empty:
+            st.warning(
+                "⚠️ No drivers and/or vehicles are registered yet. Add them under the "
+                "**🚘 Manage Drivers & Vehicles** tab before creating a requisition here."
+            )
+
+        # Optional: pick an existing Approved user to auto-fill their profile
+        # details. Kept OUTSIDE the form (same pattern as the driver/vehicle
+        # selects in Pending Requests) so choosing someone here immediately
+        # updates the defaults shown inside the form below, instead of only
+        # taking effect after the form is submitted.
+        existing_user_options = ["— Manual Entry —"] + (
+            users_df[users_df["status"] == "Approved"]["username"].tolist() if not users_df.empty else []
+        )
+        selected_existing_user = st.selectbox(
+            "Fill from an existing user (optional)", existing_user_options, key="create_req_existing_user",
+        )
+        prefill = {}
+        if selected_existing_user != "— Manual Entry —" and not users_df.empty:
+            match = users_df[users_df["username"] == selected_existing_user]
+            if not match.empty:
+                prefill = match.iloc[0].to_dict()
+
+        with st.form("admin_create_req_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                ca_applicant_name = st.text_input("Applicant Name *", value=fmt(prefill.get("full_name"), ""))
+                ca_department = st.selectbox(
+                    "Department *", DEPARTMENTS,
+                    index=DEPARTMENTS.index(prefill.get("department")) if prefill.get("department") in DEPARTMENTS else 0,
+                    key="ca_department",
+                )
+                ca_mobile = st.text_input("Mobile Number *", value=fmt(prefill.get("mobile"), ""),
+                                           placeholder="01XXXXXXXXX")
+                ca_passenger_count = st.number_input("Passenger Count *", min_value=1, max_value=50, value=1,
+                                                      key="ca_passenger_count")
+            with c2:
+                ca_date = st.date_input("Date of Travel *", min_value=date.today(), key="ca_date")
+                ca_time = time_input_12h("Time of Travel *", key_prefix="create_req_tt")
+                ca_destination = st.text_input("Destination *", key="ca_destination")
+                ca_vehicle_type = st.selectbox("Vehicle Type Required *", VEHICLE_TYPES, key="ca_vehicle_type")
+
+            ca_purpose = st.text_area("Purpose of Travel *", height=90, key="ca_purpose")
+            ca_special_request = st.text_area("Special Request (optional)", height=70, key="ca_special_request")
+
+            st.markdown("---")
+            st.markdown("##### 🚗 Assign Driver & Vehicle (required to create)")
+            d1, d2 = st.columns(2)
+            with d1:
+                ca_driver = st.selectbox(
+                    "Driver Name *", create_driver_options or ["No drivers available"],
+                    disabled=not create_driver_options, key="ca_driver",
+                )
+            with d2:
+                ca_vehicle = st.selectbox(
+                    "Vehicle Number *", create_vehicle_options or ["No vehicles available"],
+                    disabled=not create_vehicle_options, key="ca_vehicle",
+                )
+            ca_admin_note = st.text_area("Admin Note (optional)", height=60, key="ca_admin_note")
+
+            ca_submitted = st.form_submit_button("✅ Create & Approve Requisition", type="primary",
+                                                  use_container_width=True)
+
+        if ca_submitted:
+            errors = []
+            if not ca_applicant_name.strip():
+                errors.append("Applicant Name is required.")
+            if not ca_mobile.strip():
+                errors.append("Mobile Number is required.")
+            if not ca_destination.strip():
+                errors.append("Destination is required.")
+            if not ca_purpose.strip():
+                errors.append("Purpose of Travel is required.")
+            driver_ready = bool(create_driver_options) and ca_driver != "— Select Driver —"
+            vehicle_ready = bool(create_vehicle_options) and ca_vehicle != "— Select Vehicle —"
+            if not driver_ready:
+                errors.append("Please select a Driver.")
+            if not vehicle_ready:
+                errors.append("Please select a Vehicle.")
+
+            if errors:
+                for e in errors:
+                    st.error(e)
+            else:
+                request_id = generate_request_id()
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                data = {
+                    "request_id": request_id,
+                    "username": prefill.get("username", ""),
+                    "applicant_name": ca_applicant_name.strip(),
+                    "department": ca_department,
+                    "mobile_number": ca_mobile.strip(),
+                    "date_of_travel": str(ca_date),
+                    "time_of_travel": ca_time.strftime("%H:%M"),
+                    "destination": ca_destination.strip(),
+                    "passenger_count": int(ca_passenger_count),
+                    "vehicle_type": ca_vehicle_type,
+                    "purpose": ca_purpose.strip(),
+                    "special_request": ca_special_request.strip(),
+                    "status": "Approved",
+                    "driver_name": ca_driver,
+                    "driver_contact": create_driver_contact_map.get(ca_driver, ""),
+                    "vehicle_number": ca_vehicle,
+                    "approved_by": user["full_name"],
+                    "action_timestamp": now_str,
+                    "approved_time": ca_time.strftime("%H:%M"),
+                    "admin_note": ca_admin_note.strip(),
+                }
+                with st.spinner("Saving to Supabase..."):
+                    try:
+                        insert_requisition(data)
+                        st.success(
+                            f"✅ Requisition **{request_id}** created and already Approved — "
+                            f"Driver **{ca_driver}** / Vehicle **{ca_vehicle}**."
+                        )
+                        st.balloons()
+                    except Exception as e:
+                        st.error(f"❌ Failed to save requisition: {e}")
+
+    # ---------------- Staff Shuttle (Recurring Routes) — NEW ----------------
+    with tab_shuttle:
+        st.subheader("🚌 Staff Shuttle — Quick Submit")
+        st.caption(
+            "For fixed, recurring HIACE routes (e.g. the morning staff pickup, the evening "
+            "7:15 PM drop-off) — save each route once as a template below, then submit that "
+            "day's trip in a couple of clicks instead of retyping everything every day."
+        )
+
+        shuttle_drivers_df = fetch_all_drivers()
+        shuttle_vehicles_df = fetch_all_vehicles()
+        shuttle_driver_options = shuttle_drivers_df["driver_name"].tolist() if not shuttle_drivers_df.empty else []
+        shuttle_vehicle_options = shuttle_vehicles_df["vehicle_number"].tolist() if not shuttle_vehicles_df.empty else []
+        shuttle_driver_contact_map = (
+            dict(zip(shuttle_drivers_df["driver_name"], shuttle_drivers_df["driver_contact"]))
+            if not shuttle_drivers_df.empty else {}
+        )
+
+        if not shuttle_driver_options or not shuttle_vehicle_options:
+            st.warning(
+                "⚠️ No drivers and/or vehicles are registered yet. Add them under the "
+                "**🚘 Manage Drivers & Vehicles** tab before submitting a shuttle trip."
+            )
+
+        templates_df = fetch_all_shuttle_templates()
+
+        st.markdown("##### 🚀 Quick Submit")
+        if templates_df.empty:
+            st.info("No shuttle templates saved yet — add one below under 'Manage Templates'.")
+        else:
+            for _, tpl in templates_df.iterrows():
+                tpl_id = tpl["id"]
+                with st.expander(f"🚐 {tpl['template_name']}  —  {fmt(tpl.get('destination'))}"):
+                    st.write(f"**Purpose:** {fmt(tpl.get('purpose'))}")
+                    st.write(
+                        f"**Vehicle Type:** {fmt(tpl.get('vehicle_type'))}  |  "
+                        f"**Passengers:** {fmt(tpl.get('passenger_count'))}"
+                    )
+                    st.write(f"**Default Departure Time:** {fmt_time_12h(tpl.get('default_time'))}")
+
+                    qc1, qc2, qc3 = st.columns(3)
+                    with qc1:
+                        q_date = st.date_input("Trip Date", value=date.today(), key=f"shuttle_date_{tpl_id}")
+                    with qc2:
+                        default_driver = tpl.get("default_driver_name", "")
+                        driver_choices_this = shuttle_driver_options or ["No drivers available"]
+                        q_driver = st.selectbox(
+                            "Driver", driver_choices_this,
+                            index=driver_choices_this.index(default_driver) if default_driver in driver_choices_this else 0,
+                            key=f"shuttle_driver_{tpl_id}", disabled=not shuttle_driver_options,
+                        )
+                    with qc3:
+                        default_vehicle = tpl.get("default_vehicle_number", "")
+                        vehicle_choices_this = shuttle_vehicle_options or ["No vehicles available"]
+                        q_vehicle = st.selectbox(
+                            "Vehicle", vehicle_choices_this,
+                            index=vehicle_choices_this.index(default_vehicle) if default_vehicle in vehicle_choices_this else 0,
+                            key=f"shuttle_vehicle_{tpl_id}", disabled=not shuttle_vehicle_options,
+                        )
+
+                    if st.button(
+                        f"✅ Submit — {tpl['template_name']} for {q_date}",
+                        key=f"shuttle_submit_{tpl_id}", type="primary", use_container_width=True,
+                    ):
+                        if not shuttle_driver_options or not shuttle_vehicle_options:
+                            st.error("Please add at least one Driver and Vehicle first.")
+                        else:
+                            request_id = generate_request_id()
+                            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            default_time_val = fmt(tpl.get("default_time"), "08:00")
+                            data = {
+                                "request_id": request_id,
+                                "username": "",
+                                "applicant_name": fmt(tpl.get("applicant_name"), tpl["template_name"]),
+                                "department": fmt(tpl.get("department"), "Admin"),
+                                "mobile_number": "",
+                                "date_of_travel": str(q_date),
+                                "time_of_travel": default_time_val,
+                                "destination": fmt(tpl.get("destination"), ""),
+                                "passenger_count": int(tpl.get("passenger_count") or 1),
+                                "vehicle_type": fmt(tpl.get("vehicle_type"), "HIACE"),
+                                "purpose": fmt(tpl.get("purpose"), tpl["template_name"]),
+                                "special_request": "",
+                                "status": "Approved",
+                                "driver_name": q_driver,
+                                "driver_contact": shuttle_driver_contact_map.get(q_driver, ""),
+                                "vehicle_number": q_vehicle,
+                                "approved_by": user["full_name"],
+                                "action_timestamp": now_str,
+                                "approved_time": default_time_val,
+                                "admin_note": f"Auto-submitted from shuttle template: {tpl['template_name']}",
+                            }
+                            with st.spinner("Saving to Supabase..."):
+                                try:
+                                    insert_requisition(data)
+                                    st.success(
+                                        f"✅ **{tpl['template_name']}** requisition **{request_id}** "
+                                        f"created for {q_date} — Driver **{q_driver}**, Vehicle **{q_vehicle}**."
+                                    )
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"❌ Failed to save requisition: {e}")
+
+        st.markdown("---")
+        st.markdown("##### ⚙️ Manage Templates")
+        with st.form("add_shuttle_template_form", clear_on_submit=True):
+            t1, t2 = st.columns(2)
+            with t1:
+                new_tpl_name = st.text_input(
+                    "Template Name *", placeholder="e.g. Evening Staff Shuttle (7:15 PM)"
+                )
+                new_tpl_destination = st.text_input(
+                    "Destination / Route *", placeholder="e.g. Staff drop-off points, Ishwardi route"
+                )
+                new_tpl_vehicle_type = st.selectbox(
+                    "Vehicle Type", VEHICLE_TYPES,
+                    index=VEHICLE_TYPES.index("HIACE") if "HIACE" in VEHICLE_TYPES else 0,
+                    key="new_tpl_vehicle_type",
+                )
+                new_tpl_passengers = st.number_input(
+                    "Passenger Count", min_value=1, max_value=50, value=10, key="new_tpl_passengers"
+                )
+            with t2:
+                new_tpl_purpose = st.text_input(
+                    "Purpose *", placeholder="e.g. Staff Shuttle - Evening Drop-off"
+                )
+                new_tpl_time = time_input_12h("Default Departure Time *", key_prefix="new_shuttle_time")
+                new_tpl_driver = st.selectbox(
+                    "Default Driver", ["— None —"] + shuttle_driver_options, key="new_tpl_driver"
+                )
+                new_tpl_vehicle = st.selectbox(
+                    "Default Vehicle", ["— None —"] + shuttle_vehicle_options, key="new_tpl_vehicle"
+                )
+            add_tpl_clicked = st.form_submit_button("➕ Save Template", type="primary", use_container_width=True)
+
+        if add_tpl_clicked:
+            tpl_errors = []
+            if not new_tpl_name.strip():
+                tpl_errors.append("Template Name is required.")
+            if not new_tpl_destination.strip():
+                tpl_errors.append("Destination / Route is required.")
+            if not new_tpl_purpose.strip():
+                tpl_errors.append("Purpose is required.")
+            if tpl_errors:
+                for e in tpl_errors:
+                    st.error(e)
+            else:
+                try:
+                    add_shuttle_template({
+                        "template_name": new_tpl_name.strip(),
+                        "applicant_name": new_tpl_name.strip(),
+                        "department": "Admin",
+                        "destination": new_tpl_destination.strip(),
+                        "purpose": new_tpl_purpose.strip(),
+                        "vehicle_type": new_tpl_vehicle_type,
+                        "passenger_count": int(new_tpl_passengers),
+                        "default_time": new_tpl_time.strftime("%H:%M"),
+                        "default_driver_name": "" if new_tpl_driver == "— None —" else new_tpl_driver,
+                        "default_vehicle_number": "" if new_tpl_vehicle == "— None —" else new_tpl_vehicle,
+                    })
+                    st.success(f"✅ Template '{new_tpl_name.strip()}' saved.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Failed to save template: {e}")
+
+        st.markdown("###### Current Templates")
+        if templates_df.empty:
+            st.info("No templates yet.")
+        else:
+            for _, tpl in templates_df.iterrows():
+                r1, r2 = st.columns([5, 1])
+                r1.write(
+                    f"**{tpl['template_name']}** — {fmt(tpl.get('destination'))} "
+                    f"@ {fmt_time_12h(tpl.get('default_time'))}"
+                )
+                if r2.button("🗑️", key=f"del_shuttle_tpl_{tpl['id']}", help="Delete this template"):
+                    try:
+                        delete_shuttle_template(tpl["id"])
+                        st.success(f"Deleted template '{tpl['template_name']}'.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ Failed to delete template: {e}")
+
     # ---------------- User List (was Tab 2) ----------------
     with tab_users:
         st.subheader("All User Accounts")
@@ -2136,12 +2736,12 @@ elif user["role"] == "admin":
                 users_display["role"] = users_display["role"].map(lambda r: ROLE_DISPLAY.get(r, r))
             st.dataframe(users_display, use_container_width=True, hide_index=True, height=300)
 
-            st.markdown("##### Change a user's role or status")
+            st.markdown("##### Change a user's role, status, or profile info")
             approved_usernames = users_df["username"].tolist()
             sel_user = st.selectbox("Select username", approved_usernames)
             if sel_user:
                 rec = users_df[users_df["username"] == sel_user].iloc[0]
-                c1, c2, c3 = st.columns(3)
+                c1, c2 = st.columns(2)
                 with c1:
                     current_role = rec.get("role", "user")
                     new_role = st.selectbox("Role", ROLE_OPTIONS,
@@ -2150,13 +2750,34 @@ elif user["role"] == "admin":
                 with c2:
                     new_status = st.selectbox("Status", USER_STATUS_OPTIONS,
                                                index=USER_STATUS_OPTIONS.index(rec.get("status", "Pending")) if rec.get("status") in USER_STATUS_OPTIONS else 0)
+
+                # Full Name and Department are editable too — this is what
+                # actually fixes a mistake like an employee registering under
+                # the wrong department (their New Requisition form auto-fills
+                # from this exact field, so a wrong value here keeps
+                # suggesting the wrong department every time they submit).
+                c3, c4 = st.columns(2)
                 with c3:
-                    st.write("")
-                    st.write("")
-                    if st.button("💾 Save Changes", use_container_width=True):
-                        update_user(sel_user, {"role": new_role, "status": new_status})
-                        st.success(f"Updated {sel_user}.")
-                        st.rerun()
+                    new_full_name = st.text_input("Full Name", value=fmt(rec.get("full_name"), ""))
+                with c4:
+                    current_dept = rec.get("department", "")
+                    dept_options = DEPARTMENTS if current_dept in DEPARTMENTS else DEPARTMENTS + (
+                        [current_dept] if current_dept else []
+                    )
+                    new_department = st.selectbox(
+                        "Department", dept_options,
+                        index=dept_options.index(current_dept) if current_dept in dept_options else 0,
+                    )
+
+                if st.button("💾 Save Changes", use_container_width=True):
+                    update_user(sel_user, {
+                        "role": new_role,
+                        "status": new_status,
+                        "full_name": new_full_name.strip(),
+                        "department": new_department,
+                    })
+                    st.success(f"Updated {sel_user}.")
+                    st.rerun()
 
                 st.markdown("---")
                 st.markdown("##### 🗑️ Delete User (e.g. employee left the company)")
@@ -2327,6 +2948,202 @@ elif user["role"] == "admin":
                                     file_name="vehicle_requisition_report.pdf",
                                     mime="application/pdf",
                                     use_container_width=True)
+
+    # ---------------- Edit / Delete Trip (NEW) ----------------
+    with tab_edit_trip:
+        st.subheader("✏️ Edit or Delete a Requisition")
+        st.caption(
+            "Use this to fix a mistaken entry — e.g. a driver typed the wrong odometer "
+            "reading, a wrong destination/time was saved, or a duplicate/test request needs "
+            "to be removed entirely. Changes here go straight to the database."
+        )
+
+        if df_all.empty:
+            st.info("No requisitions yet.")
+        else:
+            edit_options = {
+                f"{r['request_id']} — {r['applicant_name']} → {r['destination']} ({r['status']})": r["request_id"]
+                for _, r in df_all.iterrows()
+            }
+            selected_label = st.selectbox(
+                "Select a requisition to edit", list(edit_options.keys()), key="edit_trip_select"
+            )
+            selected_request_id = edit_options[selected_label]
+            row = df_all[df_all["request_id"] == selected_request_id].iloc[0]
+
+            edit_drivers_df = fetch_all_drivers()
+            edit_vehicles_df = fetch_all_vehicles()
+            edit_driver_contact_map = (
+                dict(zip(edit_drivers_df["driver_name"], edit_drivers_df["driver_contact"]))
+                if not edit_drivers_df.empty else {}
+            )
+            edit_driver_choices = edit_drivers_df["driver_name"].tolist() if not edit_drivers_df.empty else []
+            edit_vehicle_choices = edit_vehicles_df["vehicle_number"].tolist() if not edit_vehicles_df.empty else []
+            # Always keep the row's CURRENT driver/vehicle selectable even if
+            # it's since been removed from Manage Drivers & Vehicles, so
+            # opening this form never silently wipes out a valid historical
+            # assignment just because the master list changed later.
+            current_driver = fmt(row.get("driver_name"), "")
+            current_vehicle = fmt(row.get("vehicle_number"), "")
+            if current_driver and current_driver not in edit_driver_choices:
+                edit_driver_choices = [current_driver] + edit_driver_choices
+            if current_vehicle and current_vehicle not in edit_vehicle_choices:
+                edit_vehicle_choices = [current_vehicle] + edit_vehicle_choices
+            edit_driver_choices_display = ["— None —"] + edit_driver_choices
+            edit_vehicle_choices_display = ["— None —"] + edit_vehicle_choices
+
+            with st.form("edit_trip_form"):
+                st.markdown("##### Trip Details")
+                e1, e2 = st.columns(2)
+                with e1:
+                    et_applicant_name = st.text_input("Applicant Name", value=fmt(row.get("applicant_name"), ""))
+                    et_department = st.selectbox(
+                        "Department", DEPARTMENTS,
+                        index=DEPARTMENTS.index(row.get("department")) if row.get("department") in DEPARTMENTS else 0,
+                    )
+                    et_mobile = st.text_input("Mobile Number", value=fmt(row.get("mobile_number"), ""))
+                    et_passenger_count = st.number_input(
+                        "Passenger Count", min_value=1, max_value=50,
+                        value=int(row.get("passenger_count") or 1),
+                    )
+                    et_status = st.selectbox(
+                        "Status", REQ_STATUS_OPTIONS,
+                        index=REQ_STATUS_OPTIONS.index(row.get("status")) if row.get("status") in REQ_STATUS_OPTIONS else 0,
+                    )
+                with e2:
+                    try:
+                        et_date_default = datetime.strptime(str(row.get("date_of_travel")), "%Y-%m-%d").date()
+                    except (ValueError, TypeError):
+                        et_date_default = date.today()
+                    et_date = st.date_input("Date of Travel", value=et_date_default)
+                    try:
+                        et_time_default = datetime.strptime(fmt(row.get("time_of_travel"), "09:00"), "%H:%M").time()
+                    except ValueError:
+                        et_time_default = datetime.now().time()
+                    et_time = time_input_12h("Time of Travel", key_prefix="edit_trip_tt", default_time=et_time_default)
+                    et_destination = st.text_input("Destination", value=fmt(row.get("destination"), ""))
+                    et_vehicle_type = st.selectbox(
+                        "Vehicle Type", VEHICLE_TYPES,
+                        index=VEHICLE_TYPES.index(row.get("vehicle_type")) if row.get("vehicle_type") in VEHICLE_TYPES else 0,
+                    )
+
+                et_purpose = st.text_area("Purpose", value=fmt(row.get("purpose"), ""), height=80)
+                et_special_request = st.text_area("Special Request", value=fmt(row.get("special_request"), ""), height=60)
+
+                st.markdown("---")
+                st.markdown("##### Driver & Vehicle Assignment")
+                d1, d2 = st.columns(2)
+                with d1:
+                    et_driver = st.selectbox(
+                        "Driver", edit_driver_choices_display,
+                        index=edit_driver_choices_display.index(current_driver) if current_driver in edit_driver_choices_display else 0,
+                    )
+                with d2:
+                    et_vehicle = st.selectbox(
+                        "Vehicle Number", edit_vehicle_choices_display,
+                        index=edit_vehicle_choices_display.index(current_vehicle) if current_vehicle in edit_vehicle_choices_display else 0,
+                    )
+
+                st.markdown("---")
+                st.markdown("##### Odometer / KM Corrections")
+                st.caption(
+                    "Tick 'leave blank' to clear a value that hasn't actually been recorded, "
+                    "instead of leaving a stray 0 that would throw off distance reports."
+                )
+                k1, k2 = st.columns(2)
+                with k1:
+                    st.markdown("**Security's Gate readings**")
+                    sk_blank = st.checkbox("Start KM — leave blank", value=is_blank(row.get("start_km")),
+                                            key="et_sk_blank")
+                    et_start_km = st.number_input(
+                        "Start KM", min_value=0.0, step=1.0, format="%.1f",
+                        value=float(row.get("start_km")) if not is_blank(row.get("start_km")) else 0.0,
+                        disabled=sk_blank, key="et_start_km",
+                    )
+                    ek_blank = st.checkbox("End KM — leave blank", value=is_blank(row.get("end_km")),
+                                            key="et_ek_blank")
+                    et_end_km = st.number_input(
+                        "End KM", min_value=0.0, step=1.0, format="%.1f",
+                        value=float(row.get("end_km")) if not is_blank(row.get("end_km")) else 0.0,
+                        disabled=ek_blank, key="et_end_km",
+                    )
+                with k2:
+                    st.markdown("**Driver's own readings**")
+                    dsk_blank = st.checkbox("Driver Start KM — leave blank", value=is_blank(row.get("driver_start_km")),
+                                             key="et_dsk_blank")
+                    et_driver_start_km = st.number_input(
+                        "Driver Start KM", min_value=0.0, step=1.0, format="%.1f",
+                        value=float(row.get("driver_start_km")) if not is_blank(row.get("driver_start_km")) else 0.0,
+                        disabled=dsk_blank, key="et_driver_start_km",
+                    )
+                    dek_blank = st.checkbox("Driver End KM — leave blank", value=is_blank(row.get("driver_end_km")),
+                                             key="et_dek_blank")
+                    et_driver_end_km = st.number_input(
+                        "Driver End KM", min_value=0.0, step=1.0, format="%.1f",
+                        value=float(row.get("driver_end_km")) if not is_blank(row.get("driver_end_km")) else 0.0,
+                        disabled=dek_blank, key="et_driver_end_km",
+                    )
+
+                et_admin_note = st.text_area("Admin Note", value=fmt(row.get("admin_note"), ""), height=60)
+                et_notify = st.checkbox(
+                    "📢 Send a Telegram notification about this correction", value=False, key="et_notify"
+                )
+
+                et_save_clicked = st.form_submit_button("💾 Save Changes", type="primary", use_container_width=True)
+
+            if et_save_clicked:
+                updates = {
+                    "applicant_name": et_applicant_name.strip(),
+                    "department": et_department,
+                    "mobile_number": et_mobile.strip(),
+                    "passenger_count": int(et_passenger_count),
+                    "status": et_status,
+                    "date_of_travel": str(et_date),
+                    "time_of_travel": et_time.strftime("%H:%M"),
+                    "destination": et_destination.strip(),
+                    "vehicle_type": et_vehicle_type,
+                    "purpose": et_purpose.strip(),
+                    "special_request": et_special_request.strip(),
+                    "driver_name": "" if et_driver == "— None —" else et_driver,
+                    "driver_contact": "" if et_driver == "— None —" else edit_driver_contact_map.get(et_driver, ""),
+                    "vehicle_number": "" if et_vehicle == "— None —" else et_vehicle,
+                    "start_km": None if sk_blank else float(et_start_km),
+                    "end_km": None if ek_blank else float(et_end_km),
+                    "driver_start_km": None if dsk_blank else float(et_driver_start_km),
+                    "driver_end_km": None if dek_blank else float(et_driver_end_km),
+                    "admin_note": et_admin_note.strip(),
+                }
+                # Recompute total_km using the same driver-first-then-security
+                # priority as effective_km_fields() everywhere else in the app,
+                # so a manual correction here stays consistent with every
+                # report/dashboard that reads total_km.
+                updates["total_km"] = effective_km_fields(updates)[2]
+
+                try:
+                    update_requisition(selected_request_id, updates, notify=et_notify)
+                    st.success(f"✅ Requisition {selected_request_id} updated.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Failed to update: {e}")
+
+            st.markdown("---")
+            st.markdown("##### 🗑️ Delete This Requisition Permanently")
+            st.caption(
+                f"This permanently removes **{selected_request_id}** from the system — it will "
+                "disappear from every report, export, and dashboard. This cannot be undone."
+            )
+            confirm_delete_trip = st.checkbox(
+                f"I understand this will permanently delete {selected_request_id}.",
+                key=f"confirm_del_trip_{selected_request_id}",
+            )
+            if st.button("🗑️ Delete This Requisition", type="primary", disabled=not confirm_delete_trip,
+                         use_container_width=True, key=f"del_trip_btn_{selected_request_id}"):
+                try:
+                    delete_requisition(selected_request_id)
+                    st.success(f"{selected_request_id} has been deleted.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Failed to delete: {e}")
 
     # ---------------- Manage Drivers & Vehicles (was Tab 6) ----------------
     with tab_fleet:
