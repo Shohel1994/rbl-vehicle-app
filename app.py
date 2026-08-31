@@ -57,14 +57,23 @@ def send_telegram_alert(message: str):
 
 
 def insert_requisition(data: dict):
+    """Inserts a new requisition row and fires the 'New Requisition' Telegram
+    alert. Returns the database's own auto-incrementing `id` (a small
+    integer, e.g. 42) so callers can show drivers/employees a short
+    "Requisition #42" instead of the long internal request_id string
+    (e.g. REQ-20260831103122-982) — that long string still exists and is
+    still the real unique key used for every lookup/update/join in the app,
+    it's just never meant to be read or memorized by a person. Returns None
+    if the new id couldn't be read back (insert still succeeds either way)."""
     sb = get_supabase_client()
-    sb.table(REQUISITIONS_TABLE).insert(data).execute()
+    res = sb.table(REQUISITIONS_TABLE).insert(data).execute()
+    new_id = res.data[0].get("id") if res.data else None
 
     # English Telegram Alert for New Requisition
     applicant = data.get("applicant_name", "N/A")
     dept = data.get("department", "N/A")
     dest = data.get("destination", "N/A")
-    req_id = data.get("request_id", "N/A")
+    display_id = new_id if new_id is not None else data.get("request_id", "N/A")
     date_of_travel = data.get("date_of_travel", "N/A")
     time_of_travel = data.get("time_of_travel", "N/A")
     vehicle_type = data.get("vehicle_type", "N/A")
@@ -72,7 +81,7 @@ def insert_requisition(data: dict):
 
     msg = (
         f"🚨 **New Vehicle Requisition Submitted!**\n\n"
-        f"🆔 **ID:** #{req_id}\n"
+        f"🆔 **Requisition #:** {display_id}\n"
         f"👤 **Applicant:** {applicant}\n"
         f"🏢 **Department:** {dept}\n"
         f"📍 **Destination:** {dest}\n"
@@ -81,6 +90,7 @@ def insert_requisition(data: dict):
         f"👥 **Passengers:** {passenger_count}"
     )
     send_telegram_alert(msg)
+    return new_id
 
 
 def update_requisition(request_id: str, updates: dict, notify: bool = True):
@@ -98,18 +108,20 @@ def update_requisition(request_id: str, updates: dict, notify: bool = True):
 
     applicant = ""
     dest = ""
+    short_id = None
     if notify:
-        # Look up applicant/destination so the alert is informative even
+        # Look up applicant/destination/id so the alert is informative even
         # though `updates` itself usually only carries status-related
         # fields. Skipped entirely when notify=False since nothing here is
         # needed if we're not sending a message.
         try:
-            existing = sb.table(REQUISITIONS_TABLE).select("applicant_name, destination").eq(
+            existing = sb.table(REQUISITIONS_TABLE).select("id, applicant_name, destination").eq(
                 "request_id", request_id
             ).limit(1).execute()
             if existing.data:
                 applicant = existing.data[0].get("applicant_name", "")
                 dest = existing.data[0].get("destination", "")
+                short_id = existing.data[0].get("id")
         except Exception:
             pass  # Alert enrichment is best-effort; the update itself must still proceed.
 
@@ -122,10 +134,11 @@ def update_requisition(request_id: str, updates: dict, notify: bool = True):
     status = updates.get("status", "Updated")
     driver = updates.get("driver_name", "")
     vehicle = updates.get("vehicle_number", "")
+    display_id = short_id if short_id is not None else request_id
 
     msg = (
         f"📢 **Requisition Status Updated!**\n\n"
-        f"🆔 **Requisition ID:** #{request_id}\n"
+        f"🆔 **Requisition #:** {display_id}\n"
     )
     if applicant:
         msg += f"👤 **Applicant:** {applicant}\n"
@@ -227,6 +240,22 @@ def is_blank(val) -> bool:
 
 def fmt(val, default: str = "—") -> str:
     return default if is_blank(val) else str(val)
+
+
+def short_req_id(value) -> str:
+    """Short, human-friendly requisition label ('#42') built from the
+    database's own auto-incrementing `id` column. The long internal
+    request_id (e.g. 'REQ-20260831103122-982') still exists and is still
+    the real unique key used for every lookup/update/join in the app — it's
+    just never meant to be read or memorized by a driver or employee, only
+    this short number is. Falls back to showing the raw value if it isn't
+    a usable number (e.g. already blank, or an unexpected type)."""
+    if is_blank(value):
+        return "—"
+    try:
+        return f"#{int(float(value))}"
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def fmt_time_12h(value, default: str = "—") -> str:
@@ -1128,15 +1157,17 @@ def build_pdf_report(df: pd.DataFrame, filters_summary: str) -> bytes:
     pdf.cell(0, 8, "Requisition Records", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(1)
 
-    # Column widths are sized generously for "Req ID" (the longest field, e.g.
-    # "REQ-20260809072230-852") and every cell wraps automatically via fpdf2's
-    # table() API — this is what actually prevents text from bleeding into the
-    # next column, instead of truncating with "…" as the previous version did.
-    headers = ["Req ID", "Applicant", "Department", "Date", "Time", "Destination",
+    # Every cell wraps automatically via fpdf2's table() API — this is what
+    # actually prevents text from bleeding into the next column, instead of
+    # truncating with "…" as an earlier version did. "Req #" uses the
+    # database's own short auto-incrementing id (e.g. #42) rather than the
+    # long internal request_id string, which exists only for unique
+    # lookups and isn't meant to be read by a person.
+    headers = ["Req #", "Applicant", "Department", "Date", "Time", "Destination",
                "Vehicle", "Status", "Driver", "Vehicle No.", "Total KM"]
-    cols = ["request_id", "applicant_name", "department", "date_of_travel", "time_of_travel",
+    cols = ["id", "applicant_name", "department", "date_of_travel", "time_of_travel",
             "destination", "vehicle_type", "status", "driver_name", "vehicle_number", "total_km"]
-    col_widths = [42, 24, 22, 18, 13, 24, 16, 16, 22, 28, 16]
+    col_widths = [16, 24, 22, 18, 13, 30, 16, 16, 22, 28, 16]
 
     pdf.set_font("Helvetica", size=7)
     heading_style = FontFace(emphasis="BOLD", color=(255, 255, 255), fill_color=(15, 98, 254))
@@ -1152,6 +1183,8 @@ def build_pdf_report(df: pd.DataFrame, filters_summary: str) -> bytes:
                 val = r.get(col, "")
                 if col == "time_of_travel":
                     val = fmt_time_12h(val, "")
+                elif col == "id":
+                    val = short_req_id(val)
                 row.cell(fmt(val, ""))
 
     return bytes(pdf.output())
@@ -1523,9 +1556,12 @@ def render_management_dashboard(df_all: pd.DataFrame):
             if pending_rows.empty:
                 st.caption("No pending requisitions right now.")
             else:
-                cols = ["request_id", "applicant_name", "department", "destination",
+                cols = ["id", "applicant_name", "department", "destination",
                         "date_of_travel", "time_of_travel", "purpose"]
                 disp = pending_rows[[c for c in cols if c in pending_rows.columns]].copy()
+                if "id" in disp.columns:
+                    disp["id"] = disp["id"].apply(short_req_id)
+                    disp = disp.rename(columns={"id": "Req #"})
                 if "time_of_travel" in disp.columns:
                     disp["time_of_travel"] = disp["time_of_travel"].apply(lambda v: fmt_time_12h(v, v))
                 st.dataframe(disp, use_container_width=True, hide_index=True,
@@ -1538,9 +1574,12 @@ def render_management_dashboard(df_all: pd.DataFrame):
             if on_trip_rows.empty:
                 st.caption("No vehicles are currently on a trip.")
             else:
-                cols = ["request_id", "applicant_name", "driver_name", "vehicle_number",
+                cols = ["id", "applicant_name", "driver_name", "vehicle_number",
                         "destination", "actual_exit_time"]
                 disp = on_trip_rows[[c for c in cols if c in on_trip_rows.columns]].copy()
+                if "id" in disp.columns:
+                    disp["id"] = disp["id"].apply(short_req_id)
+                    disp = disp.rename(columns={"id": "Req #"})
                 if "actual_exit_time" in disp.columns:
                     disp["actual_exit_time"] = disp["actual_exit_time"].apply(lambda v: fmt_time_12h(v, v))
                 st.dataframe(disp, use_container_width=True, hide_index=True,
@@ -1553,9 +1592,12 @@ def render_management_dashboard(df_all: pd.DataFrame):
             if submitted_today_rows.empty:
                 st.caption("No requests submitted yet today.")
             else:
-                cols = ["request_id", "applicant_name", "department", "destination",
+                cols = ["id", "applicant_name", "department", "destination",
                         "status", "created_at"]
                 disp = submitted_today_rows[[c for c in cols if c in submitted_today_rows.columns]].copy()
+                if "id" in disp.columns:
+                    disp["id"] = disp["id"].apply(short_req_id)
+                    disp = disp.rename(columns={"id": "Req #"})
                 if "created_at" in disp.columns:
                     disp["created_at"] = disp["created_at"].apply(lambda v: fmt_time_12h(v, v))
                 st.dataframe(disp, use_container_width=True, hide_index=True,
@@ -1570,9 +1612,12 @@ def render_management_dashboard(df_all: pd.DataFrame):
             else:
                 disp = completed_today_rows.copy()
                 disp["Total KM"] = disp.apply(lambda row: effective_km_fields(row)[2], axis=1)
-                cols = ["request_id", "applicant_name", "driver_name", "vehicle_number",
+                cols = ["id", "applicant_name", "driver_name", "vehicle_number",
                         "destination", "actual_return_time", "Total KM"]
                 disp = disp[[c for c in cols if c in disp.columns]].copy()
+                if "id" in disp.columns:
+                    disp["id"] = disp["id"].apply(short_req_id)
+                    disp = disp.rename(columns={"id": "Req #"})
                 if "actual_return_time" in disp.columns:
                     disp["actual_return_time"] = disp["actual_return_time"].apply(lambda v: fmt_time_12h(v, v))
                 st.dataframe(disp, use_container_width=True, hide_index=True,
@@ -1871,8 +1916,8 @@ if user["role"] == "user":
                 }
                 with st.spinner("Saving to Supabase..."):
                     try:
-                        insert_requisition(data)
-                        st.success(f"✅ Requisition submitted! Your Request ID is **{request_id}**")
+                        new_id = insert_requisition(data)
+                        st.success(f"✅ Requisition submitted! Your Requisition number is **{short_req_id(new_id)}**")
                         st.balloons()
                     except Exception as e:
                         st.error(f"❌ Failed to save requisition: {e}")
@@ -1888,7 +1933,7 @@ if user["role"] == "user":
                 with st.container():
                     st.markdown(f"""
                     <div class="req-card">
-                        <b>{r['request_id']}</b> &nbsp;|&nbsp; {r['destination']} &nbsp;|&nbsp;
+                        <b>Requisition {short_req_id(r.get('id'))}</b> &nbsp;|&nbsp; {r['destination']} &nbsp;|&nbsp;
                         {r['date_of_travel']} at {fmt_time_12h(r['time_of_travel'])} &nbsp;&nbsp;
                         <span class="{badge_class(r['status'])}">{STATUS_BADGE.get(r['status'], r['status'])}</span>
                     </div>
@@ -2057,7 +2102,8 @@ elif user["role"] == "driver":
             for _, r in start_trips.iterrows():
                 auto_start = get_last_driver_end_km(user["full_name"], r.get("vehicle_number", ""))
                 with st.expander(
-                    f"🟢 {r['request_id']} — {r['destination']}  |  Vehicle: {fmt(r.get('vehicle_number'), 'N/A')}"
+                    f"🟢 Requisition {short_req_id(r.get('id'))} — {r['destination']}  |  "
+                    f"Vehicle: {fmt(r.get('vehicle_number'), 'N/A')}"
                 ):
                     c1, c2 = st.columns(2)
                     with c1:
@@ -2120,7 +2166,8 @@ elif user["role"] == "driver":
             for _, r in end_trips.iterrows():
                 start_km_val = 0.0 if is_blank(r.get("driver_start_km")) else float(r.get("driver_start_km"))
                 with st.expander(
-                    f"🔵 {r['request_id']} — {r['destination']}  |  Vehicle: {fmt(r.get('vehicle_number'), 'N/A')}"
+                    f"🔵 Requisition {short_req_id(r.get('id'))} — {r['destination']}  |  "
+                    f"Vehicle: {fmt(r.get('vehicle_number'), 'N/A')}"
                 ):
                     c1, c2 = st.columns(2)
                     with c1:
@@ -2212,13 +2259,13 @@ elif user["role"] == "nurse":
             }
             with st.spinner("Sending emergency request..."):
                 try:
-                    insert_requisition(data)
+                    new_id = insert_requisition(data)
                     # Extra, high-visibility alert on top of insert_requisition()'s
                     # normal "New Vehicle Requisition Submitted!" message, so an
                     # emergency doesn't blend in with routine requests.
                     send_telegram_alert(
                         "🚨🚑 **EMERGENCY VEHICLE REQUEST — PATIENT CARRY** 🚑🚨\n\n"
-                        f"🆔 **ID:** #{request_id}\n"
+                        f"🆔 **Requisition #:** {short_req_id(new_id)}\n"
                         f"👤 **Requested by:** {user.get('full_name', '')} "
                         f"({user.get('designation') or 'Nurse'})\n"
                         f"📞 **Contact:** {user.get('mobile', '')}\n"
@@ -2226,7 +2273,8 @@ elif user["role"] == "nurse":
                         "⚡ Please arrange a driver and vehicle IMMEDIATELY."
                     )
                     st.success(
-                        f"✅ Emergency request **{request_id}** sent! Admin/Security have been alerted."
+                        f"✅ Emergency request **{short_req_id(new_id)}** sent! "
+                        "Admin/Security have been alerted."
                     )
                     st.balloons()
                 except Exception as e:
@@ -2243,7 +2291,7 @@ elif user["role"] == "nurse":
                 with st.container():
                     st.markdown(f"""
                     <div class="req-card">
-                        <b>{r['request_id']}</b> &nbsp;|&nbsp; {r['destination']} &nbsp;|&nbsp;
+                        <b>Requisition {short_req_id(r.get('id'))}</b> &nbsp;|&nbsp; {r['destination']} &nbsp;|&nbsp;
                         {r['date_of_travel']} at {fmt_time_12h(r['time_of_travel'])} &nbsp;&nbsp;
                         <span class="{badge_class(r['status'])}">{STATUS_BADGE.get(r['status'], r['status'])}</span>
                     </div>
@@ -2330,7 +2378,8 @@ elif user["role"] == "admin":
             st.success("🎉 No pending requisitions — all caught up!")
         else:
             for _, r in pending_df.iterrows():
-                with st.expander(f"🟡 {r['request_id']} — {r['applicant_name']} ({r['department']}) → {r['destination']}"):
+                with st.expander(f"🟡 Requisition {short_req_id(r.get('id'))} — {r['applicant_name']} ({r['department']}) → {r['destination']}"):
+                    st.caption(f"Technical ID: `{r['request_id']}`")
                     c1, c2 = st.columns(2)
                     with c1:
                         st.write(f"**Mobile:** {r['mobile_number']}")
@@ -2400,7 +2449,7 @@ elif user["role"] == "admin":
                                 if approve_clicked:
                                     updates["approved_time"] = approved_time.strftime("%H:%M")
                                 update_requisition(r["request_id"], updates)
-                                st.success(f"Request {r['request_id']} marked as {new_status}.")
+                                st.success(f"Requisition {short_req_id(r.get('id'))} marked as {new_status}.")
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"❌ Update failed: {e}")
@@ -2531,9 +2580,9 @@ elif user["role"] == "admin":
                 }
                 with st.spinner("Saving to Supabase..."):
                     try:
-                        insert_requisition(data)
+                        new_id = insert_requisition(data)
                         st.success(
-                            f"✅ Requisition **{request_id}** created and already Approved — "
+                            f"✅ Requisition **{short_req_id(new_id)}** created and already Approved — "
                             f"Driver **{ca_driver}** / Vehicle **{ca_vehicle}**."
                         )
                         st.balloons()
@@ -2634,9 +2683,9 @@ elif user["role"] == "admin":
                             }
                             with st.spinner("Saving to Supabase..."):
                                 try:
-                                    insert_requisition(data)
+                                    new_id = insert_requisition(data)
                                     st.success(
-                                        f"✅ **{tpl['template_name']}** requisition **{request_id}** "
+                                        f"✅ **{tpl['template_name']}** requisition **{short_req_id(new_id)}** "
                                         f"created for {q_date} — Driver **{q_driver}**, Vehicle **{q_vehicle}**."
                                     )
                                     st.rerun()
@@ -2962,7 +3011,7 @@ elif user["role"] == "admin":
             st.info("No requisitions yet.")
         else:
             edit_options = {
-                f"{r['request_id']} — {r['applicant_name']} → {r['destination']} ({r['status']})": r["request_id"]
+                f"{short_req_id(r.get('id'))} — {r['applicant_name']} → {r['destination']} ({r['status']})": r["request_id"]
                 for _, r in df_all.iterrows()
             }
             selected_label = st.selectbox(
@@ -2970,6 +3019,8 @@ elif user["role"] == "admin":
             )
             selected_request_id = edit_options[selected_label]
             row = df_all[df_all["request_id"] == selected_request_id].iloc[0]
+            selected_short_id = short_req_id(row.get("id"))
+            st.caption(f"Technical ID: `{selected_request_id}`")
 
             edit_drivers_df = fetch_all_drivers()
             edit_vehicles_df = fetch_all_vehicles()
@@ -3121,7 +3172,7 @@ elif user["role"] == "admin":
 
                 try:
                     update_requisition(selected_request_id, updates, notify=et_notify)
-                    st.success(f"✅ Requisition {selected_request_id} updated.")
+                    st.success(f"✅ Requisition {selected_short_id} updated.")
                     st.rerun()
                 except Exception as e:
                     st.error(f"❌ Failed to update: {e}")
@@ -3129,18 +3180,18 @@ elif user["role"] == "admin":
             st.markdown("---")
             st.markdown("##### 🗑️ Delete This Requisition Permanently")
             st.caption(
-                f"This permanently removes **{selected_request_id}** from the system — it will "
+                f"This permanently removes **{selected_short_id}** from the system — it will "
                 "disappear from every report, export, and dashboard. This cannot be undone."
             )
             confirm_delete_trip = st.checkbox(
-                f"I understand this will permanently delete {selected_request_id}.",
+                f"I understand this will permanently delete {selected_short_id}.",
                 key=f"confirm_del_trip_{selected_request_id}",
             )
             if st.button("🗑️ Delete This Requisition", type="primary", disabled=not confirm_delete_trip,
                          use_container_width=True, key=f"del_trip_btn_{selected_request_id}"):
                 try:
                     delete_requisition(selected_request_id)
-                    st.success(f"{selected_request_id} has been deleted.")
+                    st.success(f"{selected_short_id} has been deleted.")
                     st.rerun()
                 except Exception as e:
                     st.error(f"❌ Failed to delete: {e}")
@@ -3526,7 +3577,7 @@ elif user["role"] == "admin":
                     s_dist = _security_dist(r)
                     variance = round(d_dist - s_dist, 1) if (d_dist is not None and s_dist is not None) else None
                     rows.append({
-                        "Trip ID": r.get("request_id", ""),
+                        "Trip ID": short_req_id(r.get("id")),
                         "Vehicle No": fmt(r.get("vehicle_number")),
                         "Driver Name": fmt(r.get("driver_name")),
                         "Driver Start KM": fmt(r.get("driver_start_km")),
