@@ -2665,8 +2665,8 @@ elif user["role"] == "admin":
         st.subheader("🚌 Staff Shuttle — Quick Submit")
         st.caption(
             "For fixed, recurring HIACE routes (e.g. the morning staff pickup, the evening "
-            "7:15 PM drop-off) — save each route once as a template below, then submit that "
-            "day's trip in a couple of clicks instead of retyping everything every day."
+            "7:15 PM drop-off) — save each route once as a template below, then submit "
+            "tomorrow's trip with a single click instead of retyping everything every day."
         )
 
         shuttle_drivers_df = fetch_all_drivers()
@@ -2686,82 +2686,169 @@ elif user["role"] == "admin":
 
         templates_df = fetch_all_shuttle_templates()
 
+        # "Tomorrow" is recomputed fresh every time this tab renders (today's
+        # real date + 1 day) — this is what makes the one-click button always
+        # correct without anyone having to touch a date picker: run this
+        # tonight (03/09/26) and it submits for 04/09/26; run it any other
+        # night and it automatically submits for the following day.
+        tomorrow_date = date.today() + timedelta(days=1)
+
+        def _submit_shuttle_trip(tpl_row, trip_date, driver_name, vehicle_number):
+            """Creates one Approved requisition from a shuttle template for
+            the given date/driver/vehicle. Returns the new short req id, or
+            raises on failure (caller handles the try/except + message)."""
+            request_id = generate_request_id()
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            default_time_val = fmt(tpl_row.get("default_time"), "08:00")
+            data = {
+                "request_id": request_id,
+                "username": "",
+                "applicant_name": fmt(tpl_row.get("applicant_name"), tpl_row["template_name"]),
+                "department": fmt(tpl_row.get("department"), "Admin"),
+                "mobile_number": "",
+                "date_of_travel": str(trip_date),
+                "time_of_travel": default_time_val,
+                "destination": fmt(tpl_row.get("destination"), ""),
+                "passenger_count": int(tpl_row.get("passenger_count") or 1),
+                "vehicle_type": fmt(tpl_row.get("vehicle_type"), "HIACE"),
+                "purpose": fmt(tpl_row.get("purpose"), tpl_row["template_name"]),
+                "special_request": "",
+                "status": "Approved",
+                "driver_name": driver_name,
+                "driver_contact": shuttle_driver_contact_map.get(driver_name, ""),
+                "vehicle_number": vehicle_number,
+                "approved_by": user["full_name"],
+                "action_timestamp": now_str,
+                "approved_time": default_time_val,
+                "admin_note": f"Auto-submitted from shuttle template: {tpl_row['template_name']}",
+            }
+            new_id = insert_requisition(data)
+            return short_req_id(new_id)
+
         st.markdown("##### 🚀 Quick Submit")
         if templates_df.empty:
             st.info("No shuttle templates saved yet — add one below under 'Manage Templates'.")
         else:
+            # ---- ONE button for ALL fixed morning trips at once ----
+            # This is the "4 trips, one click" button: every saved template
+            # is submitted in a single go for tomorrow's date, each using
+            # its own saved default time/driver/vehicle — nothing to pick.
+            bulk_ready = bool(shuttle_driver_options) and bool(shuttle_vehicle_options)
+            st.info(
+                f"📅 **Tomorrow's date:** {tomorrow_date.strftime('%A, %d %B %Y')} "
+                f"({tomorrow_date.strftime('%d/%m/%y')})"
+            )
+            if st.button(
+                f"🌅 Submit ALL {len(templates_df)} Fixed Trips for Tomorrow ({tomorrow_date.strftime('%d/%m/%y')})",
+                type="primary", use_container_width=True, disabled=not bulk_ready,
+                key="shuttle_bulk_submit_all",
+            ):
+                created, failed = [], []
+                with st.spinner("Saving all fixed trips to Supabase..."):
+                    for _, tpl in templates_df.iterrows():
+                        d_name = tpl.get("default_driver_name", "")
+                        v_number = tpl.get("default_vehicle_number", "")
+                        if d_name not in shuttle_driver_options or v_number not in shuttle_vehicle_options:
+                            failed.append(f"{tpl['template_name']} (no default Driver/Vehicle saved)")
+                            continue
+                        try:
+                            new_short_id = _submit_shuttle_trip(tpl, tomorrow_date, d_name, v_number)
+                            created.append(f"{tpl['template_name']} → {new_short_id}")
+                        except Exception as e:
+                            failed.append(f"{tpl['template_name']} ({e})")
+                if created:
+                    st.success("✅ Created:\n\n" + "\n".join(f"- {c}" for c in created))
+                if failed:
+                    st.error("⚠️ Skipped:\n\n" + "\n".join(f"- {f}" for f in failed))
+                if created:
+                    st.balloons()
+                    st.rerun()
+            if not bulk_ready:
+                st.caption("⚠️ Add at least one Driver and Vehicle before using the bulk button above.")
+
+            st.markdown("---")
+            st.caption("Or submit / adjust one trip at a time:")
+
             for _, tpl in templates_df.iterrows():
                 tpl_id = tpl["id"]
-                with st.expander(f"🚐 {tpl['template_name']}  —  {fmt(tpl.get('destination'))}"):
-                    st.write(f"**Purpose:** {fmt(tpl.get('purpose'))}")
-                    st.write(
-                        f"**Vehicle Type:** {fmt(tpl.get('vehicle_type'))}  |  "
-                        f"**Passengers:** {fmt(tpl.get('passenger_count'))}"
+                default_driver = tpl.get("default_driver_name", "")
+                default_vehicle = tpl.get("default_vehicle_number", "")
+                driver_ok = default_driver in shuttle_driver_options
+                vehicle_ok = default_vehicle in shuttle_vehicle_options
+
+                with st.container():
+                    st.markdown(
+                        f"**🚐 {tpl['template_name']}** — {fmt(tpl.get('destination'))} "
+                        f"@ {fmt_time_12h(tpl.get('default_time'))} "
+                        f"| Driver: {fmt(default_driver, '— none saved —')} "
+                        f"| Vehicle: {fmt(default_vehicle, '— none saved —')}"
                     )
-                    st.write(f"**Default Departure Time:** {fmt_time_12h(tpl.get('default_time'))}")
-
-                    qc1, qc2, qc3 = st.columns(3)
-                    with qc1:
-                        q_date = st.date_input("Trip Date", value=date.today(), key=f"shuttle_date_{tpl_id}")
-                    with qc2:
-                        default_driver = tpl.get("default_driver_name", "")
-                        driver_choices_this = shuttle_driver_options or ["No drivers available"]
-                        q_driver = st.selectbox(
-                            "Driver", driver_choices_this,
-                            index=driver_choices_this.index(default_driver) if default_driver in driver_choices_this else 0,
-                            key=f"shuttle_driver_{tpl_id}", disabled=not shuttle_driver_options,
-                        )
-                    with qc3:
-                        default_vehicle = tpl.get("default_vehicle_number", "")
-                        vehicle_choices_this = shuttle_vehicle_options or ["No vehicles available"]
-                        q_vehicle = st.selectbox(
-                            "Vehicle", vehicle_choices_this,
-                            index=vehicle_choices_this.index(default_vehicle) if default_vehicle in vehicle_choices_this else 0,
-                            key=f"shuttle_vehicle_{tpl_id}", disabled=not shuttle_vehicle_options,
-                        )
-
+                    single_ready = driver_ok and vehicle_ok
                     if st.button(
-                        f"✅ Submit — {tpl['template_name']} for {q_date}",
-                        key=f"shuttle_submit_{tpl_id}", type="primary", use_container_width=True,
+                        f"✅ Submit for Tomorrow ({tomorrow_date.strftime('%d/%m/%y')}, {fmt_time_12h(tpl.get('default_time'))})",
+                        key=f"shuttle_submit_tomorrow_{tpl_id}", type="primary",
+                        use_container_width=True, disabled=not single_ready,
                     ):
-                        if not shuttle_driver_options or not shuttle_vehicle_options:
-                            st.error("Please add at least one Driver and Vehicle first.")
-                        else:
-                            request_id = generate_request_id()
-                            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            default_time_val = fmt(tpl.get("default_time"), "08:00")
-                            data = {
-                                "request_id": request_id,
-                                "username": "",
-                                "applicant_name": fmt(tpl.get("applicant_name"), tpl["template_name"]),
-                                "department": fmt(tpl.get("department"), "Admin"),
-                                "mobile_number": "",
-                                "date_of_travel": str(q_date),
-                                "time_of_travel": default_time_val,
-                                "destination": fmt(tpl.get("destination"), ""),
-                                "passenger_count": int(tpl.get("passenger_count") or 1),
-                                "vehicle_type": fmt(tpl.get("vehicle_type"), "HIACE"),
-                                "purpose": fmt(tpl.get("purpose"), tpl["template_name"]),
-                                "special_request": "",
-                                "status": "Approved",
-                                "driver_name": q_driver,
-                                "driver_contact": shuttle_driver_contact_map.get(q_driver, ""),
-                                "vehicle_number": q_vehicle,
-                                "approved_by": user["full_name"],
-                                "action_timestamp": now_str,
-                                "approved_time": default_time_val,
-                                "admin_note": f"Auto-submitted from shuttle template: {tpl['template_name']}",
-                            }
-                            with st.spinner("Saving to Supabase..."):
-                                try:
-                                    new_id = insert_requisition(data)
-                                    st.success(
-                                        f"✅ **{tpl['template_name']}** requisition **{short_req_id(new_id)}** "
-                                        f"created for {q_date} — Driver **{q_driver}**, Vehicle **{q_vehicle}**."
-                                    )
-                                    st.rerun()
-                                except Exception as e:
-                                    st.error(f"❌ Failed to save requisition: {e}")
+                        with st.spinner("Saving to Supabase..."):
+                            try:
+                                new_short_id = _submit_shuttle_trip(tpl, tomorrow_date, default_driver, default_vehicle)
+                                st.success(
+                                    f"✅ **{tpl['template_name']}** requisition **{new_short_id}** "
+                                    f"created for {tomorrow_date.strftime('%d/%m/%y')} — "
+                                    f"Driver **{default_driver}**, Vehicle **{default_vehicle}**."
+                                )
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"❌ Failed to save requisition: {e}")
+                    if not single_ready:
+                        st.caption(
+                            "⚠️ This template has no valid saved default Driver/Vehicle — "
+                            "edit it below under 'Manage Templates' first, or use the manual form below."
+                        )
+
+                    with st.expander("✏️ Change date / driver / vehicle for this one time"):
+                        st.write(f"**Purpose:** {fmt(tpl.get('purpose'))}")
+                        st.write(
+                            f"**Vehicle Type:** {fmt(tpl.get('vehicle_type'))}  |  "
+                            f"**Passengers:** {fmt(tpl.get('passenger_count'))}"
+                        )
+
+                        qc1, qc2, qc3 = st.columns(3)
+                        with qc1:
+                            q_date = st.date_input("Trip Date", value=tomorrow_date, key=f"shuttle_date_{tpl_id}")
+                        with qc2:
+                            driver_choices_this = shuttle_driver_options or ["No drivers available"]
+                            q_driver = st.selectbox(
+                                "Driver", driver_choices_this,
+                                index=driver_choices_this.index(default_driver) if default_driver in driver_choices_this else 0,
+                                key=f"shuttle_driver_{tpl_id}", disabled=not shuttle_driver_options,
+                            )
+                        with qc3:
+                            vehicle_choices_this = shuttle_vehicle_options or ["No vehicles available"]
+                            q_vehicle = st.selectbox(
+                                "Vehicle", vehicle_choices_this,
+                                index=vehicle_choices_this.index(default_vehicle) if default_vehicle in vehicle_choices_this else 0,
+                                key=f"shuttle_vehicle_{tpl_id}", disabled=not shuttle_vehicle_options,
+                            )
+
+                        if st.button(
+                            f"✅ Submit — {tpl['template_name']} for {q_date}",
+                            key=f"shuttle_submit_{tpl_id}", use_container_width=True,
+                        ):
+                            if not shuttle_driver_options or not shuttle_vehicle_options:
+                                st.error("Please add at least one Driver and Vehicle first.")
+                            else:
+                                with st.spinner("Saving to Supabase..."):
+                                    try:
+                                        new_short_id = _submit_shuttle_trip(tpl, q_date, q_driver, q_vehicle)
+                                        st.success(
+                                            f"✅ **{tpl['template_name']}** requisition **{new_short_id}** "
+                                            f"created for {q_date} — Driver **{q_driver}**, Vehicle **{q_vehicle}**."
+                                        )
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"❌ Failed to save requisition: {e}")
+                    st.markdown("---")
 
         st.markdown("---")
         st.markdown("##### ⚙️ Manage Templates")
