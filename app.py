@@ -69,6 +69,10 @@ def insert_requisition(data: dict):
     res = sb.table(REQUISITIONS_TABLE).insert(data).execute()
     new_id = res.data[0].get("id") if res.data else None
 
+    # Invalidate cached reads so every list/dashboard reflects this insert
+    # on the very next rerun instead of waiting out the cache TTL.
+    _clear_requisition_caches()
+
     # English Telegram Alert for New Requisition
     applicant = data.get("applicant_name", "N/A")
     dept = data.get("department", "N/A")
@@ -98,8 +102,8 @@ def update_requisition(request_id: str, updates: dict, notify: bool = True):
 
     `notify` controls whether this call fires the Telegram "Status Updated"
     alert (default True, unchanged from before). Set notify=False for
-    updates that should stay silent — currently used by the Security
-    Officer's Gate Out / Gate In panel, since KM entries there are meant to
+    updates that should stay silent — currently used by the Gate Officer's
+    Gate Out / Gate In panel, since KM entries there are meant to
     be quiet record-keeping (Admin can always pull a report/export), while
     the Driver's own Start/End KM entries (via submit_driver_km) and Admin's
     Approve/Reject actions keep sending the alert as before.
@@ -126,6 +130,12 @@ def update_requisition(request_id: str, updates: dict, notify: bool = True):
             pass  # Alert enrichment is best-effort; the update itself must still proceed.
 
     sb.table(REQUISITIONS_TABLE).update(updates).eq("request_id", request_id).execute()
+
+    # Invalidate cached reads immediately after every write, regardless of
+    # `notify`, so status changes (approve/reject, gate in/out, driver KM
+    # entry, admin edits) show up on the very next rerun instead of waiting
+    # out the cache TTL.
+    _clear_requisition_caches()
 
     if not notify:
         return
@@ -185,10 +195,10 @@ DEPARTMENTS = [
 
 # Account status (users table) — approval workflow for logins
 USER_STATUS_OPTIONS = ["Pending", "Approved", "Rejected"]
-ROLE_OPTIONS = ["user", "security_officer", "driver", "admin", "executive", "nurse"]
+ROLE_OPTIONS = ["user", "gate_officer", "driver", "admin", "executive", "nurse"]
 ROLE_DISPLAY = {
     "user": "Employee",
-    "security_officer": "Security Officer",
+    "gate_officer": "Gate Officer",
     "driver": "Driver",
     "admin": "Admin",
     "executive": "Executive / Management",
@@ -359,6 +369,38 @@ def check_tables_ready() -> tuple[bool, str]:
         return False, str(e)
 
 
+# ---------------------- CACHE INVALIDATION HELPERS ----------------------
+# All read helpers below are wrapped in @st.cache_data so the app doesn't
+# hit Supabase on every single rerun (auto-refresh tick, button click,
+# widget change, etc.) — this is what makes the app feel fast/"patla".
+# Every write helper (insert/update/delete) calls the matching `_clear_*`
+# function immediately after its Supabase call succeeds, so nobody ever
+# sees stale data — they just don't pay a network round-trip for reads
+# that haven't changed since the last fetch.
+def _clear_user_caches():
+    fetch_all_users.clear()
+
+
+def _clear_requisition_caches():
+    fetch_all_requisitions.clear()
+    fetch_requisitions_by_user.clear()
+    fetch_requisitions_by_status.clear()
+    fetch_requisitions_by_driver.clear()
+    get_last_driver_end_km.clear()
+
+
+def _clear_driver_caches():
+    fetch_all_drivers.clear()
+
+
+def _clear_vehicle_caches():
+    fetch_all_vehicles.clear()
+
+
+def _clear_shuttle_template_caches():
+    fetch_all_shuttle_templates.clear()
+
+
 # ---------------------- USERS TABLE HELPERS ----------------------
 def get_user_by_username(username: str):
     sb = get_supabase_client()
@@ -369,19 +411,23 @@ def get_user_by_username(username: str):
 def register_user(data: dict):
     sb = get_supabase_client()
     sb.table(USERS_TABLE).insert(data).execute()
+    _clear_user_caches()
 
 
 def update_user(username: str, updates: dict):
     sb = get_supabase_client()
     sb.table(USERS_TABLE).update(updates).eq("username", username).execute()
+    _clear_user_caches()
 
 
 def delete_user(username: str):
     """Permanently remove a user account (e.g. after they leave the company)."""
     sb = get_supabase_client()
     sb.table(USERS_TABLE).delete().eq("username", username).execute()
+    _clear_user_caches()
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def fetch_all_users() -> pd.DataFrame:
     sb = get_supabase_client()
     res = sb.table(USERS_TABLE).select("*").order("created_at", desc=True).execute()
@@ -414,8 +460,10 @@ def delete_requisition(request_id: str):
     rows; use status changes for that instead."""
     sb = get_supabase_client()
     sb.table(REQUISITIONS_TABLE).delete().eq("request_id", request_id).execute()
+    _clear_requisition_caches()
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def fetch_all_requisitions() -> pd.DataFrame:
     sb = get_supabase_client()
     res = sb.table(REQUISITIONS_TABLE).select("*").order("created_at", desc=True).execute()
@@ -428,6 +476,7 @@ def fetch_all_requisitions() -> pd.DataFrame:
     ])
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def fetch_requisitions_by_user(username: str) -> pd.DataFrame:
     """Server-side filtered fetch — strict data isolation: only this user's rows are ever requested."""
     sb = get_supabase_client()
@@ -447,8 +496,9 @@ def fetch_requisitions_by_user(username: str) -> pd.DataFrame:
     ])
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def fetch_requisitions_by_status(status: str) -> pd.DataFrame:
-    """Server-side filtered fetch used by the Security Officer panel — only pulls
+    """Server-side filtered fetch used by the Gate Officer panel — only pulls
     requisitions in the given trip-status (e.g. 'Approved' or 'On Trip'), so
     Pending/Rejected requests are never even requested, let alone shown."""
     sb = get_supabase_client()
@@ -470,9 +520,9 @@ def fetch_requisitions_by_status(status: str) -> pd.DataFrame:
 
 # ------------------- DRIVER-SUBMITTED KM HELPERS (NEW) -------------------
 # Additive helpers backing the Driver Dashboard (role branch, Section 9B) and
-# the Admin's KM Variance Report (Tab 8). These never touch Security's
-# start_km / end_km / total_km fields — they read/write the separate
-# driver_start_km / driver_end_km / driver_km_updated_at columns only.
+# the Admin's KM Variance Report (Tab 8). These never touch the Gate
+# Officer's start_km / end_km / total_km fields — they read/write the
+# separate driver_start_km / driver_end_km / driver_km_updated_at columns only.
 def _normalize_driver_name(name) -> str:
     """Case-insensitive, whitespace-collapsed key for matching a Driver's own
     registered full_name against the Admin-assigned requisitions.driver_name.
@@ -489,6 +539,7 @@ def _normalize_driver_name(name) -> str:
     return "".join(str(name).casefold().split())
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def fetch_requisitions_by_driver(driver_name: str) -> pd.DataFrame:
     """All trips assigned to this driver, matched case-insensitively and
     ignoring leading/trailing whitespace (see _normalize_driver_name) —
@@ -519,6 +570,7 @@ def fetch_requisitions_by_driver(driver_name: str) -> pd.DataFrame:
     return matched.reset_index(drop=True)
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def get_last_driver_end_km(driver_name: str, vehicle_number: str) -> float:
     """The driver's own most recent End KM for this specific vehicle — used
     to auto-fill their next Start KM (still fully editable). Returns 0.0 if
@@ -552,30 +604,31 @@ def get_last_driver_end_km(driver_name: str, vehicle_number: str) -> float:
 def submit_driver_km(row: dict, driver_start_km=None, driver_end_km=None):
     """Saves the driver's own odometer entry AND drives the trip's lifecycle
     status — per business requirement, the Driver's KM entries are now what
-    move a trip forward, not just Security's Gate panel:
+    move a trip forward, not just the Gate Officer's Gate panel:
       - Start KM only  -> status Approved -> On Trip. actual_exit_time is
-        stamped now (only if Security hasn't already logged one).
+        stamped now (only if the Gate Officer hasn't already logged one).
       - End KM present -> status -> Completed. actual_return_time is stamped
-        now (only if Security hasn't already logged one), and total_km is
-        filled from the driver's own distance if Security hasn't recorded
-        one.
+        now (only if the Gate Officer hasn't already logged one), and
+        total_km is filled from the driver's own distance if the Gate
+        Officer hasn't recorded one.
     This reuses update_requisition() (rather than a raw Supabase call) so the
     Telegram alert keeps the EXACT same "📢 Requisition Status Updated!"
-    format that Security's Gate Out/Gate In has always used — only the
-    trigger has moved, from Security's entry to the Driver's own entry.
+    format that the Gate Officer's Gate Out/Gate In has always used — only
+    the trigger has moved, from the Gate Officer's entry to the Driver's own
+    entry.
     `row` is the full existing requisition dict (from
     fetch_requisitions_by_driver), used only so we never clobber a timestamp
-    or total Security has already logged — Security's own start_km/end_km
-    columns are never written here, and Security can still Gate Out/Gate In
-    independently at any time for cross-verification (see the KM Variance
-    Report tab)."""
+    or total the Gate Officer has already logged — the Gate Officer's own
+    start_km/end_km columns are never written here, and the Gate Officer can
+    still Gate Out/Gate In independently at any time for cross-verification
+    (see the KM Variance Report tab)."""
     request_id = row["request_id"]
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     updates = {
         "driver_km_updated_at": now_str,
         # Re-affirm these (unchanged) values so update_requisition()'s
         # Telegram alert includes the Driver/Vehicle lines exactly like it
-        # always has for Security-triggered updates.
+        # always has for Gate-Officer-triggered updates.
         "driver_name": row.get("driver_name", ""),
         "vehicle_number": row.get("vehicle_number", ""),
     }
@@ -601,9 +654,10 @@ def submit_driver_km(row: dict, driver_start_km=None, driver_end_km=None):
 def effective_km_fields(row) -> tuple:
     """(start_km, end_km, total_km) using the Driver's own odometer entries
     as the PRIMARY source of truth for standard distance reports and duty
-    tracking, falling back to Security's Gate-Out/Gate-In readings only when
-    the driver hasn't logged their own numbers for that trip yet. Security's
-    start_km/end_km columns are never modified by this — read-only helper."""
+    tracking, falling back to the Gate Officer's Gate-Out/Gate-In readings
+    only when the driver hasn't logged their own numbers for that trip yet.
+    The Gate Officer's start_km/end_km columns are never modified by this —
+    read-only helper."""
     d_start, d_end = row.get("driver_start_km"), row.get("driver_end_km")
     if not is_blank(d_start) and not is_blank(d_end):
         s, e = float(d_start), float(d_end)
@@ -618,7 +672,7 @@ def effective_km_fields(row) -> tuple:
 def compute_duty_hours(row) -> float:
     """How long a vehicle was actually out for a given trip, in hours.
 
-    Uses the same Security-logged Gate-Out/Gate-In timestamps
+    Uses the same Gate-Officer-logged Gate-Out/Gate-In timestamps
     (actual_exit_time / actual_return_time) as the Duty Tracker tab, so the
     numbers here always agree with that tab. A trip that hasn't Gated Out
     yet contributes 0 hours; a trip that's still 'On Trip' (Gated Out but
@@ -648,6 +702,7 @@ def compute_duty_hours(row) -> float:
 # ------------------- DRIVERS & VEHICLES TABLE HELPERS -------------------
 # These back the dynamic dropdowns in the requisition-approval form so admins
 # maintain one source of truth instead of retyping names/numbers each time.
+@st.cache_data(ttl=20, show_spinner=False)
 def fetch_all_drivers() -> pd.DataFrame:
     sb = get_supabase_client()
     res = sb.table(DRIVERS_TABLE).select("*").order("driver_name").execute()
@@ -657,13 +712,16 @@ def fetch_all_drivers() -> pd.DataFrame:
 def add_driver(driver_name: str, driver_contact: str):
     sb = get_supabase_client()
     sb.table(DRIVERS_TABLE).insert({"driver_name": driver_name, "driver_contact": driver_contact}).execute()
+    _clear_driver_caches()
 
 
 def delete_driver(driver_id):
     sb = get_supabase_client()
     sb.table(DRIVERS_TABLE).delete().eq("id", driver_id).execute()
+    _clear_driver_caches()
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def fetch_all_vehicles() -> pd.DataFrame:
     sb = get_supabase_client()
     res = sb.table(VEHICLES_TABLE).select("*").order("vehicle_number").execute()
@@ -673,11 +731,13 @@ def fetch_all_vehicles() -> pd.DataFrame:
 def add_vehicle(vehicle_number: str):
     sb = get_supabase_client()
     sb.table(VEHICLES_TABLE).insert({"vehicle_number": vehicle_number}).execute()
+    _clear_vehicle_caches()
 
 
 def delete_vehicle(vehicle_id):
     sb = get_supabase_client()
     sb.table(VEHICLES_TABLE).delete().eq("id", vehicle_id).execute()
+    _clear_vehicle_caches()
 
 
 # ------------------- SHUTTLE TEMPLATE HELPERS (NEW) -------------------
@@ -687,6 +747,7 @@ def delete_vehicle(vehicle_id):
 # template, then quick-submits today's trip in a couple of clicks instead
 # of retyping everything every day. Independent of drivers/vehicles/
 # requisitions tables — never modifies them.
+@st.cache_data(ttl=20, show_spinner=False)
 def fetch_all_shuttle_templates() -> pd.DataFrame:
     sb = get_supabase_client()
     res = sb.table(SHUTTLE_TEMPLATES_TABLE).select("*").order("template_name").execute()
@@ -700,11 +761,13 @@ def fetch_all_shuttle_templates() -> pd.DataFrame:
 def add_shuttle_template(data: dict):
     sb = get_supabase_client()
     sb.table(SHUTTLE_TEMPLATES_TABLE).insert(data).execute()
+    _clear_shuttle_template_caches()
 
 
 def delete_shuttle_template(template_id):
     sb = get_supabase_client()
     sb.table(SHUTTLE_TEMPLATES_TABLE).delete().eq("id", template_id).execute()
+    _clear_shuttle_template_caches()
 
 
 # ------------------- SESSION (REMEMBER ME) HELPERS -------------------
@@ -879,11 +942,11 @@ def login_view():
                     st.rerun()
 
         with tab_register:
-            st.caption("New employees, Security Officers, Drivers, or Medical staff can request an "
+            st.caption("New employees, Gate Officers, Drivers, or Medical staff can request an "
                        "account here. An admin must approve your account before you can log in.")
 
             reg_role = st.radio(
-                "Register as", ["Employee", "Security Officer", "Driver", "Nurse / Senior Nurse"],
+                "Register as", ["Employee", "Gate Officer", "Driver", "Nurse / Senior Nurse"],
                 horizontal=True, key="reg_role_choice",
             )
             st.markdown("---")
@@ -932,9 +995,9 @@ def login_view():
                             f"**Employee ID ({employee_id.strip()})**. Please wait for admin approval before signing in."
                         )
 
-            elif reg_role == "Security Officer":
+            elif reg_role == "Gate Officer":
                 st.caption("Choose your own username and password below, just like a regular account.")
-                with st.form("register_security_form", clear_on_submit=True):
+                with st.form("register_gate_form", clear_on_submit=True):
                     sec_full_name = st.text_input("Full Name *", key="sec_full_name")
                     sec_username = st.text_input("Username *", key="sec_username")
                     sec_password = st.text_input("Password *", type="password", key="sec_password")
@@ -964,15 +1027,15 @@ def login_view():
                             "username": sec_username.strip(),
                             "password": hash_password(sec_password),
                             "full_name": sec_full_name.strip(),
-                            "designation": "Security Officer",
+                            "designation": "Gate Officer",
                             "employee_id": "",
-                            "department": "Security",
+                            "department": "Gate",
                             "mobile": "",
-                            "role": "security_officer",
+                            "role": "gate_officer",
                             "status": "Pending",
                         })
                         st.success(
-                            "✅ Your Security Officer account request has been submitted! "
+                            "✅ Your Gate Officer account request has been submitted! "
                             "Please wait for admin approval before signing in."
                         )
 
@@ -1829,7 +1892,7 @@ st.sidebar.markdown("---")
 st.sidebar.markdown(f"**{user['full_name']}**")
 st.sidebar.caption(f"Role: {ROLE_DISPLAY.get(user['role'], user['role'].capitalize())}")
 
-auto_refresh_on = st.sidebar.checkbox("🔄 Auto-refresh every 10s", value=True,
+auto_refresh_on = st.sidebar.checkbox("🔄 Auto-refresh every 20s", value=True,
                                        help="Automatically reloads live data across the app. "
                                             "Turn off temporarily if you're filling out a long form.")
 if st.sidebar.button("🔄 Refresh Now", use_container_width=True):
@@ -1837,8 +1900,16 @@ if st.sidebar.button("🔄 Refresh Now", use_container_width=True):
 st.sidebar.markdown("---")
 logout_button()
 
-if auto_refresh_on:
-    st_autorefresh(interval=10_000, key="global_autorefresh")
+# Auto-refresh is skipped only for the Gate Officer role, since that
+# dashboard is spent almost entirely typing Gate In/Out odometer entries —
+# a background rerun mid-typing was causing focus loss / lost keystrokes
+# there. Drivers now get the live 20s refresh like everyone else. Everyone
+# can still hit "🔄 Refresh Now" above for an on-demand update, and every
+# write already clears the relevant cache so approvals/gate actions show up
+# instantly for everyone regardless of this setting.
+NO_AUTOREFRESH_ROLES = {"gate_officer"}
+if auto_refresh_on and user["role"] not in NO_AUTOREFRESH_ROLES:
+    st_autorefresh(interval=20_000, key="global_autorefresh")
 
 # =========================================================
 # 8. EMPLOYEE DASHBOARD
@@ -1973,11 +2044,11 @@ if user["role"] == "user":
                                 st.caption(f"📝 Reason: {r['admin_note']}")
 
 # =========================================================
-# 9. SECURITY OFFICER DASHBOARD — Vehicle Gate In / Gate Out Panel
+# 9. GATE OFFICER DASHBOARD — Vehicle Gate In / Gate Out Panel
 # =========================================================
-elif user["role"] == "security_officer":
-    company_header("🛡️ Security Officer Dashboard — Vehicle Gate Panel")
-    st.caption(f"Logged in as {user['full_name']} — Security Officer")
+elif user["role"] == "gate_officer":
+    company_header("🛡️ Gate Officer Dashboard — Vehicle Gate Panel")
+    st.caption(f"Logged in as {user['full_name']} — Gate Officer")
 
     tab_out, tab_in = st.tabs(["🚦 Ready to Depart (Approved Trips)", "🔁 Currently On Trip (Inbound Vehicles)"])
 
@@ -2071,12 +2142,12 @@ elif user["role"] == "security_officer":
 # =========================================================
 # 9B. DRIVER DASHBOARD — My Assigned Trips & Odometer Entry (NEW)
 # =========================================================
-# Mirrors the Security Officer panel's two-tab design exactly: a "Start
-# Trip" tab (like Security's Gate Out) that only takes Start KM, and a
-# separate "End Trip" tab (like Security's Gate In) that only takes End KM
-# once the driver is back — instead of one combined form. Submitting Start
-# KM alone moves the trip Approved -> On Trip; submitting End KM later moves
-# it -> Completed (see submit_driver_km()).
+# Mirrors the Gate Officer panel's two-tab design exactly: a "Start
+# Trip" tab (like the Gate Officer's Gate Out) that only takes Start KM, and
+# a separate "End Trip" tab (like the Gate Officer's Gate In) that only
+# takes End KM once the driver is back — instead of one combined form.
+# Submitting Start KM alone moves the trip Approved -> On Trip; submitting
+# End KM later moves it -> Completed (see submit_driver_km()).
 elif user["role"] == "driver":
     company_header("🚙 Driver Dashboard — My Assigned Trips")
     st.caption(f"Logged in as {user['full_name']} — Driver")
@@ -2149,11 +2220,11 @@ elif user["role"] == "driver":
         def _needs_end(row):
             if row.get("status") == "On Trip":
                 return True
-            # Also surface trips Security already marked Completed via their
-            # own Gate-In, as long as the driver hasn't logged their own End
-            # KM yet — so a fast Security entry never locks the driver out
-            # of finishing their own log (needed for the KM Variance Report
-            # to have both sides).
+            # Also surface trips already marked Completed via the Gate
+            # Officer's own Gate-In, as long as the driver hasn't logged
+            # their own End KM yet — so a fast Gate-Officer entry never
+            # locks the driver out of finishing their own log (needed for
+            # the KM Variance Report to have both sides).
             if row.get("status") == "Completed" and is_blank(row.get("driver_end_km")):
                 return True
             return False
@@ -2216,9 +2287,9 @@ elif user["role"] == "driver":
 # requisition (today's date/time, "Hospital / Emergency" destination,
 # "Ambulance" vehicle type, 1 passenger) and fires an extra high-visibility
 # Telegram alert on top of the normal "New Requisition" one, so Admin/
-# Security notice it immediately. It reuses insert_requisition() (not a raw
-# Supabase call) so it still shows up in Admin's Pending Requests queue for
-# driver/vehicle assignment exactly like any other request.
+# the Gate Officer notice it immediately. It reuses insert_requisition()
+# (not a raw Supabase call) so it still shows up in Admin's Pending Requests
+# queue for driver/vehicle assignment exactly like any other request.
 elif user["role"] == "nurse":
     company_header("🚨 Medical Emergency Vehicle Request")
     st.caption(f"Logged in as {user['full_name']} — {user.get('designation') or 'Nurse'}")
@@ -2231,8 +2302,8 @@ elif user["role"] == "nurse":
         st.markdown("### 🚑 Need a vehicle right now to carry a patient?")
         st.write(
             "Tap the button below to submit an emergency vehicle request immediately — "
-            "no form to fill in. Admin and Security are notified right away to arrange a "
-            "driver and vehicle."
+            "no form to fill in. Admin and the Gate Officer are notified right away to arrange "
+            "a driver and vehicle."
         )
         if st.button("🚨 EMERGENCY — Request Vehicle for Patient Carry", type="primary",
                       use_container_width=True):
@@ -2274,7 +2345,7 @@ elif user["role"] == "nurse":
                     )
                     st.success(
                         f"✅ Emergency request **{short_req_id(new_id)}** sent! "
-                        "Admin/Security have been alerted."
+                        "Admin/Gate Officer have been alerted."
                     )
                     st.balloons()
                 except Exception as e:
@@ -2861,14 +2932,14 @@ elif user["role"] == "admin":
         else:
             for _, u in pending_users.iterrows():
                 role_req = u.get("role")
-                if role_req == "security_officer":
-                    role_tag = "🛡️ Security Officer"
+                if role_req == "gate_officer":
+                    role_tag = "🛡️ Gate Officer"
                 elif role_req == "driver":
                     role_tag = "🚙 Driver"
                 else:
                     role_tag = "👤 Employee"
                 with st.expander(f"{role_tag} — {u['full_name']} (@{u['username']})"):
-                    if role_req in ("security_officer", "driver"):
+                    if role_req in ("gate_officer", "driver"):
                         st.write(f"**Role Requested:** {ROLE_DISPLAY.get(role_req, role_req)}")
                     else:
                         st.write(f"**Designation:** {u.get('designation', '')}")
@@ -2918,10 +2989,11 @@ elif user["role"] == "admin":
                 fig2.update_layout(height=380)
                 st.plotly_chart(fig2, use_container_width=True, key="analytics_status_pie")
 
-            # Driver-verified KM (falls back to Security's Gate-In/Out
-            # readings only when a driver hasn't logged their own numbers)
-            # is now the primary source for this metric, per business
-            # requirement — the metric itself is unchanged, only its source.
+            # Driver-verified KM (falls back to the Gate Officer's
+            # Gate-In/Out readings only when a driver hasn't logged their
+            # own numbers) is now the primary source for this metric, per
+            # business requirement — the metric itself is unchanged, only
+            # its source.
             completed_trips = df_all[df_all["status"] == "Completed"].copy()
             if not completed_trips.empty:
                 completed_trips["_eff_km"] = completed_trips.apply(
@@ -3103,7 +3175,7 @@ elif user["role"] == "admin":
                 )
                 k1, k2 = st.columns(2)
                 with k1:
-                    st.markdown("**Security's Gate readings**")
+                    st.markdown("**Gate Officer's readings**")
                     sk_blank = st.checkbox("Start KM — leave blank", value=is_blank(row.get("start_km")),
                                             key="et_sk_blank")
                     et_start_km = st.number_input(
@@ -3164,7 +3236,7 @@ elif user["role"] == "admin":
                     "driver_end_km": None if dek_blank else float(et_driver_end_km),
                     "admin_note": et_admin_note.strip(),
                 }
-                # Recompute total_km using the same driver-first-then-security
+                # Recompute total_km using the same driver-first-then-gate-officer
                 # priority as effective_km_fields() everywhere else in the app,
                 # so a manual correction here stays consistent with every
                 # report/dashboard that reads total_km.
@@ -3348,12 +3420,12 @@ elif user["role"] == "admin":
                 duty_df_raw.get("actual_return_time"), errors="coerce", utc=True, format="mixed"
             ).astype("datetime64[ns, UTC]")
 
-            # A trip only has meaningful "duty duration" once Security has
-            # logged a Gate Out (actual_exit_time). If Gate In hasn't
-            # happened yet (still "On Trip"), treat "now" (in UTC, to match
-            # the column's dtype) as the running end time so in-progress
-            # duty shows up too. Assigning a naive Timestamp into a UTC-aware
-            # column is exactly what triggers the
+            # A trip only has meaningful "duty duration" once the Gate
+            # Officer has logged a Gate Out (actual_exit_time). If Gate In
+            # hasn't happened yet (still "On Trip"), treat "now" (in UTC, to
+            # match the column's dtype) as the running end time so
+            # in-progress duty shows up too. Assigning a naive Timestamp
+            # into a UTC-aware column is exactly what triggers the
             # "Invalid value ... for dtype 'datetime64[us, UTC]'" TypeError,
             # so we must assign an equally tz-aware Timestamp here.
             still_out_mask = duty_df_raw["_start_dt"].notna() & duty_df_raw["_end_dt"].isna()
@@ -3428,8 +3500,8 @@ elif user["role"] == "admin":
             # -------------------------------------------------------------
             # STEP 4 — Derived fields: duty duration in hours, total KM.
             # Total KM now comes from effective_km_fields(), which prefers
-            # the Driver's own logged Start/End KM and falls back to
-            # Security's Gate-Out/Gate-In readings only when the driver
+            # the Driver's own logged Start/End KM and falls back to the
+            # Gate Officer's Gate-Out/Gate-In readings only when the driver
             # hasn't submitted their own numbers yet (business requirement:
             # Driver KM is the primary baseline metric for duty tracking).
             # -------------------------------------------------------------
@@ -3540,11 +3612,11 @@ elif user["role"] == "admin":
 
     # ---------------- KM Variance Report (NEW) ----------------
     with tab_variance:
-        st.subheader("📈 KM Variance Report — Driver vs Security Readings")
+        st.subheader("📈 KM Variance Report — Driver vs Gate Officer Readings")
         st.caption(
             "Compares the Driver's self-logged odometer readings against the "
-            "Security Officer's Gate-Out/Gate-In readings for the same trip. "
-            "Variance = (Driver End − Driver Start) − (Security End − Security Start)."
+            "Gate Officer's Gate-Out/Gate-In readings for the same trip. "
+            "Variance = (Driver End − Driver Start) − (Gate End − Gate Start)."
         )
 
         if df_all.empty or "driver_start_km" not in df_all.columns:
@@ -3566,7 +3638,7 @@ elif user["role"] == "admin":
                         return None
                     return round(float(row["driver_end_km"]) - float(row["driver_start_km"]), 1)
 
-                def _security_dist(row):
+                def _gate_dist(row):
                     if is_blank(row.get("start_km")) or is_blank(row.get("end_km")):
                         return None
                     return round(float(row["end_km"]) - float(row["start_km"]), 1)
@@ -3574,7 +3646,7 @@ elif user["role"] == "admin":
                 rows = []
                 for _, r in variance_source.iterrows():
                     d_dist = _driver_dist(r)
-                    s_dist = _security_dist(r)
+                    s_dist = _gate_dist(r)
                     variance = round(d_dist - s_dist, 1) if (d_dist is not None and s_dist is not None) else None
                     rows.append({
                         "Trip ID": short_req_id(r.get("id")),
@@ -3582,8 +3654,8 @@ elif user["role"] == "admin":
                         "Driver Name": fmt(r.get("driver_name")),
                         "Driver Start KM": fmt(r.get("driver_start_km")),
                         "Driver End KM": fmt(r.get("driver_end_km")),
-                        "Security Start KM": fmt(r.get("start_km")),
-                        "Security End KM": fmt(r.get("end_km")),
+                        "Gate Start KM": fmt(r.get("start_km")),
+                        "Gate End KM": fmt(r.get("end_km")),
                         "Variance (KM)": variance if variance is not None else "—",
                     })
 
