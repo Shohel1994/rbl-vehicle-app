@@ -1848,11 +1848,26 @@ if "auth_user" not in st.session_state:
     # None — genuinely means "component is ready, browser has no cookie".
     all_cookies = cookie_manager.get_all()
 
-    if all_cookies is None and not st.session_state.get("_cookie_bootstrap_done"):
-        st.session_state["_cookie_bootstrap_done"] = True
-        # Give the cookie component a brief moment to finish loading, then
-        # force exactly one rerun so we re-check with real cookie data.
-        st_autorefresh(interval=300, limit=1, key="cookie_bootstrap_refresh")
+    # A SINGLE 300ms retry isn't always enough — on a slower device/browser
+    # the cookie iframe can take longer than that to finish its first
+    # round-trip, and once the single retry is used up, `all_cookies` is
+    # still None but gets treated as "no cookie" (see `(all_cookies or {})`
+    # below), so the login page flashes on screen before the NEXT page
+    # load/refresh finally picks up the cookie and jumps to the main app.
+    # Retrying up to 6 times (up to ~1.8s total) closes that gap so a
+    # remembered device goes straight to the main dashboard, with only a
+    # brief "Restoring your session..." placeholder instead of the login form.
+    COOKIE_BOOTSTRAP_MAX_RETRIES = 6
+    cookie_retries = st.session_state.get("_cookie_bootstrap_retries", 0)
+
+    if all_cookies is None and cookie_retries < COOKIE_BOOTSTRAP_MAX_RETRIES:
+        st.session_state["_cookie_bootstrap_retries"] = cookie_retries + 1
+        st.info("🔄 Restoring your session...")
+        # A fresh key each retry (rather than one static key) is what makes
+        # this fire again on every subsequent short-lived rerun — reusing
+        # the same key would hit that key's own `limit=1` and stop retrying
+        # after the first attempt.
+        st_autorefresh(interval=300, limit=1, key=f"cookie_bootstrap_refresh_{cookie_retries}")
         st.stop()
 
     restored_user = None
