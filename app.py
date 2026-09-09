@@ -1918,10 +1918,10 @@ logout_button()
 # Auto-refresh is skipped only for the Gate Officer role, since that
 # dashboard is spent almost entirely typing Gate In/Out odometer entries —
 # a background rerun mid-typing was causing focus loss / lost keystrokes
-# there. Drivers now get the live 20s refresh like everyone else. Everyone
-# can still hit "🔄 Refresh Now" above for an on-demand update, and every
-# write already clears the relevant cache so approvals/gate actions show up
-# instantly for everyone regardless of this setting.
+# there. Every other role (including Driver) gets the live 20s refresh.
+# Everyone can still hit "🔄 Refresh Now" above for an on-demand update, and
+# every write already clears the relevant cache so approvals/gate actions
+# show up instantly regardless of this setting.
 NO_AUTOREFRESH_ROLES = {"gate_officer"}
 if auto_refresh_on and user["role"] not in NO_AUTOREFRESH_ROLES:
     st_autorefresh(interval=20_000, key="global_autorefresh")
@@ -2459,6 +2459,96 @@ elif user["role"] == "admin":
                 "⚠️ No drivers and/or vehicles are registered yet. Add them under the "
                 "**🚘 Manage Drivers & Vehicles** tab before you can approve requests."
             )
+
+        # ---------------------------------------------------------------
+        # BULK ASSIGN — approve several Pending requisitions at once with
+        # ONE shared Driver + Vehicle + Departure Time, instead of opening
+        # each one individually. Useful when multiple people are going on
+        # the same shuttle/HIACE run together. This is purely additive: the
+        # per-request Approve/Reject cards below still work exactly as
+        # before for one-at-a-time decisions.
+        # ---------------------------------------------------------------
+        if not pending_df.empty and not drivers_df.empty and not vehicles_df.empty:
+            with st.expander("🚐 Bulk Assign Vehicle & Driver (Multiple Requests at Once)"):
+                st.caption(
+                    "Select two or more Pending requests below, pick ONE Driver, Vehicle, and "
+                    "Departure Time, and approve all of them together in a single click — handy "
+                    "when several people are sharing the same trip."
+                )
+                bulk_option_map = {
+                    f"{short_req_id(r.get('id'))} — {r['applicant_name']} ({r['department']}) → "
+                    f"{r['destination']} @ {fmt_time_12h(r['time_of_travel'])}": r["request_id"]
+                    for _, r in pending_df.iterrows()
+                }
+                bulk_selected_labels = st.multiselect(
+                    "Select Pending Requests to Bulk-Approve", list(bulk_option_map.keys()),
+                    key="bulk_assign_select",
+                )
+
+                bd1, bd2 = st.columns(2)
+                with bd1:
+                    bulk_driver = st.selectbox(
+                        "Driver Name", driver_options or ["No drivers available"],
+                        key="bulk_assign_driver", disabled=not driver_options,
+                    )
+                with bd2:
+                    bulk_contact = driver_contact_map.get(bulk_driver, "")
+                    st.text_input("Driver Contact (auto-filled)", value=bulk_contact, disabled=True,
+                                  key="bulk_assign_driver_contact")
+                bulk_vehicle = st.selectbox(
+                    "Vehicle Number", vehicle_options or ["No vehicles available"],
+                    key="bulk_assign_vehicle", disabled=not vehicle_options,
+                )
+                bulk_time = time_input_12h(
+                    "Approved Departure Time (applied to every selected request)",
+                    key_prefix="bulk_assign_time",
+                )
+                bulk_note = st.text_area(
+                    "Admin Note / Remarks (optional, applied to every selected request)",
+                    key="bulk_assign_note",
+                )
+
+                bulk_ready = (
+                    len(bulk_selected_labels) >= 2
+                    and bulk_driver != "— Select Driver —"
+                    and bulk_vehicle != "— Select Vehicle —"
+                )
+                if st.button(
+                    f"✅ Approve & Assign {len(bulk_selected_labels)} Selected Requests",
+                    type="primary", use_container_width=True, disabled=not bulk_ready,
+                    key="bulk_assign_submit",
+                ):
+                    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    bulk_updates = {
+                        "status": "Approved",
+                        "driver_name": bulk_driver,
+                        "driver_contact": driver_contact_map.get(bulk_driver, ""),
+                        "vehicle_number": bulk_vehicle,
+                        "approved_by": user["full_name"],
+                        "action_timestamp": now_str,
+                        "approved_time": bulk_time.strftime("%H:%M"),
+                        "admin_note": bulk_note.strip(),
+                    }
+                    done, failed = [], []
+                    with st.spinner("Approving selected requests..."):
+                        for label in bulk_selected_labels:
+                            req_id = bulk_option_map[label]
+                            try:
+                                update_requisition(req_id, bulk_updates)
+                                done.append(label)
+                            except Exception as e:
+                                failed.append(f"{label} ({e})")
+                    if done:
+                        st.success(
+                            f"✅ Approved {len(done)} requests with Driver **{bulk_driver}** / "
+                            f"Vehicle **{bulk_vehicle}**."
+                        )
+                    if failed:
+                        st.error("⚠️ Failed:\n\n" + "\n".join(f"- {f}" for f in failed))
+                    if done:
+                        st.rerun()
+                elif not bulk_ready and bulk_selected_labels:
+                    st.caption("⚠️ Select at least 2 requests and choose a Driver and Vehicle to enable bulk approval.")
 
         if pending_df.empty:
             st.success("🎉 No pending requisitions — all caught up!")
@@ -3184,24 +3274,78 @@ elif user["role"] == "admin":
         if df_all.empty:
             st.info("No requisitions yet.")
         else:
-            edit_options = {
-                f"{short_req_id(r.get('id'))} — {r['applicant_name']} → {r['destination']} ({r['status']})": r["request_id"]
-                for _, r in df_all.iterrows()
-            }
-            selected_label = st.selectbox(
-                "Select a requisition to edit", list(edit_options.keys()), key="edit_trip_select"
-            )
-            selected_request_id = edit_options[selected_label]
-            row = df_all[df_all["request_id"] == selected_request_id].iloc[0]
-            selected_short_id = short_req_id(row.get("id"))
-            st.caption(f"Technical ID: `{selected_request_id}`")
-
             edit_drivers_df = fetch_all_drivers()
             edit_vehicles_df = fetch_all_vehicles()
             edit_driver_contact_map = (
                 dict(zip(edit_drivers_df["driver_name"], edit_drivers_df["driver_contact"]))
                 if not edit_drivers_df.empty else {}
             )
+            edit_driver_choices = edit_drivers_df["driver_name"].tolist() if not edit_drivers_df.empty else []
+
+            # ---- STEP 1: pick a Driver first ----
+            # "Approved" trips are shown here as "🟡 Pending / Upcoming" from
+            # the driver's own perspective — assigned to them but not yet
+            # Gated Out. "All / No Driver Assigned" keeps the old behaviour
+            # of browsing every requisition (e.g. still-Pending requests
+            # that haven't been assigned a driver yet, or Rejected ones).
+            driver_filter_choices = ["— All / No Driver Assigned —"] + edit_driver_choices
+            selected_edit_driver = st.selectbox(
+                "1️⃣ Select Driver", driver_filter_choices, key="edit_trip_driver_filter",
+            )
+
+            if selected_edit_driver == "— All / No Driver Assigned —":
+                driver_scoped_df = df_all
+            else:
+                target_key = _normalize_driver_name(selected_edit_driver)
+                driver_scoped_df = df_all[df_all["driver_name"].map(_normalize_driver_name) == target_key]
+
+            if driver_scoped_df.empty:
+                st.warning(
+                    f"No requisitions found for **{selected_edit_driver}** — showing all "
+                    "requisitions instead."
+                )
+                driver_scoped_df = df_all
+
+            # ---- STEP 2: pick a trip category for that driver ----
+            status_groups = {
+                "🟡 Pending / Upcoming (Approved, not yet started)": "Approved",
+                "🔵 On Trip": "On Trip",
+                "✅ Completed": "Completed",
+                "⏳ Still Pending (no driver assigned yet)": "Pending",
+                "🔴 Rejected": "Rejected",
+            }
+            # Only offer categories that actually have at least one matching
+            # row, so the dropdown doesn't show empty groups.
+            available_groups = {
+                label: status_val for label, status_val in status_groups.items()
+                if not driver_scoped_df[driver_scoped_df["status"] == status_val].empty
+            }
+            if not available_groups:
+                st.warning("No categorized trips found for this selection — showing all statuses instead.")
+                available_groups = {
+                    STATUS_BADGE.get(s, s): s
+                    for s in sorted(driver_scoped_df["status"].dropna().unique().tolist())
+                }
+
+            selected_group_label = st.selectbox(
+                "2️⃣ Select Trip Category", list(available_groups.keys()), key="edit_trip_status_filter",
+            )
+            category_df = driver_scoped_df[driver_scoped_df["status"] == available_groups[selected_group_label]]
+
+            # ---- STEP 3: pick the specific requisition to edit ----
+            edit_options = {
+                f"{short_req_id(r.get('id'))} — {r['applicant_name']} → {r['destination']} ({r['date_of_travel']})": r["request_id"]
+                for _, r in category_df.iterrows()
+            }
+            selected_label = st.selectbox(
+                "3️⃣ Select Requisition to Edit", list(edit_options.keys()), key="edit_trip_select"
+            )
+            selected_request_id = edit_options[selected_label]
+            row = df_all[df_all["request_id"] == selected_request_id].iloc[0]
+            selected_short_id = short_req_id(row.get("id"))
+            st.caption(f"Technical ID: `{selected_request_id}`")
+            st.markdown("---")
+
             edit_driver_choices = edit_drivers_df["driver_name"].tolist() if not edit_drivers_df.empty else []
             edit_vehicle_choices = edit_vehicles_df["vehicle_number"].tolist() if not edit_vehicles_df.empty else []
             # Always keep the row's CURRENT driver/vehicle selectable even if
