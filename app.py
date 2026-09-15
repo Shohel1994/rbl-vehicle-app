@@ -770,6 +770,79 @@ def delete_shuttle_template(template_id):
     _clear_shuttle_template_caches()
 
 
+# ------------------- DAILY AUTO-GENERATED SHUTTLE REQUISITIONS (NEW) -------------------
+# Fixed 6-trip daily shuttle schedule. These are created automatically
+# (no button click needed) the first time ANY logged-in user loads the app
+# each day, as Pending requisitions with driver/vehicle left blank — Admin
+# just opens "Pending Requests" and picks Driver + Vehicle like any normal
+# approval (including via the existing Bulk Assign feature). Tagged via
+# admin_note so re-checking never depends on exact row order/count matching
+# (safe even if Admin edits/deletes one of today's six later).
+DAILY_SHUTTLE_TAG = "AUTO-DAILY-SHUTTLE"
+
+DAILY_SHUTTLE_TEMPLATES = [
+    {"destination": "Ishwardi", "time": "19:15", "passenger_count": 8, "purpose": "Staff Drop", "vehicle_type": "HIACE"},
+    {"destination": "Ishwardi", "time": "19:15", "passenger_count": 8, "purpose": "Staff Drop", "vehicle_type": "HIACE"},
+    {"destination": "Ishwardi", "time": "19:15", "passenger_count": 8, "purpose": "Staff Drop", "vehicle_type": "HIACE"},
+    {"destination": "Dashuria", "time": "19:15", "passenger_count": 8, "purpose": "Staff Drop", "vehicle_type": "HIACE"},
+    {"destination": "Ishwardi", "time": "20:15", "passenger_count": 8, "purpose": "Staff Drop", "vehicle_type": "HIACE"},
+    {"destination": "Bepza", "time": "20:15", "passenger_count": 1, "purpose": "Commercial Duty", "vehicle_type": "Private Car"},
+]
+
+
+def ensure_daily_shuttle_requisitions():
+    """Auto-creates today's fixed shuttle requisitions (Pending, no driver/
+    vehicle assigned) if they don't already exist. Runs at most once per
+    browser session per day via session_state (not on every rerun/
+    auto-refresh), and is itself idempotent via the admin_note tag check —
+    so even if two people happen to trigger it around the same time, it
+    won't double-create today's six. Any failure here is logged and
+    swallowed, never shown to the user or allowed to block the rest of the
+    app from loading."""
+    today_str = str(date.today())
+    if st.session_state.get("_daily_shuttle_checked_date") == today_str:
+        return
+    st.session_state["_daily_shuttle_checked_date"] = today_str
+
+    try:
+        sb = get_supabase_client()
+        existing = (
+            sb.table(REQUISITIONS_TABLE)
+            .select("id")
+            .eq("date_of_travel", today_str)
+            .like("admin_note", f"%{DAILY_SHUTTLE_TAG}%")
+            .execute()
+        )
+        already_count = len(existing.data) if existing.data else 0
+        if already_count >= len(DAILY_SHUTTLE_TEMPLATES):
+            return  # today's 6 are already in place
+
+        for tpl in DAILY_SHUTTLE_TEMPLATES[already_count:]:
+            data = {
+                "request_id": generate_request_id(),
+                "username": "",
+                "applicant_name": "Staff Shuttle",
+                "department": "Admin",
+                "mobile_number": "",
+                "date_of_travel": today_str,
+                "time_of_travel": tpl["time"],
+                "destination": tpl["destination"],
+                "passenger_count": tpl["passenger_count"],
+                "vehicle_type": tpl["vehicle_type"],
+                "purpose": tpl["purpose"],
+                "special_request": "",
+                "status": "Pending",
+                "driver_name": "",
+                "driver_contact": "",
+                "vehicle_number": "",
+                "approved_by": "",
+                "admin_note": DAILY_SHUTTLE_TAG,
+            }
+            insert_requisition(data)
+    except Exception as e:
+        print(f"Daily shuttle auto-creation error: {e}")
+
+
 # ------------------- SESSION (REMEMBER ME) HELPERS -------------------
 # A "remember me" cookie stores only an opaque, unguessable token — never the
 # username or password directly — so a leaked/inspected cookie can't be used
@@ -1892,6 +1965,7 @@ if "auth_user" not in st.session_state:
         st.stop()
 
 user = st.session_state.auth_user
+ensure_daily_shuttle_requisitions()  # auto-creates today's 6 fixed shuttle requisitions, once per session/day
 
 # =========================================================
 # 7. SIDEBAR
