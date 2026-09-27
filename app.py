@@ -427,7 +427,7 @@ def delete_user(username: str):
     _clear_user_caches()
 
 
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=90, show_spinner=False)
 def fetch_all_users() -> pd.DataFrame:
     sb = get_supabase_client()
     res = sb.table(USERS_TABLE).select("*").order("created_at", desc=True).execute()
@@ -463,7 +463,7 @@ def delete_requisition(request_id: str):
     _clear_requisition_caches()
 
 
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=90, show_spinner=False)
 def fetch_all_requisitions() -> pd.DataFrame:
     sb = get_supabase_client()
     res = sb.table(REQUISITIONS_TABLE).select("*").order("created_at", desc=True).execute()
@@ -476,7 +476,7 @@ def fetch_all_requisitions() -> pd.DataFrame:
     ])
 
 
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=90, show_spinner=False)
 def fetch_requisitions_by_user(username: str) -> pd.DataFrame:
     """Server-side filtered fetch — strict data isolation: only this user's rows are ever requested."""
     sb = get_supabase_client()
@@ -496,7 +496,7 @@ def fetch_requisitions_by_user(username: str) -> pd.DataFrame:
     ])
 
 
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=90, show_spinner=False)
 def fetch_requisitions_by_status(status: str) -> pd.DataFrame:
     """Server-side filtered fetch used by the Gate Officer panel — only pulls
     requisitions in the given trip-status (e.g. 'Approved' or 'On Trip'), so
@@ -539,7 +539,7 @@ def _normalize_driver_name(name) -> str:
     return "".join(str(name).casefold().split())
 
 
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=90, show_spinner=False)
 def fetch_requisitions_by_driver(driver_name: str) -> pd.DataFrame:
     """All trips assigned to this driver, matched case-insensitively and
     ignoring leading/trailing whitespace (see _normalize_driver_name) —
@@ -570,7 +570,7 @@ def fetch_requisitions_by_driver(driver_name: str) -> pd.DataFrame:
     return matched.reset_index(drop=True)
 
 
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=90, show_spinner=False)
 def get_last_driver_end_km(driver_name: str, vehicle_number: str) -> float:
     """The driver's own most recent End KM for this specific vehicle — used
     to auto-fill their next Start KM (still fully editable). Returns 0.0 if
@@ -632,18 +632,32 @@ def submit_driver_km(row: dict, driver_start_km=None, driver_end_km=None):
         "driver_name": row.get("driver_name", ""),
         "vehicle_number": row.get("vehicle_number", ""),
     }
-    if driver_start_km is not None:
+    # IMPORTANT: `row` typically comes from a pandas DataFrame row (via
+    # .to_dict()), where a missing numeric cell is Python float('nan'),
+    # NOT None. `driver_start_km is not None` is True for NaN, so the old
+    # check let `float(nan)` slip into `updates` — and float('nan') is NOT
+    # valid JSON, so the Supabase client's request body serialization blew
+    # up with "Out of range float values are not JSON compliant: nan" the
+    # moment a driver tried to complete a trip that never had its own
+    # Start KM recorded (e.g. one that Admin/Gate Officer had already
+    # marked Completed directly, bypassing the Driver's Start KM step).
+    # is_blank() correctly treats NaN, None, and "" all as "missing", so
+    # this now safely skips writing a value instead of crashing.
+    has_start = not is_blank(driver_start_km)
+    has_end = not is_blank(driver_end_km)
+
+    if has_start:
         updates["driver_start_km"] = float(driver_start_km)
-    if driver_end_km is not None:
+    if has_end:
         updates["driver_end_km"] = float(driver_end_km)
 
-    if driver_end_km is not None:
+    if has_end:
         updates["status"] = "Completed"
         if is_blank(row.get("actual_return_time")):
             updates["actual_return_time"] = now_str
-        if is_blank(row.get("total_km")) and driver_start_km is not None:
+        if is_blank(row.get("total_km")) and has_start:
             updates["total_km"] = round(float(driver_end_km) - float(driver_start_km), 1)
-    elif driver_start_km is not None and row.get("status") == "Approved":
+    elif has_start and row.get("status") == "Approved":
         updates["status"] = "On Trip"
         if is_blank(row.get("actual_exit_time")):
             updates["actual_exit_time"] = now_str
@@ -702,7 +716,7 @@ def compute_duty_hours(row) -> float:
 # ------------------- DRIVERS & VEHICLES TABLE HELPERS -------------------
 # These back the dynamic dropdowns in the requisition-approval form so admins
 # maintain one source of truth instead of retyping names/numbers each time.
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=90, show_spinner=False)
 def fetch_all_drivers() -> pd.DataFrame:
     sb = get_supabase_client()
     res = sb.table(DRIVERS_TABLE).select("*").order("driver_name").execute()
@@ -721,7 +735,7 @@ def delete_driver(driver_id):
     _clear_driver_caches()
 
 
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=90, show_spinner=False)
 def fetch_all_vehicles() -> pd.DataFrame:
     sb = get_supabase_client()
     res = sb.table(VEHICLES_TABLE).select("*").order("vehicle_number").execute()
@@ -747,7 +761,7 @@ def delete_vehicle(vehicle_id):
 # template, then quick-submits today's trip in a couple of clicks instead
 # of retyping everything every day. Independent of drivers/vehicles/
 # requisitions tables — never modifies them.
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=90, show_spinner=False)
 def fetch_all_shuttle_templates() -> pd.DataFrame:
     sb = get_supabase_client()
     res = sb.table(SHUTTLE_TEMPLATES_TABLE).select("*").order("template_name").execute()
@@ -1983,7 +1997,8 @@ st.sidebar.caption(f"Role: {ROLE_DISPLAY.get(user['role'], user['role'].capitali
 
 auto_refresh_on = st.sidebar.checkbox("🔄 Auto-refresh every 60s", value=True,
                                        help="Automatically reloads live data across the app. "
-                                            "Turn off temporarily if you're filling out a long form.")
+                                            "Turn off temporarily if you're filling out a long form, "
+                                            "or use '🔄 Refresh Now' any time for an on-demand update.")
 if st.sidebar.button("🔄 Refresh Now", use_container_width=True):
     st.rerun()
 st.sidebar.markdown("---")
@@ -1996,13 +2011,14 @@ logout_button()
 # Everyone can still hit "🔄 Refresh Now" above for an on-demand update, and
 # every write already clears the relevant cache so approvals/gate actions
 # show up instantly regardless of this setting.
-# Interval widened from 20s to 60s so the app reruns (and therefore reloads
-# data / re-renders every widget) far less often — this is what was making
-# any typing/click feel like it "hangs" for a moment: a background rerun
-# landing mid-interaction. Every write path still calls its matching
-# _clear_*_caches() immediately, so approvals/gate actions/driver KM entries
-# still show up instantly for the person who made the change; this setting
-# only controls how often *other* idle screens passively refresh.
+# Interval set to 60s, with the checkbox still OFF by default (see above) —
+# so idle screens don't rerun in the background unless someone explicitly
+# turns this on, but when they do, it checks for updates every 60s rather
+# than every 120s.
+# Every write path still calls its matching _clear_*_caches() immediately,
+# so approvals/gate actions/driver KM entries still show up instantly for
+# the person who made the change; this setting only controls how often
+# *other* idle screens passively refresh to see someone else's changes.
 NO_AUTOREFRESH_ROLES = {"gate_officer"}
 if auto_refresh_on and user["role"] not in NO_AUTOREFRESH_ROLES:
     st_autorefresh(interval=60_000, key="global_autorefresh")
@@ -2331,7 +2347,18 @@ elif user["role"] == "driver":
             st.info("No trips are currently waiting for your End KM.")
         else:
             for _, r in end_trips.iterrows():
-                start_km_val = 0.0 if is_blank(r.get("driver_start_km")) else float(r.get("driver_start_km"))
+                # `is_blank()` here (not just checking for None) matters:
+                # a trip that Admin/Gate Officer already marked Completed
+                # directly — without the driver ever logging a Start KM —
+                # has driver_start_km as pandas NaN, not None or 0. Treating
+                # that as "no baseline yet" (has_own_start = False) is what
+                # lets us show a Start KM field below instead of silently
+                # defaulting to 0.0 and later trying to write NaN to
+                # Supabase, which is exactly what caused the
+                # "Out of range float values are not JSON compliant: nan"
+                # crash on trips like this one.
+                has_own_start = not is_blank(r.get("driver_start_km"))
+                start_km_val = float(r.get("driver_start_km")) if has_own_start else 0.0
                 with st.expander(
                     f"🔵 Requisition {short_req_id(r.get('id'))} — {r['destination']}  |  "
                     f"Vehicle: {fmt(r.get('vehicle_number'), 'N/A')}"
@@ -2345,10 +2372,28 @@ elif user["role"] == "driver":
                         st.write(f"**Your Start KM:** {fmt(r.get('driver_start_km'))}")
                         st.write(f"**Trip Started:** {fmt_time_12h(r.get('actual_exit_time'))}")
 
+                    if not has_own_start:
+                        st.warning(
+                            "⚠️ You don't have a Start KM logged for this trip yet (it was likely "
+                            "completed directly by Admin/Gate Officer). Please enter BOTH your "
+                            "Start KM and End KM below so this trip has a proper distance on record."
+                        )
+
                     with st.form(f"driver_end_{r['request_id']}"):
+                        if not has_own_start:
+                            d_start_km = st.number_input(
+                                "Start KM (Odometer Reading) *", min_value=0.0, step=1.0, format="%.1f",
+                                key=f"dend_start_{r['request_id']}",
+                            )
+                        else:
+                            d_start_km = start_km_val
                         d_end_km = st.number_input(
-                            "End KM (Odometer Reading) *", min_value=start_km_val, step=1.0, format="%.1f",
-                            help=f"Must be greater than or equal to your Start KM ({start_km_val:.1f}).",
+                            "End KM (Odometer Reading) *", min_value=0.0, step=1.0, format="%.1f",
+                            help=(
+                                f"Must be greater than or equal to your Start KM ({start_km_val:.1f})."
+                                if has_own_start else
+                                "Must be greater than or equal to the Start KM you enter above."
+                            ),
                             key=f"dend_{r['request_id']}",
                         )
                         return_clicked = st.form_submit_button(
@@ -2356,18 +2401,18 @@ elif user["role"] == "driver":
                         )
 
                     if return_clicked:
-                        if d_end_km < start_km_val:
+                        if d_end_km < d_start_km:
                             st.error("End KM cannot be less than Start KM.")
                         else:
                             try:
                                 submit_driver_km(
                                     r.to_dict(),
-                                    driver_start_km=r.get("driver_start_km"),
+                                    driver_start_km=d_start_km,
                                     driver_end_km=d_end_km,
                                 )
                                 st.success(
                                     f"✅ Trip completed for {r['applicant_name']}. "
-                                    f"Distance: **{d_end_km - start_km_val:.1f} KM**. "
+                                    f"Distance: **{d_end_km - d_start_km:.1f} KM**. "
                                     "A Telegram alert has been sent."
                                 )
                                 st.rerun()
@@ -2634,7 +2679,24 @@ elif user["role"] == "admin":
         if pending_df.empty:
             st.success("🎉 No pending requisitions — all caught up!")
         else:
-            for _, r in pending_df.iterrows():
+            # Rendering each pending request as its own expander + form (with
+            # driver/vehicle selects + text inputs) is the single heaviest
+            # thing this tab does — every one of those widgets gets rebuilt
+            # on every rerun. Capping the list to the most recent 50 keeps
+            # the page fast even when the Pending queue grows into the
+            # hundreds; pending_df is already sorted newest-first (it comes
+            # from df_all, which is ordered by created_at desc), so this
+            # never hides the oldest/most-overdue requests — those surface
+            # first as the newer ones above them get approved/rejected.
+            PENDING_DISPLAY_LIMIT = 50
+            pending_display_df = pending_df.head(PENDING_DISPLAY_LIMIT)
+            if len(pending_df) > PENDING_DISPLAY_LIMIT:
+                st.info(
+                    f"Showing the {PENDING_DISPLAY_LIMIT} most recent of {len(pending_df)} pending "
+                    "requests for speed. Approve/reject these first, or use Bulk Assign above, "
+                    "to bring the rest into view."
+                )
+            for _, r in pending_display_df.iterrows():
                 with st.expander(f"🟡 Requisition {short_req_id(r.get('id'))} — {r['applicant_name']} ({r['department']}) → {r['destination']}"):
                     st.caption(f"Technical ID: `{r['request_id']}`")
                     c1, c2 = st.columns(2)
@@ -3355,6 +3417,99 @@ elif user["role"] == "admin":
         if df_all.empty:
             st.info("No requisitions yet.")
         else:
+            # -----------------------------------------------------------
+            # BULK DELETE (NEW) — for clearing out MANY stuck/duplicate/
+            # test requisitions at once. Deliberately searches driver_name
+            # by free-text PARTIAL match against the raw requisition data,
+            # rather than the "1️⃣ Select Driver" dropdown further below
+            # (which only lists names from the Manage Drivers & Vehicles
+            # master list via exact normalized matching). This matters
+            # because a trip's driver_name is free-typed at the time it
+            # was approved/created — if it was ever typed even slightly
+            # differently from that driver's master-list entry, the
+            # dropdown-based flow below won't find it even though the
+            # trip is still sitting in the database. This search-based
+            # box finds it regardless, so nothing stays permanently
+            # invisible to Admin just because of a spelling mismatch.
+            # -----------------------------------------------------------
+            with st.expander("🧹 Bulk Delete Multiple Trips (search-based, catches name-mismatched trips too)"):
+                st.caption(
+                    "Search by driver name (partial match — this also finds trips whose driver_name "
+                    "was typed slightly differently than in Manage Drivers & Vehicles) and/or filter "
+                    "by status, then select as many as you need and delete them all together. "
+                    "This permanently removes them — it cannot be undone."
+                )
+                bc1, bc2 = st.columns(2)
+                with bc1:
+                    bulk_del_driver_search = st.text_input(
+                        "Driver name contains", key="bulk_del_driver_search",
+                        placeholder="e.g. Manik",
+                    )
+                with bc2:
+                    bulk_del_status_filter = st.multiselect(
+                        "Status (optional)", REQ_STATUS_OPTIONS, key="bulk_del_status_filter",
+                    )
+
+                bulk_del_scope = df_all.copy()
+                if bulk_del_driver_search.strip():
+                    bulk_del_scope = bulk_del_scope[
+                        bulk_del_scope["driver_name"].fillna("").astype(str).str.contains(
+                            bulk_del_driver_search.strip(), case=False, na=False
+                        )
+                    ]
+                if bulk_del_status_filter:
+                    bulk_del_scope = bulk_del_scope[bulk_del_scope["status"].isin(bulk_del_status_filter)]
+
+                if not bulk_del_driver_search.strip() and not bulk_del_status_filter:
+                    st.caption("Type a driver name or pick a status above to see matching trips here.")
+                elif bulk_del_scope.empty:
+                    st.info("No requisitions match this search.")
+                else:
+                    bulk_del_option_map = {
+                        f"{short_req_id(r.get('id'))} — Driver: {fmt(r.get('driver_name'), '(none)')} — "
+                        f"{r['applicant_name']} → {r['destination']} "
+                        f"({r['status']}, {r['date_of_travel']})": r["request_id"]
+                        for _, r in bulk_del_scope.iterrows()
+                    }
+                    st.write(f"**{len(bulk_del_option_map)} matching requisition(s) found.**")
+                    bulk_del_selected = st.multiselect(
+                        "Select requisitions to permanently delete",
+                        list(bulk_del_option_map.keys()),
+                        key="bulk_del_selected",
+                    )
+
+                    if bulk_del_selected:
+                        st.warning(
+                            f"⚠️ You are about to permanently delete **{len(bulk_del_selected)}** "
+                            "requisition(s). This cannot be undone."
+                        )
+                        confirm_bulk_del = st.checkbox(
+                            f"I understand this will permanently delete {len(bulk_del_selected)} requisition(s).",
+                            key="confirm_bulk_del",
+                        )
+                        if st.button(
+                            f"🗑️ Delete {len(bulk_del_selected)} Selected Requisitions",
+                            type="primary", disabled=not confirm_bulk_del,
+                            use_container_width=True, key="bulk_del_submit",
+                        ):
+                            deleted, failed = [], []
+                            with st.spinner("Deleting selected requisitions..."):
+                                for label in bulk_del_selected:
+                                    rid = bulk_del_option_map[label]
+                                    try:
+                                        delete_requisition(rid)
+                                        deleted.append(label)
+                                    except Exception as e:
+                                        failed.append(f"{label} ({e})")
+                            if deleted:
+                                st.success(f"✅ Deleted {len(deleted)} requisition(s).")
+                            if failed:
+                                st.error("⚠️ Failed to delete:\n\n" + "\n".join(f"- {f}" for f in failed))
+                            if deleted:
+                                st.rerun()
+
+            st.markdown("---")
+
             edit_drivers_df = fetch_all_drivers()
             edit_vehicles_df = fetch_all_vehicles()
             edit_driver_contact_map = (
