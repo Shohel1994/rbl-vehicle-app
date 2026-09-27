@@ -786,7 +786,7 @@ DAILY_SHUTTLE_TEMPLATES = [
     {"destination": "Ishwardi", "time": "19:15", "passenger_count": 8, "purpose": "Staff Drop", "vehicle_type": "HIACE"},
     {"destination": "Dashuria", "time": "19:15", "passenger_count": 8, "purpose": "Staff Drop", "vehicle_type": "HIACE"},
     {"destination": "Ishwardi", "time": "20:15", "passenger_count": 8, "purpose": "Staff Drop", "vehicle_type": "HIACE"},
-    {"destination": "Bepza", "time": "20:15", "passenger_count": 1, "purpose": "Commercial Duty", "vehicle_type": "Private Car"},
+    {"destination": "Bepza", "time": "20:15", "passenger_count": 1, "purpose": "Commercial Duty", "vehicle_type": "HIACE"},
 ]
 
 
@@ -1981,7 +1981,7 @@ st.sidebar.markdown("---")
 st.sidebar.markdown(f"**{user['full_name']}**")
 st.sidebar.caption(f"Role: {ROLE_DISPLAY.get(user['role'], user['role'].capitalize())}")
 
-auto_refresh_on = st.sidebar.checkbox("🔄 Auto-refresh every 20s", value=True,
+auto_refresh_on = st.sidebar.checkbox("🔄 Auto-refresh every 60s", value=True,
                                        help="Automatically reloads live data across the app. "
                                             "Turn off temporarily if you're filling out a long form.")
 if st.sidebar.button("🔄 Refresh Now", use_container_width=True):
@@ -1992,13 +1992,20 @@ logout_button()
 # Auto-refresh is skipped only for the Gate Officer role, since that
 # dashboard is spent almost entirely typing Gate In/Out odometer entries —
 # a background rerun mid-typing was causing focus loss / lost keystrokes
-# there. Every other role (including Driver) gets the live 20s refresh.
+# there. Every other role (including Driver) gets the live auto-refresh.
 # Everyone can still hit "🔄 Refresh Now" above for an on-demand update, and
 # every write already clears the relevant cache so approvals/gate actions
 # show up instantly regardless of this setting.
+# Interval widened from 20s to 60s so the app reruns (and therefore reloads
+# data / re-renders every widget) far less often — this is what was making
+# any typing/click feel like it "hangs" for a moment: a background rerun
+# landing mid-interaction. Every write path still calls its matching
+# _clear_*_caches() immediately, so approvals/gate actions/driver KM entries
+# still show up instantly for the person who made the change; this setting
+# only controls how often *other* idle screens passively refresh.
 NO_AUTOREFRESH_ROLES = {"gate_officer"}
 if auto_refresh_on and user["role"] not in NO_AUTOREFRESH_ROLES:
-    st_autorefresh(interval=20_000, key="global_autorefresh")
+    st_autorefresh(interval=60_000, key="global_autorefresh")
 
 # =========================================================
 # 8. EMPLOYEE DASHBOARD
@@ -2374,7 +2381,7 @@ elif user["role"] == "driver":
 # for a patient FAST, not fill out a multi-field form. The Emergency tab is
 # a single button — one click submits a fully pre-filled Pending
 # requisition (today's date/time, "Hospital / Emergency" destination,
-# "Ambulance" vehicle type, 1 passenger) and fires an extra high-visibility
+# "HIACE" vehicle type, 1 passenger) and fires an extra high-visibility
 # Telegram alert on top of the normal "New Requisition" one, so Admin/
 # the Gate Officer notice it immediately. It reuses insert_requisition()
 # (not a raw Supabase call) so it still shows up in Admin's Pending Requests
@@ -2408,7 +2415,7 @@ elif user["role"] == "nurse":
                 "time_of_travel": now.strftime("%H:%M"),
                 "destination": "Hospital / Emergency",
                 "passenger_count": 1,
-                "vehicle_type": "Ambulance",
+                "vehicle_type": "HIACE",
                 "purpose": "🚨 EMERGENCY — Patient Carry",
                 "special_request": "",
                 "status": "Pending",
