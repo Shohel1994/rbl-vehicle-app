@@ -16,7 +16,7 @@ import hashlib
 import random
 import re
 import time
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from secrets import token_urlsafe
 
 import pandas as pd
@@ -30,6 +30,43 @@ from streamlit_autorefresh import st_autorefresh
 import extra_streamlit_components as stx
 import requests
 import streamlit as st
+
+
+# =========================================================
+# BANGLADESH TIME (UTC+6) — the ONE clock this whole app uses
+# =========================================================
+# Streamlit Cloud (and most servers) run on UTC, so a bare datetime.now() /
+# bd_today() there is 6 hours behind Bangladesh — a trip started at 7:00 AM
+# was being saved as 1:00 AM. Every timestamp the app writes, every "today" /
+# "tomorrow" it computes and every "now" it compares against now comes from
+# these helpers instead, so the result is the same on a UTC cloud server and
+# on a Bangladesh laptop. Bangladesh has no daylight-saving, so a fixed +6
+# offset is exact (and needs no tz database, which Windows may not have).
+BD_TZ = timezone(timedelta(hours=6))
+
+
+def bd_now() -> datetime:
+    """Current Bangladesh wall-clock time as a plain (naive) datetime."""
+    return datetime.now(BD_TZ).replace(tzinfo=None)
+
+
+def bd_today() -> date:
+    """Today's date in Bangladesh."""
+    return bd_now().date()
+
+
+def bd_now_str() -> str:
+    """Bangladesh 'now' formatted for saving to the database."""
+    return bd_now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def bd_now_ts() -> pd.Timestamp:
+    """Bangladesh 'now' as a Timestamp labeled UTC. Supabase hands the saved
+    Bangladesh wall-clock values back with a '+00:00' label (the numbers are
+    still Bangladesh time), and pandas parses them with utc=True — so to
+    compare or subtract against those columns, 'now' must carry the same
+    label. Only the numbers matter; nothing is converted."""
+    return pd.Timestamp(bd_now()).tz_localize("UTC")
 
 
 # =========================================================
@@ -66,6 +103,10 @@ def insert_requisition(data: dict):
     it's just never meant to be read or memorized by a person. Returns None
     if the new id couldn't be read back (insert still succeeds either way)."""
     sb = get_supabase_client()
+    # Save created_at in Bangladesh time (instead of the database's own
+    # now(), which is UTC) so "submitted today"/"Requested on" are correct.
+    data = dict(data)
+    data.setdefault("created_at", bd_now_str())
     res = sb.table(REQUISITIONS_TABLE).insert(data).execute()
     new_id = res.data[0].get("id") if res.data else None
 
@@ -299,8 +340,44 @@ def fmt_time_12h(value, default: str = "—") -> str:
                 dt = datetime.strptime(candidate, f)
             except ValueError:
                 continue
-            return dt.strftime("%Y-%m-%d %I:%M %p") if "%Y" in f else dt.strftime("%I:%M %p")
+            out = dt.strftime("%Y-%m-%d %I:%M %p") if "%Y" in f else dt.strftime("%I:%M %p")
+            return drop_hour_zero(out)
     return s
+
+
+def drop_hour_zero(text: str) -> str:
+    """'2026-09-28 01:05 PM' -> '2026-09-28 1:05 PM' and '01:05 PM' -> '1:05 PM'
+    (works on Windows too, unlike strftime's %-I). Only the hour's leading
+    zero is removed; dates like '2026-09-08' are left alone."""
+    return re.sub(r"(^|\s)0(\d:)", r"\1\2", str(text))
+
+
+def fmt_clock_12h(value, default: str = "—") -> str:
+    """Compact clock for dashboards: '1:00 PM' when the moment is today
+    (Bangladesh date), otherwise '27-Sep 1:00 PM'."""
+    full = fmt_time_12h(value, default)
+    m = re.match(r"^(\d{4}-\d{2}-\d{2}) (\d{1,2}:\d{2} [AP]M)$", full)
+    if not m:
+        return full
+    day, clock = m.groups()
+    if day == str(bd_today()):
+        return clock
+    return f"{datetime.strptime(day, '%Y-%m-%d').strftime('%d-%b')} {clock}"
+
+
+TIMESTAMP_COLUMNS = ["created_at", "action_timestamp", "actual_exit_time",
+                     "actual_return_time", "driver_km_updated_at"]
+
+
+def humanize_timestamp_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Copy of `df` with the raw database timestamp columns rewritten as
+    12-hour Bangladesh-time text (e.g. '2026-09-28 1:00 PM') instead of raw
+    ISO strings with a '+00:00' label — used for on-screen tables and exports."""
+    out = df.copy()
+    for c in TIMESTAMP_COLUMNS:
+        if c in out.columns:
+            out[c] = out[c].apply(lambda v: fmt_time_12h(v, ""))
+    return out
 
 
 def hash_password(raw: str) -> str:
@@ -317,7 +394,7 @@ def time_input_12h(label: str, key_prefix: str, default_time=None):
     on the result keeps working unchanged. Invalid typed input falls back
     to `default_time` with an inline warning rather than crashing the form."""
     if default_time is None:
-        default_time = datetime.now().time()
+        default_time = bd_now().time()
     default_12h = default_time.strftime("%I:%M %p")  # e.g. "09:05 AM"
     d_hm, d_ampm = default_12h.rsplit(" ", 1)  # -> "09:05", "AM"
 
@@ -410,6 +487,8 @@ def get_user_by_username(username: str):
 
 def register_user(data: dict):
     sb = get_supabase_client()
+    data = dict(data)
+    data.setdefault("created_at", bd_now_str())  # Bangladesh time, not the DB's UTC now()
     sb.table(USERS_TABLE).insert(data).execute()
     _clear_user_caches()
 
@@ -439,7 +518,7 @@ def fetch_all_users() -> pd.DataFrame:
 
 # ------------------- REQUISITIONS TABLE HELPERS -------------------
 def generate_request_id() -> str:
-    return f"REQ-{datetime.now().strftime('%Y%m%d%H%M%S')}-{random.randint(100, 999)}"
+    return f"REQ-{bd_now().strftime('%Y%m%d%H%M%S')}-{random.randint(100, 999)}"
 
 
 # NOTE: insert_requisition() and update_requisition() are defined once, above,
@@ -623,7 +702,7 @@ def submit_driver_km(row: dict, driver_start_km=None, driver_end_km=None):
     still Gate Out/Gate In independently at any time for cross-verification
     (see the KM Variance Report tab)."""
     request_id = row["request_id"]
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_str = bd_now_str()
     updates = {
         "driver_km_updated_at": now_str,
         # Re-affirm these (unchanged) values so update_requisition()'s
@@ -703,11 +782,11 @@ def compute_duty_hours(row) -> float:
 
     end_raw = row.get("actual_return_time")
     if is_blank(end_raw):
-        end_dt = pd.Timestamp.now(tz="UTC")
+        end_dt = bd_now_ts()
     else:
         end_dt = pd.to_datetime(end_raw, errors="coerce", utc=True, format="mixed")
         if pd.isna(end_dt):
-            end_dt = pd.Timestamp.now(tz="UTC")
+            end_dt = bd_now_ts()
 
     hours = (end_dt - start_dt).total_seconds() / 3600.0
     return round(max(hours, 0.0), 2)
@@ -813,7 +892,7 @@ def ensure_daily_shuttle_requisitions():
     won't double-create today's six. Any failure here is logged and
     swallowed, never shown to the user or allowed to block the rest of the
     app from loading."""
-    today_str = str(date.today())
+    today_str = str(bd_today())
     if st.session_state.get("_daily_shuttle_checked_date") == today_str:
         return
     st.session_state["_daily_shuttle_checked_date"] = today_str
@@ -1282,7 +1361,7 @@ def build_pdf_report(df: pd.DataFrame, filters_summary: str) -> bytes:
     pdf.add_page()
 
     pdf.set_font("Helvetica", size=10)
-    pdf.cell(0, 6, f"Generated on: {datetime.now().strftime('%Y-%m-%d %I:%M %p')}",
+    pdf.cell(0, 6, f"Generated on: {bd_now().strftime('%Y-%m-%d %I:%M %p')}",
               new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.multi_cell(0, 6, filters_summary)
     pdf.ln(2)
@@ -1351,8 +1430,67 @@ def build_pdf_report(df: pd.DataFrame, filters_summary: str) -> bytes:
 
 DUTY_TRACKER_DISPLAY_COLS = [
     "Vehicle No", "Driver Name", "Start Time", "End Time",
-    "Total KM", "Duty Duration (Hrs)", "Route / Purpose",
+    "Start KM", "End KM", "Total KM", "Duty Duration (Hrs)", "Route / Purpose",
 ]
+
+# Summary grouping choices offered in the Duty Tracker. "Driver + Date" is the
+# default so every row carries its date (who worked how many hours on which day).
+DUTY_SUMMARY_GROUP_OPTIONS = [
+    "Driver + Date (daily)", "Driver (total)", "Date (all drivers)", "Vehicle (total)",
+]
+
+
+def build_duty_summary(df: pd.DataFrame, group_option: str) -> pd.DataFrame:
+    """Roll the filtered duty rows up into a summary table.
+
+    `df` is the already-filtered duty DataFrame from the Duty Tracker tab; it
+    must carry the helper columns _start_dt, _end_dt, _km, _duration_hrs plus
+    driver_name / vehicle_number. Every grouping also reports the First Start
+    and Last End time (12-hour AM/PM) so the summary always shows *when* the
+    duty happened, not just how long it was. The "Date" is the calendar date
+    the trip started on. Read-only helper: nothing is written anywhere.
+    """
+    key_map = {
+        "Driver + Date (daily)": ["Date", "Driver Name"],
+        "Driver (total)": ["Driver Name"],
+        "Date (all drivers)": ["Date"],
+        "Vehicle (total)": ["Vehicle No"],
+    }
+    keys = key_map.get(group_option, ["Date", "Driver Name"])
+    out_cols = keys + ["Trips", "Total KM", "Total Duty Hours", "Total Duty Time (h m)",
+                       "First Start", "Last End"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    work = df.copy()
+    work["Date"] = work["_start_dt"].dt.strftime("%Y-%m-%d")
+    work["Driver Name"] = work["driver_name"].map(lambda v: fmt(v, "—"))
+    work["Vehicle No"] = work["vehicle_number"].map(lambda v: fmt(v, "—"))
+
+    g = (
+        work.groupby(keys)
+        .agg(
+            Trips=("_km", "size"),
+            km_sum=("_km", "sum"),
+            hrs_sum=("_duration_hrs", "sum"),
+            first_start=("_start_dt", "min"),
+            last_end=("_end_dt", "max"),
+        )
+        .reset_index()
+    )
+    g["Total KM"] = g["km_sum"].round(1)
+    g["Total Duty Hours"] = g["hrs_sum"].round(2)
+    g["Total Duty Time (h m)"] = g["hrs_sum"].map(
+        lambda h: f"{int(round(h * 60)) // 60}h {int(round(h * 60)) % 60}m"
+    )
+    g["First Start"] = g["first_start"].dt.strftime("%d-%b-%Y %I:%M %p").map(drop_hour_zero)
+    g["Last End"] = g["last_end"].dt.strftime("%d-%b-%Y %I:%M %p").map(drop_hour_zero)
+
+    if "Date" in keys:
+        g = g.sort_values(["Date", "hrs_sum"], ascending=[True, False])
+    else:
+        g = g.sort_values("hrs_sum", ascending=False)
+    return g[out_cols].reset_index(drop=True)
 
 
 def sanitize_pdf_text(value) -> str:
@@ -1396,11 +1534,13 @@ def sanitize_pdf_text(value) -> str:
     return text.encode("latin-1", "replace").decode("latin-1")
 
 
-def build_duty_tracker_excel(detail_df: pd.DataFrame, summary_metrics: dict) -> bytes:
+def build_duty_tracker_excel(detail_df: pd.DataFrame, summary_metrics: dict,
+                              driver_summary_df: pd.DataFrame = None) -> bytes:
     """Formatted .xlsx export for the Duty Tracker: a 'Summary' sheet with the
-    KPI cards' values, plus a 'Duty Log' sheet with the full filtered detail
-    table. Plug in your own detail_df / summary_metrics from the tab below —
-    both are plain pandas / dict objects, nothing Supabase-specific here.
+    KPI cards' values, an optional 'Driver Summary' sheet (trips / KM / duty
+    hours per driver), plus a 'Duty Log' sheet with the full filtered detail
+    table (now including Start KM and End KM). `driver_summary_df` defaults
+    to None so any older caller keeps working unchanged.
     """
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -1408,7 +1548,12 @@ def build_duty_tracker_excel(detail_df: pd.DataFrame, summary_metrics: dict) -> 
             [{"Metric": k, "Value": v} for k, v in summary_metrics.items()]
         )
         summary_df.to_excel(writer, index=False, sheet_name="Summary")
+        sheets = [("Summary", summary_df)]
+        if driver_summary_df is not None:
+            driver_summary_df.to_excel(writer, index=False, sheet_name="Duty Summary")
+            sheets.append(("Duty Summary", driver_summary_df))
         detail_df.to_excel(writer, index=False, sheet_name="Duty Log")
+        sheets.append(("Duty Log", detail_df))
 
         # Light auto-fit so columns aren't clipped in Excel — purely cosmetic,
         # safe to remove if you don't want the extra openpyxl dependency calls.
@@ -1421,7 +1566,7 @@ def build_duty_tracker_excel(detail_df: pd.DataFrame, summary_metrics: dict) -> 
         # with "" first guarantees every length is a real integer (0 for
         # blank cells).
         from openpyxl.utils import get_column_letter
-        for sheet_name, sheet_df in (("Summary", summary_df), ("Duty Log", detail_df)):
+        for sheet_name, sheet_df in sheets:
             ws = writer.sheets[sheet_name]
             for i, col in enumerate(sheet_df.columns, start=1):
                 width = max(12, min(40, int(sheet_df[col].fillna("").astype(str).str.len().max() if not sheet_df.empty else 12) + 2))
@@ -1455,10 +1600,13 @@ class DutyTrackerPDF(FPDF):
         self.cell(0, 10, f"Page {self.page_no()}", align="C")
 
 
-def build_duty_tracker_pdf(detail_df: pd.DataFrame, summary_metrics: dict, filters_summary: str) -> bytes:
-    """PDF containing the KPI summary table followed by the detailed duty log.
+def build_duty_tracker_pdf(detail_df: pd.DataFrame, summary_metrics: dict, filters_summary: str,
+                            driver_summary_df: pd.DataFrame = None) -> bytes:
+    """PDF containing the KPI summary table, an optional per-driver duty
+    summary (trips / KM / duty hours), followed by the detailed duty log.
     `detail_df` must already have the DUTY_TRACKER_DISPLAY_COLS columns (see
     the tab below for how it's built from the requisitions DataFrame).
+    `driver_summary_df` defaults to None so older callers keep working.
 
     Every string written to the PDF is passed through sanitize_pdf_text()
     first — see that function's docstring for why this is necessary with
@@ -1469,7 +1617,7 @@ def build_duty_tracker_pdf(detail_df: pd.DataFrame, summary_metrics: dict, filte
     pdf.add_page()
 
     pdf.set_font("Helvetica", size=10)
-    pdf.cell(0, 6, f"Generated on: {datetime.now().strftime('%Y-%m-%d %I:%M %p')}",
+    pdf.cell(0, 6, f"Generated on: {bd_now().strftime('%Y-%m-%d %I:%M %p')}",
               new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.multi_cell(0, 6, sanitize_pdf_text(filters_summary))
     pdf.ln(2)
@@ -1485,13 +1633,36 @@ def build_duty_tracker_pdf(detail_df: pd.DataFrame, summary_metrics: dict, filte
         pdf.cell(0, 7, f"{safe_label}: {safe_value}", border=1, fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(6)
 
+    # ---- Duty summary (grouped by Driver+Date / Driver / Date / Vehicle) ----
+    if driver_summary_df is not None and not driver_summary_df.empty:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(0, 8, "Duty Summary", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(1)
+        pdf.set_font("Helvetica", size=8)
+        drv_style = FontFace(emphasis="BOLD", color=(255, 255, 255), fill_color=(15, 98, 254))
+        summary_cols = list(driver_summary_df.columns)
+        equal_w = round(277 / len(summary_cols), 1)
+        with pdf.table(col_widths=[equal_w] * len(summary_cols), text_align="LEFT",
+                       first_row_as_headings=True, line_height=6, headings_style=drv_style,
+                       cell_fill_color=(245, 245, 245), cell_fill_mode="ROWS") as drv_table:
+            drv_header = drv_table.row()
+            for h in summary_cols:
+                drv_header.cell(sanitize_pdf_text(h))
+            for _, dr in driver_summary_df.iterrows():
+                drow = drv_table.row()
+                for col in summary_cols:
+                    drow.cell(sanitize_pdf_text(fmt(dr.get(col, ""), "")))
+        pdf.ln(6)
+
     # ---- Detailed duty log table ----
     pdf.set_font("Helvetica", "B", 11)
     pdf.cell(0, 8, "Detailed Duty Log", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(1)
 
     headers = DUTY_TRACKER_DISPLAY_COLS
-    col_widths = [30, 28, 34, 34, 18, 26, 107]  # sums to ~277mm, fits A4 landscape
+    # 9 columns: Vehicle, Driver, Start Time, End Time, Start KM, End KM,
+    # Total KM, Duty Hrs, Route/Purpose — sums to 277mm, fits A4 landscape.
+    col_widths = [30, 28, 32, 32, 16, 16, 16, 22, 85]
 
     pdf.set_font("Helvetica", size=7)
     heading_style = FontFace(emphasis="BOLD", color=(255, 255, 255), fill_color=(15, 98, 254))
@@ -1598,7 +1769,7 @@ def build_management_pdf(kpis: dict, dept_df: pd.DataFrame, filters_summary: str
     pdf.add_page()
 
     pdf.set_font("Helvetica", size=10)
-    pdf.cell(0, 6, f"Generated on: {datetime.now().strftime('%Y-%m-%d %I:%M %p')}",
+    pdf.cell(0, 6, f"Generated on: {bd_now().strftime('%Y-%m-%d %I:%M %p')}",
               new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.multi_cell(0, 6, sanitize_pdf_text(filters_summary))
     pdf.ln(2)
@@ -1681,18 +1852,21 @@ def render_management_dashboard(df_all: pd.DataFrame):
     # below. This answers "what's happening right now / today" separately
     # from the historical, range-filtered KPIs further down.
     # ---------------------------------------------------------------
-    today = date.today()
+    today = bd_today()
     st.markdown(f"##### 📅 Today's Live Snapshot — {today.strftime('%A, %d %B %Y')}")
     st.caption("These counts are live and independent of the date-range filter below.")
 
     created_dt = pd.to_datetime(df_all.get("created_at"), errors="coerce", utc=True, format="mixed")
     return_dt = pd.to_datetime(df_all.get("actual_return_time"), errors="coerce", utc=True, format="mixed")
-    today_utc = pd.Timestamp.now(tz="UTC").normalize()
+    # created_at and actual_return_time are both saved by the app in
+    # Bangladesh time (see insert_requisition / bd_now_str), so "today" is
+    # simply today's Bangladesh date on the same clock.
+    today_stored = bd_now_ts().normalize()
 
     pending_now = int((df_all["status"] == "Pending").sum())
     on_trip_now = int((df_all["status"] == "On Trip").sum())
-    requested_today = int((created_dt.dt.normalize() == today_utc).sum())
-    completed_today = int((return_dt.dt.normalize() == today_utc).sum())
+    requested_today = int((created_dt.dt.normalize() == today_stored).sum())
+    completed_today = int((return_dt.dt.normalize() == today_stored).sum())
 
     # Each metric is paired with an expander right below it — clicking it
     # reveals the actual requisitions behind that number, since a plain
@@ -1731,14 +1905,15 @@ def render_management_dashboard(df_all: pd.DataFrame):
                     disp["id"] = disp["id"].apply(short_req_id)
                     disp = disp.rename(columns={"id": "Req #"})
                 if "actual_exit_time" in disp.columns:
-                    disp["actual_exit_time"] = disp["actual_exit_time"].apply(lambda v: fmt_time_12h(v, v))
+                    disp["actual_exit_time"] = disp["actual_exit_time"].apply(fmt_clock_12h)
+                    disp = disp.rename(columns={"actual_exit_time": "Start Time"})
                 st.dataframe(disp, use_container_width=True, hide_index=True,
                              height=min(320, 45 + 35 * len(disp)))
 
     with t3:
         st.metric("📥 Requests Submitted Today", requested_today)
         with st.expander(f"🔍 View {requested_today} submitted today"):
-            submitted_today_rows = df_all[created_dt.dt.normalize() == today_utc]
+            submitted_today_rows = df_all[created_dt.dt.normalize() == today_stored]
             if submitted_today_rows.empty:
                 st.caption("No requests submitted yet today.")
             else:
@@ -1749,27 +1924,35 @@ def render_management_dashboard(df_all: pd.DataFrame):
                     disp["id"] = disp["id"].apply(short_req_id)
                     disp = disp.rename(columns={"id": "Req #"})
                 if "created_at" in disp.columns:
-                    disp["created_at"] = disp["created_at"].apply(lambda v: fmt_time_12h(v, v))
+                    disp["created_at"] = disp["created_at"].apply(fmt_clock_12h)
+                    disp = disp.rename(columns={"created_at": "Submitted At"})
                 st.dataframe(disp, use_container_width=True, hide_index=True,
                              height=min(320, 45 + 35 * len(disp)))
 
     with t4:
         st.metric("✅ Trips Completed Today", completed_today)
         with st.expander(f"🔍 View {completed_today} completed today"):
-            completed_today_rows = df_all[return_dt.dt.normalize() == today_utc]
+            completed_today_rows = df_all[return_dt.dt.normalize() == today_stored]
             if completed_today_rows.empty:
                 st.caption("No trips completed yet today.")
             else:
                 disp = completed_today_rows.copy()
                 disp["Total KM"] = disp.apply(lambda row: effective_km_fields(row)[2], axis=1)
                 cols = ["id", "applicant_name", "driver_name", "vehicle_number",
-                        "destination", "actual_return_time", "Total KM"]
+                        "destination", "actual_exit_time", "actual_return_time", "Total KM"]
                 disp = disp[[c for c in cols if c in disp.columns]].copy()
                 if "id" in disp.columns:
                     disp["id"] = disp["id"].apply(short_req_id)
                     disp = disp.rename(columns={"id": "Req #"})
+                # Start Time (when the trip left) and End Time (when it came
+                # back), shown as e.g. "1:00 PM" — a trip that started on an
+                # earlier day shows its date too, e.g. "27-Sep 11:30 PM".
+                if "actual_exit_time" in disp.columns:
+                    disp["actual_exit_time"] = disp["actual_exit_time"].apply(fmt_clock_12h)
                 if "actual_return_time" in disp.columns:
-                    disp["actual_return_time"] = disp["actual_return_time"].apply(lambda v: fmt_time_12h(v, v))
+                    disp["actual_return_time"] = disp["actual_return_time"].apply(fmt_clock_12h)
+                disp = disp.rename(columns={"actual_exit_time": "Start Time",
+                                            "actual_return_time": "End Time"})
                 st.dataframe(disp, use_container_width=True, hide_index=True,
                              height=min(320, 45 + 35 * len(disp)))
 
@@ -1777,8 +1960,8 @@ def render_management_dashboard(df_all: pd.DataFrame):
     work_df["_dt"] = pd.to_datetime(work_df["date_of_travel"], errors="coerce")
     min_d = work_df["_dt"].min()
     max_d = work_df["_dt"].max()
-    default_start = min_d.date() if pd.notnull(min_d) else date.today()
-    default_end = max_d.date() if pd.notnull(max_d) else date.today()
+    default_start = min_d.date() if pd.notnull(min_d) else bd_today()
+    default_end = max_d.date() if pd.notnull(max_d) else bd_today()
 
     st.markdown("---")
     st.markdown("##### 🔎 Date Range Filter")
@@ -1882,7 +2065,7 @@ def render_management_dashboard(df_all: pd.DataFrame):
     st.markdown("---")
     st.markdown("##### ⬇️ Download Reports")
 
-    filtered_display = filtered.drop(columns=["_dt"], errors="ignore").copy()
+    filtered_display = humanize_timestamp_columns(filtered.drop(columns=["_dt"], errors="ignore"))
     if "time_of_travel" in filtered_display.columns:
         filtered_display["time_of_travel"] = filtered_display["time_of_travel"].apply(lambda v: fmt_time_12h(v, v))
 
@@ -2053,7 +2236,7 @@ if user["role"] == "user":
                                                placeholder="01XXXXXXXXX")
                 passenger_count = st.number_input("Passenger Count *", min_value=1, max_value=50, value=1)
             with c2:
-                date_of_travel = st.date_input("Date of Travel *", min_value=date.today())
+                date_of_travel = st.date_input("Date of Travel *", min_value=bd_today())
                 time_of_travel = time_input_12h("Time of Travel *", key_prefix="new_req_tt")
                 destination = st.text_input("Destination *")
                 vehicle_type = st.selectbox("Vehicle Type Required *", VEHICLE_TYPES)
@@ -2197,7 +2380,7 @@ elif user["role"] == "gate_officer":
                         try:
                             update_requisition(r["request_id"], {
                                 "start_km": float(start_km),
-                                "actual_exit_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "actual_exit_time": bd_now_str(),
                                 "status": "On Trip",
                             }, notify=False)
                             st.success(f"✅ Gate Out recorded for {r['applicant_name']} — vehicle is now On Trip.")
@@ -2243,7 +2426,7 @@ elif user["role"] == "gate_officer":
                                 update_requisition(r["request_id"], {
                                     "end_km": float(end_km),
                                     "total_km": total_km,
-                                    "actual_return_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    "actual_return_time": bd_now_str(),
                                     "status": "Completed",
                                 }, notify=False)
                                 st.success(f"✅ Gate In recorded for {r['applicant_name']}. Total distance: **{total_km} KM**")
@@ -2449,7 +2632,7 @@ elif user["role"] == "nurse":
         if st.button("🚨 EMERGENCY — Request Vehicle for Patient Carry", type="primary",
                       use_container_width=True):
             request_id = generate_request_id()
-            now = datetime.now()
+            now = bd_now()
             data = {
                 "request_id": request_id,
                 "username": user["username"],
@@ -2644,7 +2827,7 @@ elif user["role"] == "admin":
                     type="primary", use_container_width=True, disabled=not bulk_ready,
                     key="bulk_assign_submit",
                 ):
-                    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    now_str = bd_now_str()
                     bulk_updates = {
                         "status": "Approved",
                         "driver_name": bulk_driver,
@@ -2732,7 +2915,7 @@ elif user["role"] == "admin":
                         try:
                             default_time = datetime.strptime(r["time_of_travel"], "%H:%M").time()
                         except (ValueError, TypeError):
-                            default_time = datetime.now().time()
+                            default_time = bd_now().time()
                         approved_time = time_input_12h(
                             f"Approved Departure Time (originally requested {fmt_time_12h(r['time_of_travel'])})",
                             key_prefix=f"atime_{r['request_id']}",
@@ -2762,7 +2945,7 @@ elif user["role"] == "admin":
                                     "driver_contact": driver_contact_map.get(selected_driver, "") if approve_clicked else "",
                                     "vehicle_number": selected_vehicle if approve_clicked else "",
                                     "approved_by": user["full_name"],
-                                    "action_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    "action_timestamp": bd_now_str(),
                                     "admin_note": admin_note.strip(),
                                 }
                                 if approve_clicked:
@@ -2826,7 +3009,7 @@ elif user["role"] == "admin":
                 ca_passenger_count = st.number_input("Passenger Count *", min_value=1, max_value=50, value=1,
                                                       key="ca_passenger_count")
             with c2:
-                ca_date = st.date_input("Date of Travel *", min_value=date.today(), key="ca_date")
+                ca_date = st.date_input("Date of Travel *", min_value=bd_today(), key="ca_date")
                 ca_time = time_input_12h("Time of Travel *", key_prefix="create_req_tt")
                 ca_destination = st.text_input("Destination *", key="ca_destination")
                 ca_vehicle_type = st.selectbox("Vehicle Type Required *", VEHICLE_TYPES, key="ca_vehicle_type")
@@ -2874,7 +3057,7 @@ elif user["role"] == "admin":
                     st.error(e)
             else:
                 request_id = generate_request_id()
-                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                now_str = bd_now_str()
                 data = {
                     "request_id": request_id,
                     "username": prefill.get("username", ""),
@@ -2939,14 +3122,14 @@ elif user["role"] == "admin":
         # correct without anyone having to touch a date picker: run this
         # tonight (03/09/26) and it submits for 04/09/26; run it any other
         # night and it automatically submits for the following day.
-        tomorrow_date = date.today() + timedelta(days=1)
+        tomorrow_date = bd_today() + timedelta(days=1)
 
         def _submit_shuttle_trip(tpl_row, trip_date, driver_name, vehicle_number):
             """Creates one Approved requisition from a shuttle template for
             the given date/driver/vehicle. Returns the new short req id, or
             raises on failure (caller handles the try/except + message)."""
             request_id = generate_request_id()
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            now_str = bd_now_str()
             default_time_val = fmt(tpl_row.get("default_time"), "08:00")
             data = {
                 "request_id": request_id,
@@ -3363,8 +3546,8 @@ elif user["role"] == "admin":
             df_all["_dt"] = pd.to_datetime(df_all["date_of_travel"], errors="coerce")
             min_d = df_all["_dt"].min()
             max_d = df_all["_dt"].max()
-            default_start = min_d.date() if pd.notnull(min_d) else date.today()
-            default_end = max_d.date() if pd.notnull(max_d) else date.today()
+            default_start = min_d.date() if pd.notnull(min_d) else bd_today()
+            default_end = max_d.date() if pd.notnull(max_d) else bd_today()
             date_range = st.date_input("Date of Travel range", value=(default_start, default_end))
 
             filtered = df_all.copy()
@@ -3378,7 +3561,7 @@ elif user["role"] == "admin":
                 start_d, end_d = date_range
                 filtered = filtered[(filtered["_dt"] >= pd.Timestamp(start_d)) & (filtered["_dt"] <= pd.Timestamp(end_d))]
 
-            filtered_display = filtered.drop(columns=["_dt"], errors="ignore").copy()
+            filtered_display = humanize_timestamp_columns(filtered.drop(columns=["_dt"], errors="ignore"))
             if "time_of_travel" in filtered_display.columns:
                 filtered_display["time_of_travel"] = filtered_display["time_of_travel"].apply(
                     lambda v: fmt_time_12h(v, v)
@@ -3619,12 +3802,12 @@ elif user["role"] == "admin":
                     try:
                         et_date_default = datetime.strptime(str(row.get("date_of_travel")), "%Y-%m-%d").date()
                     except (ValueError, TypeError):
-                        et_date_default = date.today()
+                        et_date_default = bd_today()
                     et_date = st.date_input("Date of Travel", value=et_date_default)
                     try:
                         et_time_default = datetime.strptime(fmt(row.get("time_of_travel"), "09:00"), "%H:%M").time()
                     except ValueError:
-                        et_time_default = datetime.now().time()
+                        et_time_default = bd_now().time()
                     et_time = time_input_12h("Time of Travel", key_prefix="edit_trip_tt", default_time=et_time_default)
                     et_destination = st.text_input("Destination", value=fmt(row.get("destination"), ""))
                     et_vehicle_type = st.selectbox(
@@ -3852,14 +4035,20 @@ elif user["role"] == "admin":
             fc1, fc2 = st.columns(2)
             with fc1:
                 st.markdown("**Start of Range**")
-                filter_start_date = st.date_input("Start Date", value=date.today(), key="duty_start_date")
-                filter_start_time = st.time_input("Start Time", value=datetime.strptime("07:00", "%H:%M").time(),
-                                                   key="duty_start_time")
+                filter_start_date = st.date_input("Start Date", value=bd_today(), key="duty_start_date")
+                # 12-hour clock with an AM/PM dropdown (same widget used in the
+                # requisition forms) instead of the 24-hour st.time_input.
+                filter_start_time = time_input_12h(
+                    "Start Time", key_prefix="duty_start",
+                    default_time=datetime.strptime("07:00", "%H:%M").time(),
+                )
             with fc2:
                 st.markdown("**End of Range**")
-                filter_end_date = st.date_input("End Date", value=date.today() + timedelta(days=1), key="duty_end_date")
-                filter_end_time = st.time_input("End Time", value=datetime.strptime("06:59", "%H:%M").time(),
-                                                 key="duty_end_time")
+                filter_end_date = st.date_input("End Date", value=bd_today() + timedelta(days=1), key="duty_end_date")
+                filter_end_time = time_input_12h(
+                    "End Time", key_prefix="duty_end",
+                    default_time=datetime.strptime("06:59", "%H:%M").time(),
+                )
 
             # -------------------------------------------------------------
             # STEP 1 — Build real start/end datetimes for every trip, as
@@ -3911,7 +4100,7 @@ elif user["role"] == "admin":
             # "Invalid value ... for dtype 'datetime64[us, UTC]'" TypeError,
             # so we must assign an equally tz-aware Timestamp here.
             still_out_mask = duty_df_raw["_start_dt"].notna() & duty_df_raw["_end_dt"].isna()
-            duty_df_raw.loc[still_out_mask, "_end_dt"] = pd.Timestamp.now(tz="UTC")
+            duty_df_raw.loc[still_out_mask, "_end_dt"] = bd_now_ts()
 
             # Only rows that actually left the gate are real "duty" records.
             duty_base = duty_df_raw[duty_df_raw["_start_dt"].notna()].copy()
@@ -3920,9 +4109,10 @@ elif user["role"] == "admin":
             # STEP 2 — Combine the date/time widgets into naive datetimes,
             # then localize them to UTC so they can be compared directly
             # against the tz-aware `_start_dt` / `_end_dt` columns above.
-            # (If your admin users think in a local timezone rather than
-            # UTC, swap "UTC" below for that zone, e.g. "Asia/Dhaka", and
-            # pandas will convert correctly at comparison time.)
+            # (Saved times are Bangladesh wall-clock values that Supabase labels
+            # "+00:00"; the range typed here is Bangladesh time too, so it is
+            # labeled "UTC" the same way and compared number-for-number. No
+            # timezone conversion is wanted or applied.)
             # -------------------------------------------------------------
             range_start = pd.Timestamp(datetime.combine(filter_start_date, filter_start_time)).tz_localize("UTC")
             range_end = pd.Timestamp(datetime.combine(filter_end_date, filter_end_time)).tz_localize("UTC")
@@ -3955,6 +4145,42 @@ elif user["role"] == "admin":
                 ) if not duty_drivers_df.empty else ["All Drivers"]
                 duty_driver_filter = st.selectbox("Driver Selection", driver_choices, key="duty_driver_filter")
 
+            # ---- More filters + report options ----
+            # Department / Status / Route-or-Purpose text narrow down the trips
+            # themselves; "Group summary by" and "Sort log by" control how the
+            # Summary table and Detailed Duty Log are arranged. Everything
+            # below (KPIs, summary, log, CSV / Excel / PDF exports) follows
+            # whatever is picked here.
+            fc5, fc6, fc7 = st.columns(3)
+            with fc5:
+                dept_choices = sorted(
+                    d for d in duty_base["department"].dropna().astype(str).unique().tolist() if d.strip()
+                ) if "department" in duty_base.columns else []
+                duty_dept_filter = st.multiselect("Department", dept_choices, key="duty_dept_filter")
+            with fc6:
+                status_choices = sorted(
+                    s_ for s_ in duty_base["status"].dropna().astype(str).unique().tolist() if s_.strip()
+                ) if "status" in duty_base.columns else []
+                duty_status_filter = st.multiselect("Trip Status", status_choices, key="duty_status_filter")
+            with fc7:
+                duty_text_filter = st.text_input(
+                    "Route / Purpose contains", key="duty_text_filter", placeholder="e.g. Bepza",
+                )
+
+            fc8, fc9 = st.columns(2)
+            with fc8:
+                duty_group_option = st.selectbox(
+                    "Group summary by", DUTY_SUMMARY_GROUP_OPTIONS, key="duty_group_option",
+                    help="Driver + Date shows how many hours each driver worked on each date.",
+                )
+            with fc9:
+                duty_sort_option = st.selectbox(
+                    "Sort Detailed Log by",
+                    ["Start Time — oldest first", "Start Time — newest first", "Driver Name (A–Z)",
+                     "Vehicle No (A–Z)", "Duty Hours — highest first", "Total KM — highest first"],
+                    key="duty_sort_option",
+                )
+
             # -------------------------------------------------------------
             # STEP 3 — Apply the date/time window + vehicle/driver filters.
             # A trip is included if its duty window OVERLAPS the selected
@@ -3978,6 +4204,16 @@ elif user["role"] == "admin":
                 duty_filtered = duty_filtered[
                     duty_filtered["driver_name"].map(_normalize_driver_name) == _normalize_driver_name(duty_driver_filter)
                 ]
+            if duty_dept_filter:
+                duty_filtered = duty_filtered[duty_filtered["department"].astype(str).isin(duty_dept_filter)]
+            if duty_status_filter:
+                duty_filtered = duty_filtered[duty_filtered["status"].astype(str).isin(duty_status_filter)]
+            if duty_text_filter.strip():
+                _needle = duty_text_filter.strip()
+                duty_filtered = duty_filtered[
+                    duty_filtered["destination"].fillna("").astype(str).str.contains(_needle, case=False, regex=False)
+                    | duty_filtered["purpose"].fillna("").astype(str).str.contains(_needle, case=False, regex=False)
+                ]
 
             # -------------------------------------------------------------
             # STEP 4 — Derived fields: duty duration in hours, total KM.
@@ -3991,6 +4227,61 @@ elif user["role"] == "admin":
                 (duty_filtered["_end_dt"] - duty_filtered["_start_dt"]).dt.total_seconds() / 3600.0
             ).round(2)
             duty_filtered["_km"] = duty_filtered.apply(lambda row: effective_km_fields(row)[2], axis=1)
+            # Start/End odometer readings, using the same driver-first,
+            # gate-officer-fallback priority as the KM total above.
+            duty_filtered["_start_km"] = duty_filtered.apply(lambda row: effective_km_fields(row)[0], axis=1)
+            duty_filtered["_end_km"] = duty_filtered.apply(lambda row: effective_km_fields(row)[1], axis=1)
+
+            # Apply the chosen sort order to the Detailed Duty Log.
+            duty_filtered["_sort_driver"] = duty_filtered["driver_name"].fillna("").astype(str).str.lower()
+            duty_filtered["_sort_vehicle"] = duty_filtered["vehicle_number"].fillna("").astype(str).str.lower()
+            _sort_map = {
+                "Start Time — oldest first": ("_start_dt", True),
+                "Start Time — newest first": ("_start_dt", False),
+                "Driver Name (A–Z)": ("_sort_driver", True),
+                "Vehicle No (A–Z)": ("_sort_vehicle", True),
+                "Duty Hours — highest first": ("_duration_hrs", False),
+                "Total KM — highest first": ("_km", False),
+            }
+            _sort_col, _sort_asc = _sort_map.get(duty_sort_option, ("_start_dt", True))
+            duty_filtered = duty_filtered.sort_values(_sort_col, ascending=_sort_asc, kind="stable")
+
+            # Trips that left the gate but never came back (no Gate In / End KM
+            # yet) are counted up to "right now", so an old forgotten "On Trip"
+            # entry keeps adding hours every minute and blows up the totals.
+            # Flag them so Admin can complete/fix/delete them in Edit / Delete Trip.
+            still_open_count = int(
+                (duty_filtered["status"] == "On Trip").sum()
+            ) if "status" in duty_filtered.columns else 0
+            if still_open_count:
+                st.warning(
+                    f"⚠️ {still_open_count} trip(s) in this range are still marked **On Trip** (no return "
+                    "recorded), so their duty hours keep counting up to the current time. If any of them "
+                    "are old/forgotten, complete or remove them from the **✏️ Edit / Delete Trip** tab "
+                    "to get accurate duty-hour totals."
+                )
+
+            # Explain an empty result instead of just showing zeros. Only trips
+            # that have actually left the gate (Gate Out, or the driver's Start
+            # KM) count as duty — Pending / Approved trips that haven't started
+            # yet never appear here, which is the most common reason for zero.
+            if duty_filtered.empty:
+                try:
+                    _d0, _d1 = range_start.date(), range_end.date()
+                    _sched = df_all.copy()
+                    _sched["_tdate"] = pd.to_datetime(_sched["date_of_travel"], errors="coerce").dt.date
+                    _sched = _sched[(_sched["_tdate"] >= _d0) & (_sched["_tdate"] <= _d1)]
+                    _not_started = _sched[_sched["status"].isin(["Pending", "Approved"])]
+                    _on_trip_sched = _sched[_sched["status"] == "On Trip"]
+                    st.info(
+                        f"ℹ️ No started trips found between {range_start.strftime('%d-%b-%Y %I:%M %p')} and "
+                        f"{range_end.strftime('%d-%b-%Y %I:%M %p')}. Trips scheduled in these dates: "
+                        f"{len(_sched)} — not started yet (Pending/Approved): {len(_not_started)}, "
+                        f"On Trip: {len(_on_trip_sched)}. Only trips with a recorded Gate Out / driver Start KM "
+                        "count as duty, and any active Vehicle/Driver/Department/Status/Route filters also apply."
+                    )
+                except Exception:
+                    st.info("ℹ️ No started trips match the selected date/time range and filters.")
 
             st.markdown("---")
             st.markdown("##### 📌 Summary")
@@ -4026,9 +4317,25 @@ elif user["role"] == "admin":
             k4.metric("👨‍✈️ Active Driver / Vehicle", f"{active_driver_label} / {active_vehicle_label}")
 
             # -------------------------------------------------------------
+            # DUTY SUMMARY — trips, KM and duty hours, grouped as chosen in
+            # "Group summary by" (default: Driver + Date, so every row shows
+            # which date the hours belong to, plus First Start / Last End
+            # times in 12-hour AM/PM).
+            # -------------------------------------------------------------
+            st.markdown("---")
+            st.markdown(f"##### 👨‍✈️ Duty Summary — {duty_group_option} (কে কত ঘণ্টা ডিউটি করেছে)")
+
+            driver_summary_df = build_duty_summary(duty_filtered, duty_group_option)
+            if driver_summary_df.empty:
+                st.info("No trips match the selected filters.")
+            else:
+                st.dataframe(driver_summary_df, use_container_width=True, hide_index=True,
+                             height=min(380, 45 + 35 * len(driver_summary_df)))
+
+            # -------------------------------------------------------------
             # STEP 5 — Detailed table:
-            # [Vehicle No, Driver Name, Start Time, End Time, Total KM,
-            #  Duty Duration (Hours), Route / Purpose]
+            # [Vehicle No, Driver Name, Start Time, End Time, Start KM,
+            #  End KM, Total KM, Duty Duration (Hours), Route / Purpose]
             # -------------------------------------------------------------
             st.markdown("---")
             st.markdown("##### 📋 Detailed Duty Log")
@@ -4040,8 +4347,10 @@ elif user["role"] == "admin":
                 detail_display = pd.DataFrame({
                     "Vehicle No": duty_filtered["vehicle_number"].map(lambda v: fmt(v, "—")),
                     "Driver Name": duty_filtered["driver_name"].map(lambda v: fmt(v, "—")),
-                    "Start Time": duty_filtered["_start_dt"].dt.strftime("%Y-%m-%d %I:%M %p"),
-                    "End Time": duty_filtered["_end_dt"].dt.strftime("%Y-%m-%d %I:%M %p"),
+                    "Start Time": duty_filtered["_start_dt"].dt.strftime("%Y-%m-%d %I:%M %p").map(drop_hour_zero),
+                    "End Time": duty_filtered["_end_dt"].dt.strftime("%Y-%m-%d %I:%M %p").map(drop_hour_zero),
+                    "Start KM": duty_filtered["_start_km"].astype(float).round(1),
+                    "End KM": duty_filtered["_end_km"].astype(float).round(1),
                     "Total KM": duty_filtered["_km"].round(1),
                     "Duty Duration (Hrs)": duty_filtered["_duration_hrs"],
                     "Route / Purpose": duty_filtered["destination"].fillna("").astype(str)
@@ -4055,9 +4364,14 @@ elif user["role"] == "admin":
             # PDF's KPI block — plug in any additional metrics here as needed.
             # -------------------------------------------------------------
             summary_metrics = {
-                "Date/Time Range": f"{range_start.strftime('%Y-%m-%d %I:%M %p')} to {range_end.strftime('%Y-%m-%d %I:%M %p')}",
+                "Date/Time Range": drop_hour_zero(range_start.strftime('%Y-%m-%d %I:%M %p')) + " to " + drop_hour_zero(range_end.strftime('%Y-%m-%d %I:%M %p')),
                 "Vehicle Filter": duty_vehicle_filter,
                 "Driver Filter": duty_driver_filter,
+                "Department Filter": ", ".join(duty_dept_filter) if duty_dept_filter else "All",
+                "Status Filter": ", ".join(duty_status_filter) if duty_status_filter else "All",
+                "Route / Purpose Filter": duty_text_filter.strip() or "None",
+                "Summary Grouped By": duty_group_option,
+                "Log Sorted By": duty_sort_option,
                 "Total Distance (KM)": f"{total_km:.1f}",
                 "Total Duty Duration": f"{duration_h}h {duration_m}m",
                 "Total Trips": total_trips,
@@ -4066,7 +4380,8 @@ elif user["role"] == "admin":
             }
             filters_summary_text = (
                 f"Range: {summary_metrics['Date/Time Range']} | Vehicle: {duty_vehicle_filter} | "
-                f"Driver: {duty_driver_filter}"
+                f"Driver: {duty_driver_filter} | Department: {summary_metrics['Department Filter']} | "
+                f"Status: {summary_metrics['Status Filter']} | Grouped by: {duty_group_option}"
             )
 
             st.markdown("---")
@@ -4079,14 +4394,14 @@ elif user["role"] == "admin":
                     mime="text/csv", use_container_width=True,
                 )
             with e2:
-                duty_excel_bytes = build_duty_tracker_excel(detail_display, summary_metrics)
+                duty_excel_bytes = build_duty_tracker_excel(detail_display, summary_metrics, driver_summary_df)
                 st.download_button(
                     "⬇️ Download Excel (.xlsx)", data=duty_excel_bytes, file_name="duty_tracker_report.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
             with e3:
-                duty_pdf_bytes = build_duty_tracker_pdf(detail_display, summary_metrics, filters_summary_text)
+                duty_pdf_bytes = build_duty_tracker_pdf(detail_display, summary_metrics, filters_summary_text, driver_summary_df)
                 st.download_button(
                     "⬇️ Download PDF (.pdf)", data=duty_pdf_bytes, file_name="duty_tracker_report.pdf",
                     mime="application/pdf", use_container_width=True,
