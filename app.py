@@ -1447,7 +1447,7 @@ def build_duty_summary(df: pd.DataFrame, group_option: str) -> pd.DataFrame:
         "Vehicle (total)": ["Vehicle No"],
     }
     keys = key_map.get(group_option, ["Date", "Driver Name"])
-    out_cols = keys + ["Trips", "Total KM", "Total Duty Hours", "Total Duty Time (h m)",
+    out_cols = keys + ["Trips", "Total KM", "Run Hours", "Total Duty Hours", "Total Duty Time (h m)",
                        "First Start", "Last End"]
     if df is None or df.empty:
         return pd.DataFrame(columns=out_cols)
@@ -1468,34 +1468,49 @@ def build_duty_summary(df: pd.DataFrame, group_option: str) -> pd.DataFrame:
         )
         .reset_index()
     )
+    # DUTY TIME = first trip start -> last trip end, per driver (or vehicle)
+    # per day, so gaps between trips are INCLUDED (e.g. 6:50 AM -> 9:00 PM).
+    # "Run Hours" stays the plain sum of each trip's own Start->End time.
+    entity = "Vehicle No" if "Vehicle No" in keys else "Driver Name"
+    day = work.groupby(["Date", entity]).agg(_s=("_start_dt", "min"), _e=("_end_dt", "max")).reset_index()
+    day["duty_hrs"] = (day["_e"] - day["_s"]).dt.total_seconds() / 3600.0
+    duty = day.groupby(keys)["duty_hrs"].sum().reset_index()
+    g = g.merge(duty, on=keys, how="left")
+    g["duty_hrs"] = g["duty_hrs"].fillna(0.0)
+
     g["Total KM"] = g["km_sum"].round(1)
-    g["Total Duty Hours"] = g["hrs_sum"].round(2)
-    g["Total Duty Time (h m)"] = g["hrs_sum"].map(
+    g["Run Hours"] = g["hrs_sum"].round(2)
+    g["Total Duty Hours"] = g["duty_hrs"].round(2)
+    g["Total Duty Time (h m)"] = g["duty_hrs"].map(
         lambda h: f"{int(round(h * 60)) // 60}h {int(round(h * 60)) % 60}m"
     )
     g["First Start"] = g["first_start"].dt.strftime("%d-%b-%Y %I:%M %p").map(drop_hour_zero)
     g["Last End"] = g["last_end"].dt.strftime("%d-%b-%Y %I:%M %p").map(drop_hour_zero)
 
     if "Date" in keys:
-        g = g.sort_values(["Date", "hrs_sum"], ascending=[True, False])
+        g = g.sort_values(["Date", "duty_hrs"], ascending=[True, False])
     else:
-        g = g.sort_values("hrs_sum", ascending=False)
+        g = g.sort_values("duty_hrs", ascending=False)
     return g[out_cols].reset_index(drop=True)
 
 
 def build_driver_daily_matrix(df: pd.DataFrame, all_driver_names=None) -> pd.DataFrame:
     """Driver x Date matrix of Run KM, with Total KM, per-day average KM,
-    Total Hours and average hours per day (divided by the number of date
-    columns in the selected period). A GRAND TOTAL row is added at the end.
+    Run Hours (sum of trip times) and Duty Hours (first start -> last end per
+    day, gaps included) plus the average of each per day (divided by the
+    number of date columns in the selected period). A GRAND TOTAL row is added at the end.
     Drivers from the master list are included even with no trips (blank row),
     like the sample sheet."""
-    fixed = ["Total KM", "Per Day Avg KM", "Total Hours", "Avg Hours / Day"]
+    fixed = ["Total KM", "Per Day Avg KM", "Run Hours", "Duty Hours",
+             "Avg Run Hrs / Day", "Avg Duty Hrs / Day"]
     work = df.copy() if df is not None else pd.DataFrame()
     display = {}
     for n in (all_driver_names or []):
         display.setdefault(_normalize_driver_name(n), n)
 
-    day_labels, km, hrs = [], pd.DataFrame(), pd.Series(dtype=float)
+    day_labels, km = [], pd.DataFrame()
+    hrs = pd.Series(dtype=float)       # duty hours (first start -> last end per day)
+    run_hrs = pd.Series(dtype=float)   # run hours (sum of each trip's own time)
     if not work.empty:
         work["_day_sort"] = work["_start_dt"].dt.strftime("%Y-%m-%d")
         work["_dkey"] = work["driver_name"].map(_normalize_driver_name)
@@ -1503,7 +1518,10 @@ def build_driver_daily_matrix(df: pd.DataFrame, all_driver_names=None) -> pd.Dat
         order = sorted(work["_day_sort"].unique())
         day_labels = [datetime.strptime(d, "%Y-%m-%d").strftime("%d/%m/%y") for d in order]
         km = work.pivot_table(index="_dkey", columns="_day", values="_km", aggfunc="sum")
-        hrs = work.groupby("_dkey")["_duration_hrs"].sum()
+        # Duty hours = first start -> last end per driver per day (gaps included)
+        _span = work.groupby(["_dkey", "_day_sort"]).agg(_s=("_start_dt", "min"), _e=("_end_dt", "max"))
+        hrs = ((_span["_e"] - _span["_s"]).dt.total_seconds() / 3600.0).groupby(level=0).sum()
+        run_hrs = work.groupby("_dkey")["_duration_hrs"].sum()
         for k, n in work.groupby("_dkey")["driver_name"].first().items():
             display.setdefault(k, fmt(n, "—"))
 
@@ -1517,8 +1535,10 @@ def build_driver_daily_matrix(df: pd.DataFrame, all_driver_names=None) -> pd.Dat
     n_days = max(len(day_labels), 1)
     out["Total KM"] = out[day_labels].sum(axis=1).round(1) if day_labels else 0.0
     out["Per Day Avg KM"] = (out["Total KM"] / n_days).round(1)
-    out["Total Hours"] = hrs.reindex(out.index).fillna(0).round(2)
-    out["Avg Hours / Day"] = (out["Total Hours"] / n_days).round(2)
+    out["Run Hours"] = run_hrs.reindex(out.index).fillna(0).round(2)
+    out["Duty Hours"] = hrs.reindex(out.index).fillna(0).round(2)
+    out["Avg Run Hrs / Day"] = (out["Run Hours"] / n_days).round(2)
+    out["Avg Duty Hrs / Day"] = (out["Duty Hours"] / n_days).round(2)
     out = out.sort_values("Driver Name").reset_index(drop=True)
 
     total_row = {"Driver Name": "GRAND TOTAL"}
@@ -1526,8 +1546,10 @@ def build_driver_daily_matrix(df: pd.DataFrame, all_driver_names=None) -> pd.Dat
         total_row[d] = round(float(out[d].sum()), 1)
     total_row["Total KM"] = round(float(out["Total KM"].sum()), 1)
     total_row["Per Day Avg KM"] = round(total_row["Total KM"] / n_days, 1)
-    total_row["Total Hours"] = round(float(out["Total Hours"].sum()), 2)
-    total_row["Avg Hours / Day"] = round(total_row["Total Hours"] / n_days, 2)
+    total_row["Run Hours"] = round(float(out["Run Hours"].sum()), 2)
+    total_row["Duty Hours"] = round(float(out["Duty Hours"].sum()), 2)
+    total_row["Avg Run Hrs / Day"] = round(total_row["Run Hours"] / n_days, 2)
+    total_row["Avg Duty Hrs / Day"] = round(total_row["Duty Hours"] / n_days, 2)
     return pd.concat([out, pd.DataFrame([total_row])], ignore_index=True)
 
 
@@ -4343,7 +4365,13 @@ elif user["role"] == "admin":
             st.markdown("##### 📌 Summary")
 
             total_km = float(duty_filtered["_km"].sum())
-            total_duration_hrs = float(duty_filtered["_duration_hrs"].sum())
+            run_hrs_total = float(duty_filtered["_duration_hrs"].sum())  # sum of trip run times
+            # Duty time = first start -> last end per driver per day (gaps included)
+            total_duration_hrs = float(
+                build_duty_summary(duty_filtered, "Driver + Date (daily)")["Total Duty Hours"].sum()
+            ) if not duty_filtered.empty else 0.0
+            run_h = int(run_hrs_total)
+            run_m = int(round((run_hrs_total - run_h) * 60))
             total_trips = int(len(duty_filtered))
             duration_h = int(total_duration_hrs)
             duration_m = int(round((total_duration_hrs - duration_h) * 60))
@@ -4366,11 +4394,13 @@ elif user["role"] == "admin":
             else:
                 active_vehicle_label = "—"
 
-            k1, k2, k3, k4 = st.columns(4)
+            k1, k2, k3, k4, k5 = st.columns(5)
             k1.metric("🛣️ Total Distance", f"{total_km:.1f} KM")
-            k2.metric("⏱️ Total Duty Duration", f"{duration_h}h {duration_m}m")
-            k3.metric("🚗 Total Trips", total_trips)
-            k4.metric("👨‍✈️ Active Driver / Vehicle", f"{active_driver_label} / {active_vehicle_label}")
+            k2.metric("⏱️ Total Duty Time", f"{duration_h}h {duration_m}m",
+                      help="First trip start to last trip end, per driver per day (gaps between trips included).")
+            k3.metric("🚙 Run Time (trips only)", f"{run_h}h {run_m}m")
+            k4.metric("🚗 Total Trips", total_trips)
+            k5.metric("👨‍✈️ Active Driver / Vehicle", f"{active_driver_label} / {active_vehicle_label}")
 
             # -------------------------------------------------------------
             # DUTY SUMMARY — trips, KM and duty hours, grouped as chosen in
@@ -4452,7 +4482,8 @@ elif user["role"] == "admin":
                 "Summary Grouped By": duty_group_option,
                 "Log Sorted By": duty_sort_option,
                 "Total Distance (KM)": f"{total_km:.1f}",
-                "Total Duty Duration": f"{duration_h}h {duration_m}m",
+                "Total Duty Time (first start to last end)": f"{duration_h}h {duration_m}m",
+                "Run Time (trips only)": f"{run_h}h {run_m}m",
                 "Total Trips": total_trips,
                 "Active Driver": active_driver_label,
                 "Assigned Vehicle": active_vehicle_label,
