@@ -542,17 +542,20 @@ def delete_requisition(request_id: str):
     _clear_requisition_caches()
 
 
+REQUISITION_COLUMNS = [
+    "id", "request_id", "created_at", "username", "applicant_name", "department", "mobile_number",
+    "date_of_travel", "time_of_travel", "destination", "passenger_count", "vehicle_type", "purpose",
+    "special_request", "status", "driver_name", "driver_contact", "vehicle_number", "approved_by",
+    "action_timestamp", "approved_time", "admin_note", "start_km", "end_km", "total_km",
+    "actual_exit_time", "actual_return_time", "driver_start_km", "driver_end_km", "driver_km_updated_at",
+]
+
+
 @st.cache_data(ttl=90, show_spinner=False)
 def fetch_all_requisitions() -> pd.DataFrame:
     sb = get_supabase_client()
     res = sb.table(REQUISITIONS_TABLE).select("*").order("created_at", desc=True).execute()
-    return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=[
-        "id", "request_id", "created_at", "username", "applicant_name", "department", "mobile_number",
-        "date_of_travel", "time_of_travel", "destination", "passenger_count", "vehicle_type", "purpose",
-        "special_request", "status", "driver_name", "driver_contact", "vehicle_number", "approved_by",
-        "action_timestamp", "approved_time", "admin_note", "start_km", "end_km", "total_km",
-        "actual_exit_time", "actual_return_time", "driver_start_km", "driver_end_km", "driver_km_updated_at",
-    ])
+    return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=REQUISITION_COLUMNS)
 
 
 @st.cache_data(ttl=90, show_spinner=False)
@@ -566,13 +569,7 @@ def fetch_requisitions_by_user(username: str) -> pd.DataFrame:
         .order("created_at", desc=True)
         .execute()
     )
-    return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=[
-        "id", "request_id", "created_at", "username", "applicant_name", "department", "mobile_number",
-        "date_of_travel", "time_of_travel", "destination", "passenger_count", "vehicle_type", "purpose",
-        "special_request", "status", "driver_name", "driver_contact", "vehicle_number", "approved_by",
-        "action_timestamp", "approved_time", "admin_note", "start_km", "end_km", "total_km",
-        "actual_exit_time", "actual_return_time", "driver_start_km", "driver_end_km", "driver_km_updated_at",
-    ])
+    return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=REQUISITION_COLUMNS)
 
 
 @st.cache_data(ttl=90, show_spinner=False)
@@ -588,13 +585,7 @@ def fetch_requisitions_by_status(status: str) -> pd.DataFrame:
         .order("created_at", desc=True)
         .execute()
     )
-    return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=[
-        "id", "request_id", "created_at", "username", "applicant_name", "department", "mobile_number",
-        "date_of_travel", "time_of_travel", "destination", "passenger_count", "vehicle_type", "purpose",
-        "special_request", "status", "driver_name", "driver_contact", "vehicle_number", "approved_by",
-        "action_timestamp", "approved_time", "admin_note", "start_km", "end_km", "total_km",
-        "actual_exit_time", "actual_return_time", "driver_start_km", "driver_end_km", "driver_km_updated_at",
-    ])
+    return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=REQUISITION_COLUMNS)
 
 
 # ------------------- DRIVER-SUBMITTED KM HELPERS (NEW) -------------------
@@ -634,15 +625,8 @@ def fetch_requisitions_by_driver(driver_name: str) -> pd.DataFrame:
         .order("created_at", desc=True)
         .execute()
     )
-    cols = [
-        "id", "request_id", "created_at", "username", "applicant_name", "department", "mobile_number",
-        "date_of_travel", "time_of_travel", "destination", "passenger_count", "vehicle_type", "purpose",
-        "special_request", "status", "driver_name", "driver_contact", "vehicle_number", "approved_by",
-        "action_timestamp", "approved_time", "admin_note", "start_km", "end_km", "total_km",
-        "actual_exit_time", "actual_return_time", "driver_start_km", "driver_end_km", "driver_km_updated_at",
-    ]
     if not res.data:
-        return pd.DataFrame(columns=cols)
+        return pd.DataFrame(columns=REQUISITION_COLUMNS)
     df = pd.DataFrame(res.data)
     target = _normalize_driver_name(driver_name)
     matched = df[df["driver_name"].map(_normalize_driver_name) == target]
@@ -1416,6 +1400,12 @@ def build_pdf_report(df: pd.DataFrame, filters_summary: str) -> bytes:
                     val = short_req_id(val)
                 row.cell(fmt(val, ""))
 
+    # Grand total of the Total KM column shown above.
+    grand_km = pd.to_numeric(df["total_km"], errors="coerce").sum() if ("total_km" in df.columns and not df.empty) else 0
+    pdf.ln(2)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(0, 8, f"Total KM: {grand_km:.1f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
     return bytes(pdf.output())
 
 
@@ -1430,7 +1420,7 @@ def build_pdf_report(df: pd.DataFrame, filters_summary: str) -> bytes:
 
 DUTY_TRACKER_DISPLAY_COLS = [
     "Vehicle No", "Driver Name", "Start Time", "End Time",
-    "Start KM", "End KM", "Total KM", "Duty Duration (Hrs)", "Route / Purpose",
+    "Start KM", "End KM", "Total KM", "Duty Duration (Hrs)", "Route / Purpose", "Admin Note",
 ]
 
 # Summary grouping choices offered in the Duty Tracker. "Driver + Date" is the
@@ -1493,6 +1483,54 @@ def build_duty_summary(df: pd.DataFrame, group_option: str) -> pd.DataFrame:
     return g[out_cols].reset_index(drop=True)
 
 
+def build_driver_daily_matrix(df: pd.DataFrame, all_driver_names=None) -> pd.DataFrame:
+    """Driver x Date matrix of Run KM, with Total KM, per-day average KM,
+    Total Hours and average hours per day (divided by the number of date
+    columns in the selected period). A GRAND TOTAL row is added at the end.
+    Drivers from the master list are included even with no trips (blank row),
+    like the sample sheet."""
+    fixed = ["Total KM", "Per Day Avg KM", "Total Hours", "Avg Hours / Day"]
+    work = df.copy() if df is not None else pd.DataFrame()
+    display = {}
+    for n in (all_driver_names or []):
+        display.setdefault(_normalize_driver_name(n), n)
+
+    day_labels, km, hrs = [], pd.DataFrame(), pd.Series(dtype=float)
+    if not work.empty:
+        work["_day_sort"] = work["_start_dt"].dt.strftime("%Y-%m-%d")
+        work["_dkey"] = work["driver_name"].map(_normalize_driver_name)
+        work["_day"] = work["_start_dt"].dt.strftime("%d/%m/%y")
+        order = sorted(work["_day_sort"].unique())
+        day_labels = [datetime.strptime(d, "%Y-%m-%d").strftime("%d/%m/%y") for d in order]
+        km = work.pivot_table(index="_dkey", columns="_day", values="_km", aggfunc="sum")
+        hrs = work.groupby("_dkey")["_duration_hrs"].sum()
+        for k, n in work.groupby("_dkey")["driver_name"].first().items():
+            display.setdefault(k, fmt(n, "—"))
+
+    if not display:
+        return pd.DataFrame(columns=["Driver Name"] + day_labels + fixed)
+
+    out = pd.DataFrame({"Driver Name": list(display.values())}, index=list(display.keys()))
+    for d in day_labels:
+        out[d] = km[d].reindex(out.index) if d in km.columns else float("nan")
+
+    n_days = max(len(day_labels), 1)
+    out["Total KM"] = out[day_labels].sum(axis=1).round(1) if day_labels else 0.0
+    out["Per Day Avg KM"] = (out["Total KM"] / n_days).round(1)
+    out["Total Hours"] = hrs.reindex(out.index).fillna(0).round(2)
+    out["Avg Hours / Day"] = (out["Total Hours"] / n_days).round(2)
+    out = out.sort_values("Driver Name").reset_index(drop=True)
+
+    total_row = {"Driver Name": "GRAND TOTAL"}
+    for d in day_labels:
+        total_row[d] = round(float(out[d].sum()), 1)
+    total_row["Total KM"] = round(float(out["Total KM"].sum()), 1)
+    total_row["Per Day Avg KM"] = round(total_row["Total KM"] / n_days, 1)
+    total_row["Total Hours"] = round(float(out["Total Hours"].sum()), 2)
+    total_row["Avg Hours / Day"] = round(total_row["Total Hours"] / n_days, 2)
+    return pd.concat([out, pd.DataFrame([total_row])], ignore_index=True)
+
+
 def sanitize_pdf_text(value) -> str:
     """Make any string safe to hand to FPDF's core 'Helvetica' font.
 
@@ -1534,13 +1572,28 @@ def sanitize_pdf_text(value) -> str:
     return text.encode("latin-1", "replace").decode("latin-1")
 
 
+def _autofit_columns(writer, sheets):
+    """Light auto-fit so columns aren't clipped in Excel — purely cosmetic.
+    `fillna("")` BEFORE `.astype(str)` matters on pandas >= 3.0: that version
+    stopped converting NaN/None to the literal string "nan" on astype(str),
+    leaving real NaN behind instead, which makes .str.len().max() return NaN
+    and int(NaN) raise. Filling blanks with "" first guarantees real integers."""
+    from openpyxl.utils import get_column_letter
+    for sheet_name, sheet_df in sheets:
+        ws = writer.sheets[sheet_name]
+        for i, col in enumerate(sheet_df.columns, start=1):
+            width = max(12, min(40, int(sheet_df[col].fillna("").astype(str).str.len().max() if not sheet_df.empty else 12) + 2))
+            ws.column_dimensions[get_column_letter(i)].width = width
+
+
 def build_duty_tracker_excel(detail_df: pd.DataFrame, summary_metrics: dict,
-                              driver_summary_df: pd.DataFrame = None) -> bytes:
+                              driver_summary_df: pd.DataFrame = None,
+                              matrix_df: pd.DataFrame = None) -> bytes:
     """Formatted .xlsx export for the Duty Tracker: a 'Summary' sheet with the
-    KPI cards' values, an optional 'Driver Summary' sheet (trips / KM / duty
-    hours per driver), plus a 'Duty Log' sheet with the full filtered detail
-    table (now including Start KM and End KM). `driver_summary_df` defaults
-    to None so any older caller keeps working unchanged.
+    KPI cards' values, an optional 'Duty Summary' sheet, an optional 'Driver
+    KM Matrix' sheet (driver x date Run KM), plus a 'Duty Log' sheet with the
+    full filtered detail table. The optional args default to None so any
+    older caller keeps working unchanged.
     """
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -1549,28 +1602,16 @@ def build_duty_tracker_excel(detail_df: pd.DataFrame, summary_metrics: dict,
         )
         summary_df.to_excel(writer, index=False, sheet_name="Summary")
         sheets = [("Summary", summary_df)]
+        if matrix_df is not None:
+            matrix_df.to_excel(writer, index=False, sheet_name="Driver KM Matrix")
+            sheets.append(("Driver KM Matrix", matrix_df))
         if driver_summary_df is not None:
             driver_summary_df.to_excel(writer, index=False, sheet_name="Duty Summary")
             sheets.append(("Duty Summary", driver_summary_df))
         detail_df.to_excel(writer, index=False, sheet_name="Duty Log")
         sheets.append(("Duty Log", detail_df))
 
-        # Light auto-fit so columns aren't clipped in Excel — purely cosmetic,
-        # safe to remove if you don't want the extra openpyxl dependency calls.
-        # `fillna("")` BEFORE `.astype(str)` matters on pandas >= 3.0: that
-        # version stopped converting NaN/None to the literal string "nan" on
-        # astype(str), leaving real NaN behind instead. A column that's
-        # partially or entirely blank (e.g. admin_note with no note yet)
-        # would then make .str.len().max() return NaN, and int(NaN) raises
-        # "ValueError: cannot convert float NaN to integer" — filling blanks
-        # with "" first guarantees every length is a real integer (0 for
-        # blank cells).
-        from openpyxl.utils import get_column_letter
-        for sheet_name, sheet_df in sheets:
-            ws = writer.sheets[sheet_name]
-            for i, col in enumerate(sheet_df.columns, start=1):
-                width = max(12, min(40, int(sheet_df[col].fillna("").astype(str).str.len().max() if not sheet_df.empty else 12) + 2))
-                ws.column_dimensions[get_column_letter(i)].width = width
+        _autofit_columns(writer, sheets)
 
     return buf.getvalue()
 
@@ -1601,12 +1642,13 @@ class DutyTrackerPDF(FPDF):
 
 
 def build_duty_tracker_pdf(detail_df: pd.DataFrame, summary_metrics: dict, filters_summary: str,
-                            driver_summary_df: pd.DataFrame = None) -> bytes:
-    """PDF containing the KPI summary table, an optional per-driver duty
-    summary (trips / KM / duty hours), followed by the detailed duty log.
-    `detail_df` must already have the DUTY_TRACKER_DISPLAY_COLS columns (see
-    the tab below for how it's built from the requisitions DataFrame).
-    `driver_summary_df` defaults to None so older callers keep working.
+                            driver_summary_df: pd.DataFrame = None,
+                            matrix_df: pd.DataFrame = None) -> bytes:
+    """PDF containing the KPI summary table, an optional duty summary, an
+    optional Driver-wise Daily Run KM matrix, followed by the detailed duty
+    log and its Total KM. `detail_df` must already have the
+    DUTY_TRACKER_DISPLAY_COLS columns. The optional args default to None so
+    older callers keep working.
 
     Every string written to the PDF is passed through sanitize_pdf_text()
     first — see that function's docstring for why this is necessary with
@@ -1654,15 +1696,37 @@ def build_duty_tracker_pdf(detail_df: pd.DataFrame, summary_metrics: dict, filte
                     drow.cell(sanitize_pdf_text(fmt(dr.get(col, ""), "")))
         pdf.ln(6)
 
+    # ---- Driver-wise Daily Run KM matrix (with Total KM) ----
+    if matrix_df is not None and not matrix_df.empty:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(0, 8, "Driver-wise Daily Run KM & Duty Hours", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(1)
+        mcols = list(matrix_df.columns)
+        first_w = 38
+        rest_w = round((277 - first_w) / max(len(mcols) - 1, 1), 1)
+        pdf.set_font("Helvetica", size=8 if len(mcols) <= 12 else 6)
+        mstyle = FontFace(emphasis="BOLD", color=(255, 255, 255), fill_color=(15, 98, 254))
+        with pdf.table(col_widths=[first_w] + [rest_w] * (len(mcols) - 1), text_align="LEFT",
+                       first_row_as_headings=True, line_height=6, headings_style=mstyle,
+                       cell_fill_color=(245, 245, 245), cell_fill_mode="ROWS") as mt:
+            hr = mt.row()
+            for h in mcols:
+                hr.cell(sanitize_pdf_text(h))
+            for _, mr in matrix_df.iterrows():
+                mrow = mt.row()
+                for c in mcols:
+                    mrow.cell(sanitize_pdf_text(fmt(mr.get(c, ""), "")))
+        pdf.ln(6)
+
     # ---- Detailed duty log table ----
     pdf.set_font("Helvetica", "B", 11)
     pdf.cell(0, 8, "Detailed Duty Log", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(1)
 
     headers = DUTY_TRACKER_DISPLAY_COLS
-    # 9 columns: Vehicle, Driver, Start Time, End Time, Start KM, End KM,
-    # Total KM, Duty Hrs, Route/Purpose — sums to 277mm, fits A4 landscape.
-    col_widths = [30, 28, 32, 32, 16, 16, 16, 22, 85]
+    # 10 columns: Vehicle, Driver, Start Time, End Time, Start KM, End KM,
+    # Total KM, Duty Hrs, Route/Purpose, Admin Note — sums to 277mm, fits A4 landscape.
+    col_widths = [26, 26, 28, 28, 14, 14, 14, 18, 55, 54]
 
     pdf.set_font("Helvetica", size=7)
     heading_style = FontFace(emphasis="BOLD", color=(255, 255, 255), fill_color=(15, 98, 254))
@@ -1676,6 +1740,11 @@ def build_duty_tracker_pdf(detail_df: pd.DataFrame, summary_metrics: dict, filte
             row = table.row()
             for col in headers:
                 row.cell(sanitize_pdf_text(fmt(r.get(col, ""), "")))
+
+    total_km_val = pd.to_numeric(detail_df.get("Total KM"), errors="coerce").sum() if not detail_df.empty else 0
+    pdf.ln(2)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(0, 8, f"Total KM (all rows above): {total_km_val:.1f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     return bytes(pdf.output())
 
@@ -1710,21 +1779,7 @@ def build_management_excel(kpis: dict, dept_df: pd.DataFrame, detail_df: pd.Data
         detail_df.to_excel(writer, index=False, sheet_name="Detailed Data")
         sheets.append(("Detailed Data", detail_df))
 
-        # `fillna("")` BEFORE `.astype(str)` matters on pandas >= 3.0: that
-        # version stopped converting NaN/None to the literal string "nan" on
-        # astype(str), leaving real NaN behind instead. A column that's
-        # partially or entirely blank (e.g. admin_note, or numeric fields
-        # like total_km before any trip is Completed) would then make
-        # .str.len().max() return NaN, and int(NaN) raises
-        # "ValueError: cannot convert float NaN to integer" — exactly the
-        # error this fixes. Filling blanks with "" first guarantees every
-        # length is a real integer (0 for blank cells).
-        from openpyxl.utils import get_column_letter
-        for sheet_name, sheet_df in sheets:
-            ws = writer.sheets[sheet_name]
-            for i, col in enumerate(sheet_df.columns, start=1):
-                width = max(12, min(40, int(sheet_df[col].fillna("").astype(str).str.len().max() if not sheet_df.empty else 12) + 2))
-                ws.column_dimensions[get_column_letter(i)].width = width
+        _autofit_columns(writer, sheets)
 
     return buf.getvalue()
 
@@ -2178,8 +2233,8 @@ st.sidebar.markdown("---")
 st.sidebar.markdown(f"**{user['full_name']}**")
 st.sidebar.caption(f"Role: {ROLE_DISPLAY.get(user['role'], user['role'].capitalize())}")
 
-auto_refresh_on = st.sidebar.checkbox("🔄 Auto-refresh every 60s", value=True,
-                                       help="Automatically reloads live data across the app. "
+auto_refresh_on = st.sidebar.checkbox("🔄 Auto-refresh every 90s", value=True,
+                                       help="Automatically reloads live data across the app every 90 seconds. "
                                             "Turn off temporarily if you're filling out a long form, "
                                             "or use '🔄 Refresh Now' any time for an on-demand update.")
 if st.sidebar.button("🔄 Refresh Now", use_container_width=True):
@@ -2194,17 +2249,14 @@ logout_button()
 # Everyone can still hit "🔄 Refresh Now" above for an on-demand update, and
 # every write already clears the relevant cache so approvals/gate actions
 # show up instantly regardless of this setting.
-# Interval set to 60s, with the checkbox still OFF by default (see above) —
-# so idle screens don't rerun in the background unless someone explicitly
-# turns this on, but when they do, it checks for updates every 60s rather
-# than every 120s.
-# Every write path still calls its matching _clear_*_caches() immediately,
-# so approvals/gate actions/driver KM entries still show up instantly for
-# the person who made the change; this setting only controls how often
-# *other* idle screens passively refresh to see someone else's changes.
+# Interval is 90s (matching the read-cache TTL of 90s). Every write path
+# still calls its matching _clear_*_caches() immediately, so approvals/gate
+# actions/driver KM entries show up instantly for the person who made the
+# change; this setting only controls how often *other* idle screens passively
+# refresh to see someone else's changes.
 NO_AUTOREFRESH_ROLES = {"gate_officer"}
 if auto_refresh_on and user["role"] not in NO_AUTOREFRESH_ROLES:
-    st_autorefresh(interval=60_000, key="global_autorefresh")
+    st_autorefresh(interval=90_000, key="global_autorefresh")
 
 # =========================================================
 # 8. EMPLOYEE DASHBOARD
@@ -3566,6 +3618,10 @@ elif user["role"] == "admin":
                 filtered_display["time_of_travel"] = filtered_display["time_of_travel"].apply(
                     lambda v: fmt_time_12h(v, v)
                 )
+            # Total KM for the table AND the PDF: driver-first (falls back to
+            # Gate Officer's readings), so driver-only trips don't show blank.
+            if not filtered.empty:
+                filtered_display["total_km"] = filtered.apply(lambda row: effective_km_fields(row)[2], axis=1)
             st.dataframe(filtered_display, use_container_width=True, hide_index=True, height=340)
 
             filters_summary = (
@@ -4333,9 +4389,28 @@ elif user["role"] == "admin":
                              height=min(380, 45 + 35 * len(driver_summary_df)))
 
             # -------------------------------------------------------------
+            # DRIVER-WISE DAILY RUN KM — driver x date matrix with Total KM,
+            # per-day average, total hours and average hours per day.
+            # -------------------------------------------------------------
+            matrix_names = (
+                duty_drivers_df["driver_name"].tolist()
+                if duty_driver_filter == "All Drivers" and not duty_drivers_df.empty else []
+            )
+            matrix_df = build_driver_daily_matrix(duty_filtered, matrix_names)
+
+            st.markdown("---")
+            st.markdown("##### 🗓️ Driver-wise Daily Run KM")
+            if matrix_df.empty:
+                st.info("No data for the selected range.")
+            else:
+                st.dataframe(matrix_df, use_container_width=True, hide_index=True,
+                             height=min(420, 45 + 35 * len(matrix_df)))
+
+            # -------------------------------------------------------------
             # STEP 5 — Detailed table:
             # [Vehicle No, Driver Name, Start Time, End Time, Start KM,
-            #  End KM, Total KM, Duty Duration (Hours), Route / Purpose]
+            #  End KM, Total KM, Duty Duration (Hours), Route / Purpose,
+            #  Admin Note]
             # -------------------------------------------------------------
             st.markdown("---")
             st.markdown("##### 📋 Detailed Duty Log")
@@ -4355,6 +4430,10 @@ elif user["role"] == "admin":
                     "Duty Duration (Hrs)": duty_filtered["_duration_hrs"],
                     "Route / Purpose": duty_filtered["destination"].fillna("").astype(str)
                                         + " — " + duty_filtered["purpose"].fillna("").astype(str),
+                    "Admin Note": (
+                        duty_filtered["admin_note"].fillna("").astype(str)
+                        if "admin_note" in duty_filtered.columns else ""
+                    ),
                 }).reset_index(drop=True)
                 st.dataframe(detail_display, use_container_width=True, hide_index=True, height=340)
 
@@ -4394,14 +4473,14 @@ elif user["role"] == "admin":
                     mime="text/csv", use_container_width=True,
                 )
             with e2:
-                duty_excel_bytes = build_duty_tracker_excel(detail_display, summary_metrics, driver_summary_df)
+                duty_excel_bytes = build_duty_tracker_excel(detail_display, summary_metrics, driver_summary_df, matrix_df)
                 st.download_button(
                     "⬇️ Download Excel (.xlsx)", data=duty_excel_bytes, file_name="duty_tracker_report.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
             with e3:
-                duty_pdf_bytes = build_duty_tracker_pdf(detail_display, summary_metrics, filters_summary_text, driver_summary_df)
+                duty_pdf_bytes = build_duty_tracker_pdf(detail_display, summary_metrics, filters_summary_text, driver_summary_df, matrix_df)
                 st.download_button(
                     "⬇️ Download PDF (.pdf)", data=duty_pdf_bytes, file_name="duty_tracker_report.pdf",
                     mime="application/pdf", use_container_width=True,
