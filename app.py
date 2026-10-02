@@ -1494,63 +1494,133 @@ def build_duty_summary(df: pd.DataFrame, group_option: str) -> pd.DataFrame:
     return g[out_cols].reset_index(drop=True)
 
 
+MATRIX_METRICS = ["TWH", "SWH", "Km"]
+MATRIX_SUMMARY_TOPS = ("Total", "Average")
+
+
 def build_driver_daily_matrix(df: pd.DataFrame, all_driver_names=None) -> pd.DataFrame:
-    """Driver x Date matrix of Run KM, with Total KM, per-day average KM,
-    Run Hours (sum of trip times) and Duty Hours (first start -> last end per
-    day, gaps included) plus the average of each per day (divided by the
-    number of date columns in the selected period). A GRAND TOTAL row is added at the end.
-    Drivers from the master list are included even with no trips (blank row),
-    like the sample sheet."""
-    fixed = ["Total KM", "Per Day Avg KM", "Run Hours", "Duty Hours",
-             "Avg Run Hrs / Day", "Avg Duty Hrs / Day"]
+    """Driver x Date table in the sheet format: for every date three columns
+    TWH | SWH | Km, then a 'Total' block and an 'Average' block (per-day
+    average = total / number of date columns), and a GRAND TOTAL row.
+
+      TWH = Total Working Hours = DUTY time (first trip start -> last trip end
+            that day, gaps between trips included).
+      SWH = trip running hours (sum of each trip's own Start -> End time).
+      Km  = distance run that day (driver KM first, gate KM as fallback).
+
+    Returns a DataFrame with a 2-level column index (date label, metric) and
+    the driver name as the index. Drivers from the master list are included
+    even with no trips (blank row). Date = the day the trip STARTED."""
     work = df.copy() if df is not None else pd.DataFrame()
     display = {}
     for n in (all_driver_names or []):
         display.setdefault(_normalize_driver_name(n), n)
 
-    day_labels, km = [], pd.DataFrame()
-    hrs = pd.Series(dtype=float)       # duty hours (first start -> last end per day)
-    run_hrs = pd.Series(dtype=float)   # run hours (sum of each trip's own time)
+    days, g = [], pd.DataFrame()
     if not work.empty:
-        work["_day_sort"] = work["_start_dt"].dt.strftime("%Y-%m-%d")
         work["_dkey"] = work["driver_name"].map(_normalize_driver_name)
-        work["_day"] = work["_start_dt"].dt.strftime("%d/%m/%y")
-        order = sorted(work["_day_sort"].unique())
-        day_labels = [datetime.strptime(d, "%Y-%m-%d").strftime("%d/%m/%y") for d in order]
-        km = work.pivot_table(index="_dkey", columns="_day", values="_km", aggfunc="sum")
-        # Duty hours = first start -> last end per driver per day (gaps included)
-        _span = work.groupby(["_dkey", "_day_sort"]).agg(_s=("_start_dt", "min"), _e=("_end_dt", "max"))
-        hrs = ((_span["_e"] - _span["_s"]).dt.total_seconds() / 3600.0).groupby(level=0).sum()
-        run_hrs = work.groupby("_dkey")["_duration_hrs"].sum()
+        work["_day_sort"] = work["_start_dt"].dt.strftime("%Y-%m-%d")
+        g = work.groupby(["_dkey", "_day_sort"]).agg(
+            _s=("_start_dt", "min"), _e=("_end_dt", "max"),
+            swh=("_duration_hrs", "sum"), km=("_km", "sum"),
+        ).reset_index()
+        g["twh"] = (g["_e"] - g["_s"]).dt.total_seconds() / 3600.0
+        days = sorted(g["_day_sort"].unique())
         for k, n in work.groupby("_dkey")["driver_name"].first().items():
             display.setdefault(k, fmt(n, "—"))
 
     if not display:
-        return pd.DataFrame(columns=["Driver Name"] + day_labels + fixed)
+        return pd.DataFrame()
 
-    out = pd.DataFrame({"Driver Name": list(display.values())}, index=list(display.keys()))
-    for d in day_labels:
-        out[d] = km[d].reindex(out.index) if d in km.columns else float("nan")
+    keys = list(display.keys())
+    n_days = max(len(days), 1)
+    cols = {}
+    for d in days:
+        label = datetime.strptime(d, "%Y-%m-%d").strftime("%d/%m/%y")
+        sub = g[g["_day_sort"] == d].set_index("_dkey")
+        cols[(label, "TWH")] = sub["twh"].reindex(keys).round(1)
+        cols[(label, "SWH")] = sub["swh"].reindex(keys).round(1)
+        cols[(label, "Km")] = sub["km"].reindex(keys).round(1)
 
-    n_days = max(len(day_labels), 1)
-    out["Total KM"] = out[day_labels].sum(axis=1).round(1) if day_labels else 0.0
-    out["Per Day Avg KM"] = (out["Total KM"] / n_days).round(1)
-    out["Run Hours"] = run_hrs.reindex(out.index).fillna(0).round(2)
-    out["Duty Hours"] = hrs.reindex(out.index).fillna(0).round(2)
-    out["Avg Run Hrs / Day"] = (out["Run Hours"] / n_days).round(2)
-    out["Avg Duty Hrs / Day"] = (out["Duty Hours"] / n_days).round(2)
-    out = out.sort_values("Driver Name").reset_index(drop=True)
+    if not g.empty:
+        tot = g.groupby("_dkey")[["twh", "swh", "km"]].sum().reindex(keys).fillna(0.0)
+    else:
+        tot = pd.DataFrame(0.0, index=keys, columns=["twh", "swh", "km"])
+    for m, c in zip(MATRIX_METRICS, ["twh", "swh", "km"]):
+        cols[("Total", m)] = tot[c].round(1)
+    for m, c in zip(MATRIX_METRICS, ["twh", "swh", "km"]):
+        cols[("Average", m)] = (tot[c] / n_days).round(1)
 
-    total_row = {"Driver Name": "GRAND TOTAL"}
-    for d in day_labels:
-        total_row[d] = round(float(out[d].sum()), 1)
-    total_row["Total KM"] = round(float(out["Total KM"].sum()), 1)
-    total_row["Per Day Avg KM"] = round(total_row["Total KM"] / n_days, 1)
-    total_row["Run Hours"] = round(float(out["Run Hours"].sum()), 2)
-    total_row["Duty Hours"] = round(float(out["Duty Hours"].sum()), 2)
-    total_row["Avg Run Hrs / Day"] = round(total_row["Run Hours"] / n_days, 2)
-    total_row["Avg Duty Hrs / Day"] = round(total_row["Duty Hours"] / n_days, 2)
-    return pd.concat([out, pd.DataFrame([total_row])], ignore_index=True)
+    out = pd.DataFrame(cols, index=keys)
+    out.columns = pd.MultiIndex.from_tuples(list(cols.keys()))
+    out.index = [display[k] for k in keys]
+    out = out.sort_index(key=lambda ix: ix.str.lower())
+    out.index.name = "Driver Name"
+    grand = out.sum(min_count=1).round(1)  # sums are linear, so Average column sums stay correct
+    out.loc["GRAND TOTAL"] = grand
+    return out
+
+
+def _matrix_blocks(matrix_df: pd.DataFrame, dates_per_block: int = 6):
+    """Split the matrix's top-level labels into PDF-friendly blocks: groups of
+    `dates_per_block` dates, then one block with Total + Average."""
+    tops = list(dict.fromkeys(matrix_df.columns.get_level_values(0)))
+    date_tops = [t for t in tops if t not in MATRIX_SUMMARY_TOPS]
+    blocks = [date_tops[i:i + dates_per_block] for i in range(0, len(date_tops), dates_per_block)]
+    summary = [t for t in tops if t in MATRIX_SUMMARY_TOPS]
+    if summary:
+        blocks.append(summary)
+    return blocks
+
+
+def _matrix_num(v) -> str:
+    """Blank for missing, '187' for whole numbers, '9.9' otherwise."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    v = float(v)
+    return str(int(v)) if v == int(v) else f"{v:.1f}"
+
+
+def _write_matrix_sheet(wb, matrix_df: pd.DataFrame, position: int = 1):
+    """Writes the Driver KM Matrix sheet by hand so it looks like the sheet
+    format: merged date headers over TWH | SWH | Km, borders, centered cells,
+    bold GRAND TOTAL row."""
+    from openpyxl.styles import Alignment, Border, Side, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    ws = wb.create_sheet("Driver KM Matrix", position)
+    thin = Side(style="thin")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+    head_fill = PatternFill("solid", fgColor="D9D9D9")
+
+    cols = list(matrix_df.columns)
+    ws.cell(1, 1, "Driver Name")
+    ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
+    for j, (top, metric) in enumerate(cols, start=2):
+        ws.cell(2, j, metric)
+        if metric == MATRIX_METRICS[0]:
+            ws.cell(1, j, top)
+            ws.merge_cells(start_row=1, start_column=j, end_row=1, end_column=j + len(MATRIX_METRICS) - 1)
+    for ri, (name, row) in enumerate(matrix_df.iterrows(), start=3):
+        ws.cell(ri, 1, name)
+        for j, v in enumerate(row.tolist(), start=2):
+            ws.cell(ri, j, None if pd.isna(v) else float(v))
+
+    last_row, last_col = 2 + len(matrix_df), 1 + len(cols)
+    for r in range(1, last_row + 1):
+        for c in range(1, last_col + 1):
+            cell = ws.cell(r, c)
+            cell.border = border
+            cell.alignment = center
+            if r <= 2:
+                cell.fill = head_fill
+                cell.font = Font(bold=True)
+            elif r == last_row:
+                cell.font = Font(bold=True)
+    ws.column_dimensions["A"].width = 18
+    for c in range(2, last_col + 1):
+        ws.column_dimensions[get_column_letter(c)].width = 8
+    ws.freeze_panes = "B3"
 
 
 def sanitize_pdf_text(value) -> str:
@@ -1624,9 +1694,6 @@ def build_duty_tracker_excel(detail_df: pd.DataFrame, summary_metrics: dict,
         )
         summary_df.to_excel(writer, index=False, sheet_name="Summary")
         sheets = [("Summary", summary_df)]
-        if matrix_df is not None:
-            matrix_df.to_excel(writer, index=False, sheet_name="Driver KM Matrix")
-            sheets.append(("Driver KM Matrix", matrix_df))
         if driver_summary_df is not None:
             driver_summary_df.to_excel(writer, index=False, sheet_name="Duty Summary")
             sheets.append(("Duty Summary", driver_summary_df))
@@ -1634,6 +1701,10 @@ def build_duty_tracker_excel(detail_df: pd.DataFrame, summary_metrics: dict,
         sheets.append(("Duty Log", detail_df))
 
         _autofit_columns(writer, sheets)
+
+        # Driver x Date matrix (TWH | SWH | Km) written last, then placed as the 2nd sheet.
+        if matrix_df is not None and not matrix_df.empty:
+            _write_matrix_sheet(writer.book, matrix_df, position=1)
 
     return buf.getvalue()
 
@@ -1718,27 +1789,43 @@ def build_duty_tracker_pdf(detail_df: pd.DataFrame, summary_metrics: dict, filte
                     drow.cell(sanitize_pdf_text(fmt(dr.get(col, ""), "")))
         pdf.ln(6)
 
-    # ---- Driver-wise Daily Run KM matrix (with Total KM) ----
+    # ---- Driver-wise Daily Duty & Run KM (TWH | SWH | Km per date) ----
     if matrix_df is not None and not matrix_df.empty:
         pdf.set_font("Helvetica", "B", 11)
-        pdf.cell(0, 8, "Driver-wise Daily Run KM & Duty Hours", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(0, 8, "Driver-wise Daily Duty Hours & Run KM", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.cell(0, 5, "TWH = total working (duty) hours, first start to last end  |  "
+                       "SWH = trip running hours  |  Km = distance run",
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.ln(1)
-        mcols = list(matrix_df.columns)
-        first_w = 38
-        rest_w = round((277 - first_w) / max(len(mcols) - 1, 1), 1)
-        pdf.set_font("Helvetica", size=8 if len(mcols) <= 12 else 6)
-        mstyle = FontFace(emphasis="BOLD", color=(255, 255, 255), fill_color=(15, 98, 254))
-        with pdf.table(col_widths=[first_w] + [rest_w] * (len(mcols) - 1), text_align="LEFT",
-                       first_row_as_headings=True, line_height=6, headings_style=mstyle,
-                       cell_fill_color=(245, 245, 245), cell_fill_mode="ROWS") as mt:
-            hr = mt.row()
-            for h in mcols:
-                hr.cell(sanitize_pdf_text(h))
-            for _, mr in matrix_df.iterrows():
-                mrow = mt.row()
-                for c in mcols:
-                    mrow.cell(sanitize_pdf_text(fmt(mr.get(c, ""), "")))
-        pdf.ln(6)
+        hstyle = FontFace(emphasis="BOLD", color=(255, 255, 255), fill_color=(15, 98, 254))
+        bold = FontFace(emphasis="BOLD")
+        first_w = 34
+        for tops in _matrix_blocks(matrix_df):
+            ncols = len(tops) * len(MATRIX_METRICS)
+            w = min(round((277 - first_w) / ncols, 2), 18)
+            pdf.set_font("Helvetica", size=8)
+            with pdf.table(col_widths=[first_w] + [w] * ncols, text_align="CENTER",
+                           first_row_as_headings=False, line_height=6,
+                           cell_fill_color=(245, 245, 245), cell_fill_mode="ROWS") as mt:
+                r1 = mt.row()
+                r1.cell("", style=hstyle)
+                for t in tops:
+                    r1.cell(sanitize_pdf_text(t), colspan=len(MATRIX_METRICS), style=hstyle)
+                r2 = mt.row()
+                r2.cell("Driver Name", style=hstyle)
+                for _ in tops:
+                    for m in MATRIX_METRICS:
+                        r2.cell(m, style=hstyle)
+                for name, mr in matrix_df.iterrows():
+                    is_total = (name == "GRAND TOTAL")
+                    mrow = mt.row()
+                    mrow.cell(sanitize_pdf_text(name), style=bold if is_total else None)
+                    for t in tops:
+                        for m in MATRIX_METRICS:
+                            mrow.cell(_matrix_num(mr[(t, m)]), style=bold if is_total else None)
+            pdf.ln(4)
+        pdf.ln(2)
 
     # ---- Detailed duty log table ----
     pdf.set_font("Helvetica", "B", 11)
@@ -4443,11 +4530,16 @@ elif user["role"] == "admin":
             matrix_df = build_driver_daily_matrix(duty_filtered, matrix_names)
 
             st.markdown("---")
-            st.markdown("##### 🗓️ Driver-wise Daily Run KM")
+            st.markdown("##### 🗓️ Driver-wise Daily Duty & Run KM (TWH | SWH | Km)")
+            st.caption(
+                "**TWH** = total working (duty) hours, first trip start → last trip end that day  |  "
+                "**SWH** = trip running hours  |  **Km** = distance run. "
+                "Average = total ÷ number of date columns. Date = the day the trip started."
+            )
             if matrix_df.empty:
                 st.info("No data for the selected range.")
             else:
-                st.dataframe(matrix_df, use_container_width=True, hide_index=True,
+                st.dataframe(matrix_df, use_container_width=True,
                              height=min(420, 45 + 35 * len(matrix_df)))
 
             # -------------------------------------------------------------
