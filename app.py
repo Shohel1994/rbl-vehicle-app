@@ -2280,14 +2280,28 @@ NO_AUTOREFRESH_ROLES = {"gate_officer"}
 if auto_refresh_on and user["role"] not in NO_AUTOREFRESH_ROLES:
     st_autorefresh(interval=90_000, key="global_autorefresh")
 
+
+def section_nav(key: str, labels: list):
+    """Drop-in replacement for st.tabs() that REMEMBERS the selected section.
+    st.tabs() always jumps back to the first tab whenever the script reruns
+    (auto-refresh, st.rerun(), cache refresh). This uses a keyed st.radio, so
+    the choice lives in st.session_state and survives every rerun. It returns
+    one True/False per label, so the old `with tab_x:` blocks only needed to
+    become `if tab_x:`. Bonus: only the selected section's code runs on each
+    rerun (st.tabs ran ALL tabs every time), so the app is also faster."""
+    if st.session_state.get(key) not in labels:
+        st.session_state[key] = labels[0]
+    choice = st.radio("Section", labels, horizontal=True, key=key, label_visibility="collapsed")
+    return tuple(choice == l for l in labels)
+
 # =========================================================
 # 8. EMPLOYEE DASHBOARD
 # =========================================================
 if user["role"] == "user":
     company_header("👤 Employee Dashboard")
-    tab1, tab2 = st.tabs(["📋 New Requisition", "📍 My Requests / Live Status"])
+    tab1, tab2 = section_nav("emp_section", ["📋 New Requisition", "📍 My Requests / Live Status"])
 
-    with tab1:
+    if tab1:
         st.subheader("Submit a New Vehicle Requisition")
         st.caption(
             "👤 Applicant Name, Department, and Mobile Number are auto-filled from your "
@@ -2362,7 +2376,7 @@ if user["role"] == "user":
                     except Exception as e:
                         st.error(f"❌ Failed to save requisition: {e}")
 
-    with tab2:
+    if tab2:
         st.subheader("My Requests — Live Status")
         with st.spinner("Loading your requests..."):
             my_df = fetch_requisitions_by_user(user["username"])
@@ -2419,10 +2433,10 @@ elif user["role"] == "gate_officer":
     company_header("🛡️ Gate Officer Dashboard — Vehicle Gate Panel")
     st.caption(f"Logged in as {user['full_name']} — Gate Officer")
 
-    tab_out, tab_in = st.tabs(["🚦 Ready to Depart (Approved Trips)", "🔁 Currently On Trip (Inbound Vehicles)"])
+    tab_out, tab_in = section_nav("gate_section", ["🚦 Ready to Depart (Approved Trips)", "🔁 Currently On Trip (Inbound Vehicles)"])
 
     # ---------------- TAB 1: Ready to Depart ----------------
-    with tab_out:
+    if tab_out:
         st.subheader("Approved Trips Awaiting Gate Out")
         with st.spinner("Loading approved trips..."):
             ready_df = fetch_requisitions_by_status("Approved")
@@ -2463,7 +2477,7 @@ elif user["role"] == "gate_officer":
                             st.error(f"❌ Failed to record Gate Out: {e}")
 
     # ---------------- TAB 2: Currently On Trip ----------------
-    with tab_in:
+    if tab_in:
         st.subheader("Vehicles Currently Outside the Gate")
         with st.spinner("Loading active trips..."):
             ontrip_df = fetch_requisitions_by_status("On Trip")
@@ -2526,13 +2540,13 @@ elif user["role"] == "driver":
         "ask an Admin to check the name spelling in **Manage Drivers & Vehicles**."
     )
 
-    tab_depart, tab_return = st.tabs(["🚦 Start Trip (Approved)", "🏁 End Trip (Return)"])
+    tab_depart, tab_return = section_nav("driver_section", ["🚦 Start Trip (Approved)", "🏁 End Trip (Return)"])
 
     with st.spinner("Loading your assigned trips..."):
         my_trips = fetch_requisitions_by_driver(user["full_name"])
 
     # ---------------- TAB 1: Start Trip (Start KM only) ----------------
-    with tab_depart:
+    if tab_depart:
         st.subheader("Approved Trips Awaiting Your Start KM")
         start_trips = my_trips[my_trips["status"] == "Approved"] if not my_trips.empty else my_trips
 
@@ -2583,7 +2597,7 @@ elif user["role"] == "driver":
                             st.error(f"❌ Failed to record Start KM: {e}")
 
     # ---------------- TAB 2: End Trip (End KM only) ----------------
-    with tab_return:
+    if tab_return:
         st.subheader("Trips Currently On the Road")
 
         def _needs_end(row):
@@ -2692,11 +2706,11 @@ elif user["role"] == "nurse":
     company_header("🚨 Medical Emergency Vehicle Request")
     st.caption(f"Logged in as {user['full_name']} — {user.get('designation') or 'Nurse'}")
 
-    tab_emergency, tab_my_emergency_requests = st.tabs(
+    tab_emergency, tab_my_emergency_requests = section_nav("nurse_section", 
         ["🚨 Emergency Request", "📍 My Requests / Live Status"]
     )
 
-    with tab_emergency:
+    if tab_emergency:
         st.markdown("### 🚑 Need a vehicle right now to carry a patient?")
         st.write(
             "Tap the button below to submit an emergency vehicle request immediately — "
@@ -2749,7 +2763,7 @@ elif user["role"] == "nurse":
                 except Exception as e:
                     st.error(f"❌ Failed to send emergency request: {e}")
 
-    with tab_my_emergency_requests:
+    if tab_my_emergency_requests:
         st.subheader("My Requests — Live Status")
         with st.spinner("Loading your requests..."):
             my_df = fetch_requisitions_by_user(user["username"])
@@ -2808,7 +2822,7 @@ elif user["role"] == "admin":
     # list — each variable below is named for what it holds, not its position,
     # so the underlying tab bodies didn't need to be reshuffled in the file.
     tab_pending_req, tab_create_req, tab_shuttle, tab_users, tab_pending_users, tab_analytics, tab_export, \
-        tab_edit_trip, tab_fleet, tab_duty, tab_variance, tab_management = st.tabs([
+        tab_edit_trip, tab_fleet, tab_duty, tab_variance, tab_management = section_nav("admin_section", [
             "🚗 Pending Requests", "➕ Create Requisition", "🚌 Staff Shuttle", "👥 User List", "⏳ ID Requests",
             "📊 Analytics", "📁 All Requisitions & Export", "✏️ Edit / Delete Trip",
             "🚘 Manage Drivers & Vehicles",
@@ -2825,7 +2839,7 @@ elif user["role"] == "admin":
         df_all = fetch_all_requisitions()
 
     # ---------------- Pending Requests (was Tab 3) ----------------
-    with tab_pending_req:
+    if tab_pending_req:
         st.subheader("Requisitions Awaiting Action")
         pending_df = df_all[df_all["status"] == "Pending"] if not df_all.empty else df_all
 
@@ -3031,7 +3045,7 @@ elif user["role"] == "admin":
                                 st.error(f"❌ Update failed: {e}")
 
     # ---------------- Create Requisition (Admin) — NEW ----------------
-    with tab_create_req:
+    if tab_create_req:
         st.subheader("➕ Create a Requisition Directly (Admin)")
         st.caption(
             "Use this when you need to arrange a vehicle for someone yourself — a walk-in request, "
@@ -3166,7 +3180,7 @@ elif user["role"] == "admin":
                         st.error(f"❌ Failed to save requisition: {e}")
 
     # ---------------- Staff Shuttle (Recurring Routes) — NEW ----------------
-    with tab_shuttle:
+    if tab_shuttle:
         st.subheader("🚌 Staff Shuttle — Quick Submit")
         st.caption(
             "For fixed, recurring HIACE routes (e.g. the morning staff pickup, the evening "
@@ -3436,7 +3450,7 @@ elif user["role"] == "admin":
                         st.error(f"❌ Failed to delete template: {e}")
 
     # ---------------- User List (was Tab 2) ----------------
-    with tab_users:
+    if tab_users:
         st.subheader("All User Accounts")
         if users_df.empty:
             st.info("No users yet.")
@@ -3515,7 +3529,7 @@ elif user["role"] == "admin":
                             st.error(f"❌ Failed to delete user: {e}")
 
     # ---------------- ID Requests (was Tab 1) ----------------
-    with tab_pending_users:
+    if tab_pending_users:
         st.subheader("New Account Requests")
         pending_users = users_df[users_df["status"] == "Pending"] if not users_df.empty else users_df
 
@@ -3550,7 +3564,7 @@ elif user["role"] == "admin":
                         st.rerun()
 
     # ---------------- Analytics (was Tab 4) ----------------
-    with tab_analytics:
+    if tab_analytics:
         st.subheader("📊 Visual Analytics")
         if df_all.empty:
             st.info("No data yet.")
@@ -3604,7 +3618,7 @@ elif user["role"] == "admin":
                 st.plotly_chart(fig3, use_container_width=True, key="analytics_monthly_trend")
 
     # ---------------- All Requisitions & Export (was Tab 5) ----------------
-    with tab_export:
+    if tab_export:
         st.subheader("📁 All Requisitions — Search, Filter & Export")
         if df_all.empty:
             st.info("No data yet.")
@@ -3667,7 +3681,7 @@ elif user["role"] == "admin":
                                     use_container_width=True)
 
     # ---------------- Edit / Delete Trip (NEW) ----------------
-    with tab_edit_trip:
+    if tab_edit_trip:
         st.subheader("✏️ Edit or Delete a Requisition")
         st.caption(
             "Use this to fix a mistaken entry — e.g. a driver typed the wrong odometer "
@@ -4012,7 +4026,7 @@ elif user["role"] == "admin":
                     st.error(f"❌ Failed to delete: {e}")
 
     # ---------------- Manage Drivers & Vehicles (was Tab 6) ----------------
-    with tab_fleet:
+    if tab_fleet:
         st.subheader("🚘 Manage Drivers & Vehicles")
         st.caption("These lists power the Driver and Vehicle dropdowns admins use when approving requisitions.")
 
@@ -4088,7 +4102,7 @@ elif user["role"] == "admin":
                             st.error(f"❌ Failed to delete vehicle: {e}")
 
     # ---------------- Duty Tracker & Analytics (was Tab 7) ----------------
-    with tab_duty:
+    if tab_duty:
         st.subheader("🕒 Vehicle & Driver Duty Tracker & Analytics Dashboard")
         st.caption(
             "Filter any custom date/time window plus a specific vehicle or driver to see live duty "
@@ -4518,7 +4532,7 @@ elif user["role"] == "admin":
                 )
 
     # ---------------- KM Variance Report (NEW) ----------------
-    with tab_variance:
+    if tab_variance:
         st.subheader("📈 KM Variance Report — Driver vs Gate Officer Readings")
         st.caption(
             "Compares the Driver's self-logged odometer readings against the "
@@ -4589,7 +4603,7 @@ elif user["role"] == "admin":
                     )
 
     # ---------------- Management Dashboard (NEW) ----------------
-    with tab_management:
+    if tab_management:
         # Admins get the same Executive/Management overview as the
         # standalone 'executive' role, reusing the exact same function so
         # both roles always see identical KPI numbers for the same filters.
