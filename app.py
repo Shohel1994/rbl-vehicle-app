@@ -30,6 +30,33 @@ from streamlit_autorefresh import st_autorefresh
 import extra_streamlit_components as stx
 import requests
 import streamlit as st
+import httpx
+
+# ---------------------------------------------------------------------------
+# Supabase "ConnectionTerminated" fix: the Supabase client is cached for the
+# whole life of the app, and its pooled HTTP/2 connection is often closed by
+# the server (or by Windows/your network) while the app sits idle. The next
+# request then fails with httpx.RemoteProtocolError. Here, such a request is
+# simply retried once on a fresh connection. Safe requests (read / update /
+# delete) are retried on any connection error; an INSERT (POST) is retried
+# only if the connection could not even be opened, so a requisition can never
+# be saved twice.
+# ---------------------------------------------------------------------------
+_httpx_original_send = httpx.Client.send
+
+
+def _httpx_send_with_reconnect(self, request, *args, **kwargs):
+    try:
+        return _httpx_original_send(self, request, *args, **kwargs)
+    except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError, httpx.ConnectError) as exc:
+        if request.method.upper() == "POST" and not isinstance(exc, httpx.ConnectError):
+            raise
+        return _httpx_original_send(self, request, *args, **kwargs)
+
+
+if not getattr(httpx.Client.send, "_rbl_reconnect_patched", False):
+    _httpx_send_with_reconnect._rbl_reconnect_patched = True
+    httpx.Client.send = _httpx_send_with_reconnect
 
 
 # =========================================================
@@ -548,6 +575,7 @@ REQUISITION_COLUMNS = [
     "special_request", "status", "driver_name", "driver_contact", "vehicle_number", "approved_by",
     "action_timestamp", "approved_time", "admin_note", "start_km", "end_km", "total_km",
     "actual_exit_time", "actual_return_time", "driver_start_km", "driver_end_km", "driver_km_updated_at",
+    "trip_group_id",
 ]
 
 
@@ -664,51 +692,144 @@ def get_last_driver_end_km(driver_name: str, vehicle_number: str) -> float:
     return 0.0
 
 
-def submit_driver_km(row: dict, driver_start_km=None, driver_end_km=None):
-    """Saves the driver's own odometer entry AND drives the trip's lifecycle
-    status — per business requirement, the Driver's KM entries are now what
-    move a trip forward, not just the Gate Officer's Gate panel:
-      - Start KM only  -> status Approved -> On Trip. actual_exit_time is
-        stamped now (only if the Gate Officer hasn't already logged one).
-      - End KM present -> status -> Completed. actual_return_time is stamped
-        now (only if the Gate Officer hasn't already logged one), and
-        total_km is filled from the driver's own distance if the Gate
-        Officer hasn't recorded one.
-    This reuses update_requisition() (rather than a raw Supabase call) so the
-    Telegram alert keeps the EXACT same "📢 Requisition Status Updated!"
-    format that the Gate Officer's Gate Out/Gate In has always used — only
-    the trigger has moved, from the Gate Officer's entry to the Driver's own
-    entry.
-    `row` is the full existing requisition dict (from
-    fetch_requisitions_by_driver), used only so we never clobber a timestamp
-    or total the Gate Officer has already logged — the Gate Officer's own
-    start_km/end_km columns are never written here, and the Gate Officer can
-    still Gate Out/Gate In independently at any time for cross-verification
-    (see the KM Variance Report tab)."""
-    request_id = row["request_id"]
-    now_str = bd_now_str()
+# ------------------- GROUP TRIP HELPERS (NEW) -------------------
+# Requisitions that Admin bulk-assigns share one `trip_group_id`. They are ONE
+# physical trip, so the Driver / Gate Officer see them as ONE card, enter
+# Start/End KM once, and Telegram sends ONE message.
+def generate_trip_group_id() -> str:
+    return f"GRP-{bd_now().strftime('%Y%m%d%H%M%S')}-{random.randint(100, 999)}"
+
+
+def group_trips(df: pd.DataFrame) -> list:
+    """Split df rows into trips: a list of lists of rows. Rows sharing a
+    trip_group_id come together; rows without one are a trip of their own."""
+    groups, seen = [], {}
+    if df is None or df.empty:
+        return groups
+    for _, r in df.iterrows():
+        gid = r.get("trip_group_id")
+        if is_blank(gid):
+            groups.append([r])
+        else:
+            if gid not in seen:
+                seen[gid] = []
+                groups.append(seen[gid])
+            seen[gid].append(r)
+    return groups
+
+
+def mark_group_duplicates(df: pd.DataFrame) -> pd.Series:
+    """True for the 2nd+ requisition of the same group trip, so distance/hours
+    of one physical trip are not counted several times in totals."""
+    if df is None or df.empty or "trip_group_id" not in df.columns:
+        return pd.Series(False, index=df.index if df is not None else None)
+    g = df["trip_group_id"]
+    has = g.notna() & (g.astype(str).str.strip() != "")
+    return has & g.duplicated(keep="first")
+
+
+def bulk_update_requisitions(request_ids: list, updates: dict):
+    """One database call that updates many requisitions with the same values."""
+    sb = get_supabase_client()
+    sb.table(REQUISITIONS_TABLE).update(updates).in_("request_id", list(request_ids)).execute()
+    _clear_requisition_caches()
+
+
+def attach_requisitions_to_trip(request_ids: list, pending_rows: list, target, approved_by: str):
+    """Add already-submitted Pending requisitions to a trip that is ALREADY
+    Approved / On Trip (same driver, vehicle, time). They join the target's
+    group (one is created if it has none), so the Driver sees ONE trip and
+    enters KM once. If the target is already On Trip, the new requisitions
+    inherit its Gate Out time and Start KM too. ONE Telegram message."""
+    gid = target.get("trip_group_id")
+    if is_blank(gid):
+        gid = generate_trip_group_id()
+        update_requisition(target["request_id"], {"trip_group_id": gid}, notify=False)
+    approved_hhmm = target.get("approved_time") if not is_blank(target.get("approved_time")) \
+        else target.get("time_of_travel")
+    updates = {
+        "status": target.get("status"),
+        "driver_name": fmt(target.get("driver_name"), ""),
+        "driver_contact": fmt(target.get("driver_contact"), ""),
+        "vehicle_number": fmt(target.get("vehicle_number"), ""),
+        "approved_by": approved_by,
+        "action_timestamp": bd_now_str(),
+        "approved_time": approved_hhmm,
+        "trip_group_id": gid,
+    }
+    if target.get("status") == "On Trip":
+        if not is_blank(target.get("actual_exit_time")):
+            updates["actual_exit_time"] = str(target.get("actual_exit_time"))
+        for f in ("start_km", "driver_start_km"):
+            if not is_blank(target.get(f)):
+                updates[f] = float(target.get(f))
+    bulk_update_requisitions(request_ids, updates)
+
+    lines = [
+        f"• {short_req_id(r.get('id'))} — {r.get('applicant_name', '')} "
+        f"({r.get('department', '')}) → {r.get('destination', '')}"
+        for r in pending_rows
+    ]
+    send_telegram_alert(
+        f"➕ **Added to an existing trip! ({len(pending_rows)} more requisition(s))**\n\n"
+        + "\n".join(lines)
+        + f"\n\n🔗 **Joined trip:** {short_req_id(target.get('id'))} ({target.get('status')})"
+        + f"\n👨‍✈️ **Driver:** {updates['driver_name']}\n🚗 **Vehicle:** {updates['vehicle_number']}"
+        + f"\n🕒 **Departure:** {fmt_time_12h(approved_hhmm)}\n✅ **Approved by:** {approved_by}"
+    )
+
+
+def send_bulk_assignment_alert(rows: list, driver: str, vehicle: str, approved_hhmm: str,
+                               approved_by: str, note: str = ""):
+    """ONE Telegram message for a whole bulk assignment."""
+    lines = [
+        f"• {short_req_id(r.get('id'))} — {r.get('applicant_name', '')} "
+        f"({r.get('department', '')}) → {r.get('destination', '')}"
+        for r in rows
+    ]
+    msg = (
+        f"🚐 **Group Trip Assigned! ({len(rows)} requisitions, 1 vehicle)**\n\n"
+        + "\n".join(lines)
+        + f"\n\n👨‍✈️ **Driver:** {driver}\n🚗 **Vehicle:** {vehicle}"
+        + f"\n🕒 **Departure:** {fmt_time_12h(approved_hhmm)}"
+        + f"\n✅ **Approved by:** {approved_by}"
+    )
+    if note:
+        msg += f"\n📝 **Note:** {note}"
+    send_telegram_alert(msg)
+
+
+def send_group_status_alert(rows: list, status: str, driver: str = "", vehicle: str = ""):
+    """ONE Telegram message when a group trip starts / completes."""
+    ids = ", ".join(short_req_id(r.get("id")) for r in rows)
+    applicants = ", ".join(dict.fromkeys(str(r.get("applicant_name", "")) for r in rows))
+    dests = ", ".join(dict.fromkeys(str(r.get("destination", "")) for r in rows))
+    msg = (
+        f"📢 **Group Trip Status Updated!**\n\n"
+        f"🆔 **Requisitions:** {ids}\n"
+        f"👤 **Applicants:** {applicants}\n"
+        f"📍 **Destinations:** {dests}\n"
+        f"📌 **New Status:** {status}"
+    )
+    if not is_blank(driver):
+        msg += f"\n👨‍✈️ **Driver:** {driver}"
+    if not is_blank(vehicle):
+        msg += f"\n🚗 **Vehicle:** {vehicle}"
+    send_telegram_alert(msg)
+
+
+def _build_driver_km_updates(row: dict, driver_start_km=None, driver_end_km=None, now_str=None) -> dict:
+    """The DB fields to write for one requisition when the driver enters KM.
+    (Same rules as before: Start KM -> On Trip, End KM -> Completed.)
+    is_blank() is used so a pandas NaN never reaches the JSON request."""
+    now_str = now_str or bd_now_str()
     updates = {
         "driver_km_updated_at": now_str,
-        # Re-affirm these (unchanged) values so update_requisition()'s
-        # Telegram alert includes the Driver/Vehicle lines exactly like it
-        # always has for Gate-Officer-triggered updates.
         "driver_name": row.get("driver_name", ""),
         "vehicle_number": row.get("vehicle_number", ""),
     }
-    # IMPORTANT: `row` typically comes from a pandas DataFrame row (via
-    # .to_dict()), where a missing numeric cell is Python float('nan'),
-    # NOT None. `driver_start_km is not None` is True for NaN, so the old
-    # check let `float(nan)` slip into `updates` — and float('nan') is NOT
-    # valid JSON, so the Supabase client's request body serialization blew
-    # up with "Out of range float values are not JSON compliant: nan" the
-    # moment a driver tried to complete a trip that never had its own
-    # Start KM recorded (e.g. one that Admin/Gate Officer had already
-    # marked Completed directly, bypassing the Driver's Start KM step).
-    # is_blank() correctly treats NaN, None, and "" all as "missing", so
-    # this now safely skips writing a value instead of crashing.
     has_start = not is_blank(driver_start_km)
     has_end = not is_blank(driver_end_km)
-
     if has_start:
         updates["driver_start_km"] = float(driver_start_km)
     if has_end:
@@ -724,8 +845,313 @@ def submit_driver_km(row: dict, driver_start_km=None, driver_end_km=None):
         updates["status"] = "On Trip"
         if is_blank(row.get("actual_exit_time")):
             updates["actual_exit_time"] = now_str
+    return updates
 
-    update_requisition(request_id, updates)
+
+def submit_driver_km(row: dict, driver_start_km=None, driver_end_km=None):
+    """Single-requisition driver KM entry (+ the usual Telegram alert)."""
+    updates = _build_driver_km_updates(row, driver_start_km, driver_end_km)
+    update_requisition(row["request_id"], updates)
+
+
+def submit_driver_km_group(rows: list, driver_start_km=None, driver_end_km=None):
+    """Driver enters Start/End KM ONCE for a whole group trip: the same values
+    are saved on every requisition in the group and ONE Telegram message is
+    sent. A group of one behaves exactly like submit_driver_km()."""
+    if len(rows) == 1:
+        return submit_driver_km(rows[0], driver_start_km, driver_end_km)
+    now_str = bd_now_str()
+    final_status = None
+    for row in rows:
+        updates = _build_driver_km_updates(row, driver_start_km, driver_end_km, now_str)
+        update_requisition(row["request_id"], updates, notify=False)
+        final_status = updates.get("status", final_status)
+    first = rows[0]
+    send_group_status_alert(rows, final_status or "Updated",
+                            first.get("driver_name", ""), first.get("vehicle_number", ""))
+
+
+# ------------------- EASY-EDIT INPUT HELPERS (NEW) -------------------
+def parse_stored_datetime(value):
+    """Stored timestamp string (plain or ISO with +00:00) -> naive datetime, or None."""
+    if is_blank(value):
+        return None
+    s = str(value).strip().replace("T", " ")
+    s = re.sub(r"(\.\d+)?(Z|[+-]\d{2}:?\d{2})$", "", s, flags=re.IGNORECASE).strip()
+    for f in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(s, f)
+        except ValueError:
+            continue
+    return None
+
+
+def optional_datetime_input(label: str, key: str, existing_value):
+    """Checkbox + date + 12-hour time. Returns 'YYYY-MM-DD HH:MM:SS' or None
+    (None = not recorded / clear it). Use OUTSIDE st.form so the checkbox
+    reacts instantly."""
+    existing = parse_stored_datetime(existing_value)
+    on = st.checkbox(f"{label} recorded", value=existing is not None, key=f"{key}_on")
+    if not on:
+        return None
+    base = existing or bd_now()
+    d = st.date_input(f"{label} — date", value=base.date(), key=f"{key}_d")
+    t = time_input_12h(f"{label} — time", key_prefix=f"{key}_t", default_time=base.time())
+    return datetime.combine(d, t).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def optional_time_input(label: str, key: str, existing_value, fallback_time=None):
+    """Checkbox + 12-hour time. Returns 'HH:MM' or None."""
+    existing = None
+    if not is_blank(existing_value):
+        for f in ("%H:%M:%S", "%H:%M"):
+            try:
+                existing = datetime.strptime(str(existing_value).strip(), f).time()
+                break
+            except ValueError:
+                continue
+    on = st.checkbox(f"{label} set", value=existing is not None, key=f"{key}_on")
+    if not on:
+        return None
+    t = time_input_12h(label, key_prefix=f"{key}_t",
+                       default_time=existing or fallback_time or bd_now().time())
+    return t.strftime("%H:%M")
+
+
+def km_text_input(label: str, value, key: str) -> str:
+    if is_blank(value):
+        shown = ""
+    else:
+        v = float(value)
+        shown = str(int(v)) if v == int(v) else str(round(v, 1))
+    return st.text_input(label, value=shown, key=key, placeholder="empty = blank")
+
+
+def parse_km_text(text):
+    """-> (value or None, ok)."""
+    t = (text or "").strip()
+    if not t:
+        return None, True
+    try:
+        v = float(t)
+    except ValueError:
+        return None, False
+    return (v, True) if v >= 0 else (None, False)
+
+
+def admin_edit_trip_panel(row, df_all: pd.DataFrame, drivers_df: pd.DataFrame, vehicles_df: pd.DataFrame):
+    """Edit ANY requisition (any status): every detail, status, driver/vehicle,
+    approved time, Gate Out/In date+time, all KM readings, admin note.
+    Not an st.form on purpose: checkboxes / fields react instantly."""
+    rid = row["request_id"]
+    short = short_req_id(row.get("id"))
+    # Widget keys include a signature of the saved row, so if the data changes
+    # (e.g. the driver finishes the trip) the form reloads the fresh values
+    # instead of showing stale ones.
+    sig = hashlib.md5(str(row.to_dict()).encode("utf-8")).hexdigest()[:8]
+
+    def k(name):
+        return f"et_{name}_{rid}_{sig}"
+
+    driver_contact_map = dict(zip(drivers_df["driver_name"], drivers_df["driver_contact"])) if not drivers_df.empty else {}
+    driver_choices = drivers_df["driver_name"].tolist() if not drivers_df.empty else []
+    vehicle_choices = vehicles_df["vehicle_number"].tolist() if not vehicles_df.empty else []
+    current_driver = fmt(row.get("driver_name"), "")
+    current_vehicle = fmt(row.get("vehicle_number"), "")
+    if current_driver and current_driver not in driver_choices:
+        driver_choices = [current_driver] + driver_choices
+    if current_vehicle and current_vehicle not in vehicle_choices:
+        vehicle_choices = [current_vehicle] + vehicle_choices
+    driver_display = ["— None —"] + driver_choices
+    vehicle_display = ["— None —"] + vehicle_choices
+
+    st.markdown("---")
+    st.markdown(f"#### ✏️ Editing {short}  —  {STATUS_BADGE.get(row.get('status'), row.get('status'))}")
+    st.caption(f"Technical ID: `{rid}`")
+
+    group_rows = pd.DataFrame()
+    gid = row.get("trip_group_id")
+    if not is_blank(gid) and "trip_group_id" in df_all.columns:
+        group_rows = df_all[df_all["trip_group_id"] == gid]
+    in_group = len(group_rows) > 1
+    apply_group = False
+    if in_group:
+        st.info("🚐 This requisition is part of a group trip with: "
+                + ", ".join(short_req_id(x) for x in group_rows["id"]))
+        apply_group = st.checkbox(
+            "Apply Driver, Vehicle, KM and Gate times to ALL requisitions of this group trip",
+            value=True, key=k("apply_group"),
+        )
+
+    # ---------------- Status ----------------
+    cur_status = row.get("status")
+    et_status = st.selectbox(
+        "Status", REQ_STATUS_OPTIONS,
+        index=REQ_STATUS_OPTIONS.index(cur_status) if cur_status in REQ_STATUS_OPTIONS else 0,
+        key=k("status"),
+    )
+
+    # ---------------- Trip details ----------------
+    st.markdown("##### Trip Details")
+    e1, e2 = st.columns(2)
+    dept_list = DEPARTMENTS if row.get("department") in DEPARTMENTS or is_blank(row.get("department")) \
+        else DEPARTMENTS + [row.get("department")]
+    vtype_list = VEHICLE_TYPES if row.get("vehicle_type") in VEHICLE_TYPES or is_blank(row.get("vehicle_type")) \
+        else VEHICLE_TYPES + [row.get("vehicle_type")]
+    try:
+        pc_default = min(max(int(float(row.get("passenger_count"))), 1), 50)
+    except (TypeError, ValueError):
+        pc_default = 1
+    try:
+        date_default = datetime.strptime(str(row.get("date_of_travel"))[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        date_default = bd_today()
+    try:
+        time_default = datetime.strptime(fmt(row.get("time_of_travel"), "09:00")[:5], "%H:%M").time()
+    except ValueError:
+        time_default = bd_now().time()
+
+    with e1:
+        et_applicant = st.text_input("Applicant Name", value=fmt(row.get("applicant_name"), ""), key=k("app"))
+        et_department = st.selectbox(
+            "Department", dept_list,
+            index=dept_list.index(row.get("department")) if row.get("department") in dept_list else 0,
+            key=k("dept"),
+        )
+        et_mobile = st.text_input("Mobile Number", value=fmt(row.get("mobile_number"), ""), key=k("mob"))
+        et_passengers = st.number_input("Passenger Count", min_value=1, max_value=50, value=pc_default, key=k("pax"))
+    with e2:
+        et_date = st.date_input("Date of Travel", value=date_default, key=k("date"))
+        et_time = time_input_12h("Time of Travel", key_prefix=k("tt"), default_time=time_default)
+        et_destination = st.text_input("Destination", value=fmt(row.get("destination"), ""), key=k("dest"))
+        et_vehicle_type = st.selectbox(
+            "Vehicle Type", vtype_list,
+            index=vtype_list.index(row.get("vehicle_type")) if row.get("vehicle_type") in vtype_list else 0,
+            key=k("vtype"),
+        )
+    et_purpose = st.text_area("Purpose", value=fmt(row.get("purpose"), ""), height=80, key=k("purpose"))
+    et_special = st.text_area("Special Request", value=fmt(row.get("special_request"), ""), height=60, key=k("special"))
+
+    # ---------------- Driver & vehicle ----------------
+    st.markdown("##### Driver & Vehicle")
+    d1, d2 = st.columns(2)
+    with d1:
+        et_driver = st.selectbox(
+            "Driver", driver_display,
+            index=driver_display.index(current_driver) if current_driver in driver_display else 0,
+            key=k("driver"),
+        )
+    with d2:
+        et_vehicle = st.selectbox(
+            "Vehicle Number", vehicle_display,
+            index=vehicle_display.index(current_vehicle) if current_vehicle in vehicle_display else 0,
+            key=k("vehicle"),
+        )
+    et_approved_time = optional_time_input(
+        "Approved Departure Time", k("appr"), row.get("approved_time"), fallback_time=et_time,
+    )
+
+    # ---------------- Actual times ----------------
+    st.markdown("##### 🕒 Actual Trip Times (Start / Gate Out and End / Gate In)")
+    t1, t2 = st.columns(2)
+    with t1:
+        et_exit = optional_datetime_input("Start / Gate Out", k("exit"), row.get("actual_exit_time"))
+    with t2:
+        et_return = optional_datetime_input("End / Gate In", k("ret"), row.get("actual_return_time"))
+
+    # ---------------- KM ----------------
+    st.markdown("##### 🛣️ Odometer / KM  (empty box = blank / not recorded)")
+    k1, k2 = st.columns(2)
+    with k1:
+        st.markdown("**Gate Officer's readings**")
+        sk_txt = km_text_input("Start KM", row.get("start_km"), k("sk"))
+        ek_txt = km_text_input("End KM", row.get("end_km"), k("ek"))
+    with k2:
+        st.markdown("**Driver's own readings**")
+        dsk_txt = km_text_input("Driver Start KM", row.get("driver_start_km"), k("dsk"))
+        dek_txt = km_text_input("Driver End KM", row.get("driver_end_km"), k("dek"))
+
+    et_note = st.text_area("Admin Note", value=fmt(row.get("admin_note"), ""), height=60, key=k("note"))
+    et_notify = st.checkbox("📢 Send a Telegram notification about this correction", value=False, key=k("notify"))
+
+    if st.button("💾 Save Changes", type="primary", use_container_width=True, key=k("save")):
+        sk, ok1 = parse_km_text(sk_txt)
+        ek, ok2 = parse_km_text(ek_txt)
+        dsk, ok3 = parse_km_text(dsk_txt)
+        dek, ok4 = parse_km_text(dek_txt)
+        errors = []
+        if not (ok1 and ok2 and ok3 and ok4):
+            errors.append("KM values must be numbers (0 or more) or left empty.")
+        else:
+            if sk is not None and ek is not None and ek < sk:
+                errors.append("Gate End KM cannot be less than Gate Start KM.")
+            if dsk is not None and dek is not None and dek < dsk:
+                errors.append("Driver End KM cannot be less than Driver Start KM.")
+        if et_exit and et_return and et_return < et_exit:
+            errors.append("End / Gate In time cannot be earlier than Start / Gate Out time.")
+
+        if errors:
+            for msg in errors:
+                st.error(msg)
+        else:
+            updates = {
+                "applicant_name": et_applicant.strip(),
+                "department": et_department,
+                "mobile_number": et_mobile.strip(),
+                "passenger_count": int(et_passengers),
+                "status": et_status,
+                "date_of_travel": str(et_date),
+                "time_of_travel": et_time.strftime("%H:%M"),
+                "destination": et_destination.strip(),
+                "vehicle_type": et_vehicle_type,
+                "purpose": et_purpose.strip(),
+                "special_request": et_special.strip(),
+                "driver_name": "" if et_driver == "— None —" else et_driver,
+                "driver_contact": "" if et_driver == "— None —" else driver_contact_map.get(et_driver, ""),
+                "vehicle_number": "" if et_vehicle == "— None —" else et_vehicle,
+                "approved_time": et_approved_time,
+                "actual_exit_time": et_exit,
+                "actual_return_time": et_return,
+                "start_km": sk,
+                "end_km": ek,
+                "driver_start_km": dsk,
+                "driver_end_km": dek,
+                "admin_note": et_note.strip(),
+            }
+            updates["total_km"] = effective_km_fields(updates)[2]
+            try:
+                update_requisition(rid, updates, notify=et_notify)
+                n_others = 0
+                if apply_group:
+                    shared_fields = ("driver_name", "driver_contact", "vehicle_number", "approved_time",
+                                     "actual_exit_time", "actual_return_time", "start_km", "end_km",
+                                     "driver_start_km", "driver_end_km", "total_km")
+                    shared = {f: updates[f] for f in shared_fields}
+                    for other_id in group_rows["request_id"]:
+                        if other_id != rid:
+                            update_requisition(other_id, shared, notify=False)
+                            n_others += 1
+                st.session_state["edit_flash"] = (
+                    f"✅ Requisition {short} updated"
+                    + (f" (and {n_others} other requisition(s) in its group)." if n_others else ".")
+                )
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ Failed to update: {e}")
+
+    # ---------------- Delete ----------------
+    st.markdown("---")
+    st.markdown("##### 🗑️ Delete This Requisition Permanently")
+    st.caption(f"This permanently removes **{short}** from every report, export and dashboard. Cannot be undone.")
+    confirm_del = st.checkbox(f"I understand this will permanently delete {short}.", key=k("confirm_del"))
+    if st.button("🗑️ Delete This Requisition", type="primary", disabled=not confirm_del,
+                 use_container_width=True, key=k("del_btn")):
+        try:
+            delete_requisition(rid)
+            st.session_state["edit_flash"] = f"🗑️ {short} has been deleted."
+            st.rerun()
+        except Exception as e:
+            st.error(f"❌ Failed to delete: {e}")
 
 
 def effective_km_fields(row) -> tuple:
@@ -2150,7 +2576,8 @@ def render_management_dashboard(df_all: pd.DataFrame):
     if not filtered.empty:
         completed_rows = filtered[filtered["status"] == "Completed"]
         total_distance = (
-            float(completed_rows.apply(lambda row: effective_km_fields(row)[2], axis=1).sum())
+            float(completed_rows.apply(lambda row: effective_km_fields(row)[2], axis=1)
+                  .where(~mark_group_duplicates(completed_rows), 0.0).sum())
             if not completed_rows.empty else 0.0
         )
     else:
@@ -2531,34 +2958,54 @@ elif user["role"] == "gate_officer":
         if ready_df.empty:
             st.info("No trips are currently approved and waiting to depart.")
         else:
-            for _, r in ready_df.iterrows():
-                approved_time = r["time_of_travel"] if is_blank(r.get("approved_time")) else r.get("approved_time")
-                with st.expander(f"🟢 {r['applicant_name']} ({r['department']}) → {r['destination']}  |  Vehicle: {fmt(r['vehicle_number'], 'N/A')}"):
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.write(f"**Applicant Name:** {r['applicant_name']}")
-                        st.write(f"**Department:** {r['department']}")
-                        st.write(f"**Vehicle:** {fmt(r['vehicle_number'], 'N/A')} ({r['vehicle_type']})")
-                    with c2:
-                        st.write(f"**Destination:** {r['destination']}")
-                        st.write(f"**Requested Time:** {r['date_of_travel']} at {fmt_time_12h(r['time_of_travel'])}")
-                        st.write(f"**Admin Approved Time:** {fmt_time_12h(approved_time)}")
-                    if not is_blank(r.get("admin_note")):
-                        st.caption(f"📝 Admin Notes: {r['admin_note']}")
+            for grp in group_trips(ready_df):
+                first = grp[0]
+                gkey = first["request_id"]
+                multi = len(grp) > 1
+                ids_label = ", ".join(short_req_id(x.get("id")) for x in grp)
+                if multi:
+                    title = (f"🟢 GROUP TRIP — {len(grp)} requisitions ({ids_label}) | "
+                             f"Driver: {fmt(first.get('driver_name'), 'N/A')} | "
+                             f"Vehicle: {fmt(first.get('vehicle_number'), 'N/A')}")
+                else:
+                    title = (f"🟢 {first['applicant_name']} ({first['department']}) → {first['destination']}  |  "
+                             f"Vehicle: {fmt(first['vehicle_number'], 'N/A')}")
+                with st.expander(title):
+                    if multi:
+                        st.info("🚐 One vehicle, several requisitions — enter the Start KM only ONCE below.")
+                        for r in grp:
+                            st.write(f"**{short_req_id(r.get('id'))}** — {r['applicant_name']} ({r['department']}) "
+                                     f"→ {r['destination']}  |  {r['date_of_travel']} at {fmt_time_12h(r['time_of_travel'])}")
+                        st.write(f"**Vehicle:** {fmt(first['vehicle_number'], 'N/A')} ({first['vehicle_type']})")
+                    else:
+                        approved_time = first["time_of_travel"] if is_blank(first.get("approved_time")) else first.get("approved_time")
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.write(f"**Applicant Name:** {first['applicant_name']}")
+                            st.write(f"**Department:** {first['department']}")
+                            st.write(f"**Vehicle:** {fmt(first['vehicle_number'], 'N/A')} ({first['vehicle_type']})")
+                        with c2:
+                            st.write(f"**Destination:** {first['destination']}")
+                            st.write(f"**Requested Time:** {first['date_of_travel']} at {fmt_time_12h(first['time_of_travel'])}")
+                            st.write(f"**Admin Approved Time:** {fmt_time_12h(approved_time)}")
+                    if not is_blank(first.get("admin_note")):
+                        st.caption(f"📝 Admin Notes: {first['admin_note']}")
 
-                    with st.form(f"gateout_{r['request_id']}"):
+                    with st.form(f"gateout_{gkey}"):
                         start_km = st.number_input("Start KM (Odometer Reading) *", min_value=0.0, step=1.0,
-                                                     format="%.1f", key=f"skm_{r['request_id']}")
+                                                     format="%.1f", key=f"skm_{gkey}")
                         depart_clicked = st.form_submit_button("🚦 Gate Out / Depart", type="primary", use_container_width=True)
 
                     if depart_clicked:
                         try:
-                            update_requisition(r["request_id"], {
-                                "start_km": float(start_km),
-                                "actual_exit_time": bd_now_str(),
-                                "status": "On Trip",
-                            }, notify=False)
-                            st.success(f"✅ Gate Out recorded for {r['applicant_name']} — vehicle is now On Trip.")
+                            exit_str = bd_now_str()
+                            for r in grp:
+                                update_requisition(r["request_id"], {
+                                    "start_km": float(start_km),
+                                    "actual_exit_time": exit_str,
+                                    "status": "On Trip",
+                                }, notify=False)
+                            st.success(f"✅ Gate Out recorded ({len(grp)} requisition(s)) — vehicle is now On Trip.")
                             st.rerun()
                         except Exception as e:
                             st.error(f"❌ Failed to record Gate Out: {e}")
@@ -2572,23 +3019,41 @@ elif user["role"] == "gate_officer":
         if ontrip_df.empty:
             st.info("No vehicles are currently on a trip.")
         else:
-            for _, r in ontrip_df.iterrows():
-                with st.expander(f"🔵 {r['applicant_name']} ({r['department']}) → {r['destination']}  |  Vehicle: {fmt(r['vehicle_number'], 'N/A')}"):
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.write(f"**Applicant Name:** {r['applicant_name']}")
-                        st.write(f"**Vehicle:** {fmt(r['vehicle_number'], 'N/A')} ({r['vehicle_type']})")
-                        st.write(f"**Destination:** {r['destination']}")
-                    with c2:
-                        st.write(f"**Gate Out Time:** {fmt_time_12h(r.get('actual_exit_time'))}")
-                        st.write(f"**Start KM:** {fmt(r.get('start_km'))}")
+            for grp in group_trips(ontrip_df):
+                first = grp[0]
+                gkey = first["request_id"]
+                multi = len(grp) > 1
+                ids_label = ", ".join(short_req_id(x.get("id")) for x in grp)
+                if multi:
+                    title = (f"🔵 GROUP TRIP — {len(grp)} requisitions ({ids_label}) | "
+                             f"Vehicle: {fmt(first.get('vehicle_number'), 'N/A')}")
+                else:
+                    title = (f"🔵 {first['applicant_name']} ({first['department']}) → {first['destination']}  |  "
+                             f"Vehicle: {fmt(first['vehicle_number'], 'N/A')}")
+                start_vals = [float(x["start_km"]) for x in grp if not is_blank(x.get("start_km"))]
+                start_km_val = start_vals[0] if start_vals else 0.0
+                with st.expander(title):
+                    if multi:
+                        st.info("🚐 One vehicle, several requisitions — enter the End KM only ONCE below.")
+                        for r in grp:
+                            st.write(f"**{short_req_id(r.get('id'))}** — {r['applicant_name']} ({r['department']}) → {r['destination']}")
+                    else:
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.write(f"**Applicant Name:** {first['applicant_name']}")
+                            st.write(f"**Vehicle:** {fmt(first['vehicle_number'], 'N/A')} ({first['vehicle_type']})")
+                            st.write(f"**Destination:** {first['destination']}")
+                        with c2:
+                            st.write(f"**Gate Out Time:** {fmt_time_12h(first.get('actual_exit_time'))}")
+                            st.write(f"**Start KM:** {fmt(first.get('start_km'))}")
+                    if multi:
+                        st.write(f"**Gate Out Time:** {fmt_time_12h(first.get('actual_exit_time'))}  |  **Start KM:** {fmt(first.get('start_km'))}")
 
-                    start_km_val = 0.0 if is_blank(r.get("start_km")) else float(r.get("start_km"))
-                    with st.form(f"gatein_{r['request_id']}"):
+                    with st.form(f"gatein_{gkey}"):
                         end_km = st.number_input(
                             "End KM (Odometer Reading) *", min_value=start_km_val, step=1.0, format="%.1f",
                             help=f"Must be greater than or equal to Start KM ({start_km_val:.1f}).",
-                            key=f"ekm_{r['request_id']}",
+                            key=f"ekm_{gkey}",
                         )
                         return_clicked = st.form_submit_button("🏁 Gate In / Complete", type="primary", use_container_width=True)
 
@@ -2596,15 +3061,18 @@ elif user["role"] == "gate_officer":
                         if end_km < start_km_val:
                             st.error("End KM cannot be less than Start KM.")
                         else:
-                            total_km = round(float(end_km) - start_km_val, 1)
                             try:
-                                update_requisition(r["request_id"], {
-                                    "end_km": float(end_km),
-                                    "total_km": total_km,
-                                    "actual_return_time": bd_now_str(),
-                                    "status": "Completed",
-                                }, notify=False)
-                                st.success(f"✅ Gate In recorded for {r['applicant_name']}. Total distance: **{total_km} KM**")
+                                return_str = bd_now_str()
+                                for r in grp:
+                                    r_start = float(r["start_km"]) if not is_blank(r.get("start_km")) else start_km_val
+                                    update_requisition(r["request_id"], {
+                                        "end_km": float(end_km),
+                                        "total_km": round(float(end_km) - r_start, 1),
+                                        "actual_return_time": return_str,
+                                        "status": "Completed",
+                                    }, notify=False)
+                                st.success(f"✅ Gate In recorded ({len(grp)} requisition(s)). "
+                                           f"Total distance: **{round(float(end_km) - start_km_val, 1)} KM**")
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"❌ Failed to record Gate In: {e}")
@@ -2640,33 +3108,47 @@ elif user["role"] == "driver":
         if start_trips.empty:
             st.info("You have no Approved trips waiting to start.")
         else:
-            for _, r in start_trips.iterrows():
-                auto_start = get_last_driver_end_km(user["full_name"], r.get("vehicle_number", ""))
-                with st.expander(
-                    f"🟢 Requisition {short_req_id(r.get('id'))} — {r['destination']}  |  "
-                    f"Vehicle: {fmt(r.get('vehicle_number'), 'N/A')}"
-                ):
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.write(f"**Applicant:** {r['applicant_name']} ({r['department']})")
-                        st.write(f"**Date/Time:** {r['date_of_travel']} at {fmt_time_12h(r['time_of_travel'])}")
-                    with c2:
-                        approved_time = r["time_of_travel"] if is_blank(r.get("approved_time")) else r.get("approved_time")
-                        st.write(f"**Approved Departure Time:** {fmt_time_12h(approved_time)}")
-                        st.write(f"**Vehicle Type:** {r['vehicle_type']}")
-                    if not is_blank(r.get("admin_note")):
-                        st.caption(f"📝 Admin Notes: {r['admin_note']}")
+            for grp in group_trips(start_trips):
+                first = grp[0]
+                gkey = first["request_id"]
+                multi = len(grp) > 1
+                auto_start = get_last_driver_end_km(user["full_name"], first.get("vehicle_number", ""))
+                ids_label = ", ".join(short_req_id(x.get("id")) for x in grp)
+                dests = " / ".join(dict.fromkeys(str(x["destination"]) for x in grp))
+                if multi:
+                    title = (f"🟢 Group Trip — Requisitions {ids_label} — {dests}  |  "
+                             f"Vehicle: {fmt(first.get('vehicle_number'), 'N/A')}")
+                else:
+                    title = (f"🟢 Requisition {short_req_id(first.get('id'))} — {first['destination']}  |  "
+                             f"Vehicle: {fmt(first.get('vehicle_number'), 'N/A')}")
+                with st.expander(title):
+                    if multi:
+                        st.info(f"🚐 These {len(grp)} requisitions are ONE trip — enter your Start KM only once below.")
+                        for r in grp:
+                            st.write(f"**{short_req_id(r.get('id'))}** — {r['applicant_name']} ({r['department']}) "
+                                     f"→ {r['destination']}  |  {r['date_of_travel']} at {fmt_time_12h(r['time_of_travel'])}")
+                    else:
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.write(f"**Applicant:** {first['applicant_name']} ({first['department']})")
+                            st.write(f"**Date/Time:** {first['date_of_travel']} at {fmt_time_12h(first['time_of_travel'])}")
+                        with c2:
+                            approved_time = first["time_of_travel"] if is_blank(first.get("approved_time")) else first.get("approved_time")
+                            st.write(f"**Approved Departure Time:** {fmt_time_12h(approved_time)}")
+                            st.write(f"**Vehicle Type:** {first['vehicle_type']}")
+                    if not is_blank(first.get("admin_note")):
+                        st.caption(f"📝 Admin Notes: {first['admin_note']}")
 
                     if auto_start and auto_start > 0:
                         st.caption(
                             f"↩️ Auto-filled from your last logged End KM for "
-                            f"**{fmt(r.get('vehicle_number'))}** — change it below if needed."
+                            f"**{fmt(first.get('vehicle_number'))}** — change it below if needed."
                         )
 
-                    with st.form(f"driver_start_{r['request_id']}"):
+                    with st.form(f"driver_start_{gkey}"):
                         d_start_km = st.number_input(
                             "Start KM (Odometer Reading) *", min_value=0.0, step=1.0, format="%.1f",
-                            value=float(auto_start), key=f"dstart_{r['request_id']}",
+                            value=float(auto_start), key=f"dstart_{gkey}",
                         )
                         depart_clicked = st.form_submit_button(
                             "🚦 Start Trip / Depart", type="primary", use_container_width=True
@@ -2674,9 +3156,10 @@ elif user["role"] == "driver":
 
                     if depart_clicked:
                         try:
-                            submit_driver_km(r.to_dict(), driver_start_km=d_start_km, driver_end_km=None)
+                            submit_driver_km_group([x.to_dict() for x in grp],
+                                                   driver_start_km=d_start_km, driver_end_km=None)
                             st.success(
-                                f"✅ Trip started for {r['applicant_name']} — status is now On Trip. "
+                                f"✅ Trip started ({len(grp)} requisition(s)) — status is now On Trip. "
                                 "A Telegram alert has been sent."
                             )
                             st.rerun()
@@ -2692,9 +3175,7 @@ elif user["role"] == "driver":
                 return True
             # Also surface trips already marked Completed via the Gate
             # Officer's own Gate-In, as long as the driver hasn't logged
-            # their own End KM yet — so a fast Gate-Officer entry never
-            # locks the driver out of finishing their own log (needed for
-            # the KM Variance Report to have both sides).
+            # their own End KM yet (needed for the KM Variance Report).
             if row.get("status") == "Completed" and is_blank(row.get("driver_end_km")):
                 return True
             return False
@@ -2704,31 +3185,37 @@ elif user["role"] == "driver":
         if end_trips.empty:
             st.info("No trips are currently waiting for your End KM.")
         else:
-            for _, r in end_trips.iterrows():
-                # `is_blank()` here (not just checking for None) matters:
-                # a trip that Admin/Gate Officer already marked Completed
-                # directly — without the driver ever logging a Start KM —
-                # has driver_start_km as pandas NaN, not None or 0. Treating
-                # that as "no baseline yet" (has_own_start = False) is what
-                # lets us show a Start KM field below instead of silently
-                # defaulting to 0.0 and later trying to write NaN to
-                # Supabase, which is exactly what caused the
-                # "Out of range float values are not JSON compliant: nan"
-                # crash on trips like this one.
-                has_own_start = not is_blank(r.get("driver_start_km"))
-                start_km_val = float(r.get("driver_start_km")) if has_own_start else 0.0
-                with st.expander(
-                    f"🔵 Requisition {short_req_id(r.get('id'))} — {r['destination']}  |  "
-                    f"Vehicle: {fmt(r.get('vehicle_number'), 'N/A')}"
-                ):
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.write(f"**Applicant:** {r['applicant_name']} ({r['department']})")
-                        st.write(f"**Vehicle:** {fmt(r.get('vehicle_number'), 'N/A')} ({r['vehicle_type']})")
-                        st.write(f"**Destination:** {r['destination']}")
-                    with c2:
-                        st.write(f"**Your Start KM:** {fmt(r.get('driver_start_km'))}")
-                        st.write(f"**Trip Started:** {fmt_time_12h(r.get('actual_exit_time'))}")
+            for grp in group_trips(end_trips):
+                first = grp[0]
+                gkey = first["request_id"]
+                multi = len(grp) > 1
+                own_starts = [float(x["driver_start_km"]) for x in grp if not is_blank(x.get("driver_start_km"))]
+                has_own_start = bool(own_starts)
+                start_km_val = own_starts[0] if has_own_start else 0.0
+                ids_label = ", ".join(short_req_id(x.get("id")) for x in grp)
+                dests = " / ".join(dict.fromkeys(str(x["destination"]) for x in grp))
+                if multi:
+                    title = (f"🔵 Group Trip — Requisitions {ids_label} — {dests}  |  "
+                             f"Vehicle: {fmt(first.get('vehicle_number'), 'N/A')}")
+                else:
+                    title = (f"🔵 Requisition {short_req_id(first.get('id'))} — {first['destination']}  |  "
+                             f"Vehicle: {fmt(first.get('vehicle_number'), 'N/A')}")
+                with st.expander(title):
+                    if multi:
+                        st.info(f"🚐 These {len(grp)} requisitions are ONE trip — enter your End KM only once below.")
+                        for r in grp:
+                            st.write(f"**{short_req_id(r.get('id'))}** — {r['applicant_name']} ({r['department']}) → {r['destination']}")
+                        st.write(f"**Your Start KM:** {fmt(first.get('driver_start_km'))}  |  "
+                                 f"**Trip Started:** {fmt_time_12h(first.get('actual_exit_time'))}")
+                    else:
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.write(f"**Applicant:** {first['applicant_name']} ({first['department']})")
+                            st.write(f"**Vehicle:** {fmt(first.get('vehicle_number'), 'N/A')} ({first['vehicle_type']})")
+                            st.write(f"**Destination:** {first['destination']}")
+                        with c2:
+                            st.write(f"**Your Start KM:** {fmt(first.get('driver_start_km'))}")
+                            st.write(f"**Trip Started:** {fmt_time_12h(first.get('actual_exit_time'))}")
 
                     if not has_own_start:
                         st.warning(
@@ -2737,11 +3224,11 @@ elif user["role"] == "driver":
                             "Start KM and End KM below so this trip has a proper distance on record."
                         )
 
-                    with st.form(f"driver_end_{r['request_id']}"):
+                    with st.form(f"driver_end_{gkey}"):
                         if not has_own_start:
                             d_start_km = st.number_input(
                                 "Start KM (Odometer Reading) *", min_value=0.0, step=1.0, format="%.1f",
-                                key=f"dend_start_{r['request_id']}",
+                                key=f"dend_start_{gkey}",
                             )
                         else:
                             d_start_km = start_km_val
@@ -2752,7 +3239,7 @@ elif user["role"] == "driver":
                                 if has_own_start else
                                 "Must be greater than or equal to the Start KM you enter above."
                             ),
-                            key=f"dend_{r['request_id']}",
+                            key=f"dend_{gkey}",
                         )
                         return_clicked = st.form_submit_button(
                             "🏁 Complete Trip / Return", type="primary", use_container_width=True
@@ -2763,13 +3250,13 @@ elif user["role"] == "driver":
                             st.error("End KM cannot be less than Start KM.")
                         else:
                             try:
-                                submit_driver_km(
-                                    r.to_dict(),
+                                submit_driver_km_group(
+                                    [x.to_dict() for x in grp],
                                     driver_start_km=d_start_km,
                                     driver_end_km=d_end_km,
                                 )
                                 st.success(
-                                    f"✅ Trip completed for {r['applicant_name']}. "
+                                    f"✅ Trip completed ({len(grp)} requisition(s)). "
                                     f"Distance: **{d_end_km - d_start_km:.1f} KM**. "
                                     "A Telegram alert has been sent."
                                 )
@@ -2953,12 +3440,63 @@ elif user["role"] == "admin":
         # before for one-at-a-time decisions.
         # ---------------------------------------------------------------
         if not pending_df.empty and not drivers_df.empty and not vehicles_df.empty:
+            with st.expander("➕ Add to an Already-Approved Trip (same driver & vehicle)"):
+                st.caption(
+                    "Use this when a trip is ALREADY Approved (or On Trip) and another request comes in "
+                    "for the same time — e.g. Commercial's HIACE at 11:30 AM is approved with Manik, then "
+                    "HR asks for 11:30 AM too. Pick the new request(s) and the existing trip: they join it, "
+                    "Manik sees ONE trip and enters KM once."
+                )
+                open_trips = df_all[df_all["status"].isin(["Approved", "On Trip"])]
+                if open_trips.empty:
+                    st.info("No Approved / On Trip trips to join right now.")
+                else:
+                    attach_pending_rows = {r["request_id"]: r for _, r in pending_df.iterrows()}
+                    attach_option_map = {
+                        f"{short_req_id(r.get('id'))} — {r['applicant_name']} ({r['department']}) → "
+                        f"{r['destination']} @ {fmt_time_12h(r['time_of_travel'])}": r["request_id"]
+                        for _, r in pending_df.iterrows()
+                    }
+                    attach_selected = st.multiselect(
+                        "1. New Pending request(s) to add", list(attach_option_map.keys()), key="attach_select",
+                    )
+                    target_map = {}
+                    for _, t in open_trips.iterrows():
+                        t_time = t["time_of_travel"] if is_blank(t.get("approved_time")) else t.get("approved_time")
+                        target_map[
+                            f"{short_req_id(t.get('id'))} — {t['status']} — Driver: {fmt(t.get('driver_name'))} / "
+                            f"Vehicle: {fmt(t.get('vehicle_number'))} @ {fmt_time_12h(t_time)} — "
+                            f"{t['applicant_name']} → {t['destination']}"
+                        ] = t["request_id"]
+                    attach_target_label = st.selectbox(
+                        "2. Join this existing trip", list(target_map.keys()), key="attach_target",
+                    )
+                    if st.button(
+                        f"➕ Add {len(attach_selected)} request(s) to this trip", type="primary",
+                        use_container_width=True, disabled=not attach_selected, key="attach_submit",
+                    ):
+                        a_ids = [attach_option_map[l] for l in attach_selected]
+                        a_target = df_all[df_all["request_id"] == target_map[attach_target_label]].iloc[0]
+                        try:
+                            with st.spinner("Adding to the trip..."):
+                                attach_requisitions_to_trip(
+                                    a_ids, [attach_pending_rows[i] for i in a_ids], a_target, user["full_name"],
+                                )
+                            st.success(
+                                f"✅ Added {len(a_ids)} request(s) to the trip — Driver "
+                                f"**{fmt(a_target.get('driver_name'))}** / Vehicle **{fmt(a_target.get('vehicle_number'))}**."
+                            )
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Failed to add to the trip: {e}")
+
             with st.expander("🚐 Bulk Assign Vehicle & Driver (Multiple Requests at Once)"):
                 st.caption(
-                    "Select two or more Pending requests below, pick ONE Driver, Vehicle, and "
-                    "Departure Time, and approve all of them together in a single click — handy "
-                    "when several people are sharing the same trip."
+                    "Select two or more Pending requests, pick ONE Driver, Vehicle and Departure Time, "
+                    "and approve them together. They become ONE group trip: the team gets a single "
+                    "combined Telegram message, and the Driver enters Start/End KM only once for all of them."
                 )
+                pending_rows = {r["request_id"]: r for _, r in pending_df.iterrows()}
                 bulk_option_map = {
                     f"{short_req_id(r.get('id'))} — {r['applicant_name']} ({r['department']}) → "
                     f"{r['destination']} @ {fmt_time_12h(r['time_of_travel'])}": r["request_id"]
@@ -3002,35 +3540,37 @@ elif user["role"] == "admin":
                     type="primary", use_container_width=True, disabled=not bulk_ready,
                     key="bulk_assign_submit",
                 ):
-                    now_str = bd_now_str()
+                    ids = [bulk_option_map[l] for l in bulk_selected_labels]
+                    approved_hhmm = bulk_time.strftime("%H:%M")
                     bulk_updates = {
                         "status": "Approved",
                         "driver_name": bulk_driver,
                         "driver_contact": driver_contact_map.get(bulk_driver, ""),
                         "vehicle_number": bulk_vehicle,
                         "approved_by": user["full_name"],
-                        "action_timestamp": now_str,
-                        "approved_time": bulk_time.strftime("%H:%M"),
+                        "action_timestamp": bd_now_str(),
+                        "approved_time": approved_hhmm,
                         "admin_note": bulk_note.strip(),
+                        "trip_group_id": generate_trip_group_id(),
                     }
-                    done, failed = [], []
-                    with st.spinner("Approving selected requests..."):
-                        for label in bulk_selected_labels:
-                            req_id = bulk_option_map[label]
-                            try:
-                                update_requisition(req_id, bulk_updates)
-                                done.append(label)
-                            except Exception as e:
-                                failed.append(f"{label} ({e})")
-                    if done:
+                    try:
+                        with st.spinner("Approving selected requests..."):
+                            bulk_update_requisitions(ids, bulk_updates)
+                            send_bulk_assignment_alert(
+                                [pending_rows[i] for i in ids], bulk_driver, bulk_vehicle,
+                                approved_hhmm, user["full_name"], bulk_note.strip(),
+                            )
                         st.success(
-                            f"✅ Approved {len(done)} requests with Driver **{bulk_driver}** / "
+                            f"✅ Approved {len(ids)} requests as ONE group trip — Driver **{bulk_driver}** / "
                             f"Vehicle **{bulk_vehicle}**."
                         )
-                    if failed:
-                        st.error("⚠️ Failed:\n\n" + "\n".join(f"- {f}" for f in failed))
-                    if done:
                         st.rerun()
+                    except Exception as e:
+                        st.error(
+                            f"❌ Bulk approval failed: {e}\n\n"
+                            "If this mentions `trip_group_id`, run this once in the Supabase SQL Editor: "
+                            "`alter table requisitions add column if not exists trip_group_id text;`"
+                        )
                 elif not bulk_ready and bulk_selected_labels:
                     st.caption("⚠️ Select at least 2 requests and choose a Driver and Vehicle to enable bulk approval.")
 
@@ -3692,7 +4232,7 @@ elif user["role"] == "admin":
                 completed_trips["_eff_km"] = completed_trips.apply(
                     lambda row: effective_km_fields(row)[2], axis=1
                 )
-                total_km_all = float(completed_trips["_eff_km"].sum())
+                total_km_all = float(completed_trips["_eff_km"].where(~mark_group_duplicates(completed_trips), 0.0).sum())
                 st.metric("🛣️ Total KM Covered (Completed Trips — Driver-verified)", f"{total_km_all:.1f} KM")
 
             df_all["_dt"] = pd.to_datetime(df_all["date_of_travel"], errors="coerce")
@@ -3770,6 +4310,8 @@ elif user["role"] == "admin":
     # ---------------- Edit / Delete Trip (NEW) ----------------
     if tab_edit_trip:
         st.subheader("✏️ Edit or Delete a Requisition")
+        if st.session_state.get("edit_flash"):
+            st.success(st.session_state.pop("edit_flash"))
         st.caption(
             "Use this to fix a mistaken entry — e.g. a driver typed the wrong odometer "
             "reading, a wrong destination/time was saved, or a duplicate/test request needs "
@@ -3874,243 +4416,71 @@ elif user["role"] == "admin":
 
             edit_drivers_df = fetch_all_drivers()
             edit_vehicles_df = fetch_all_vehicles()
-            edit_driver_contact_map = (
-                dict(zip(edit_drivers_df["driver_name"], edit_drivers_df["driver_contact"]))
-                if not edit_drivers_df.empty else {}
-            )
-            edit_driver_choices = edit_drivers_df["driver_name"].tolist() if not edit_drivers_df.empty else []
 
-            # ---- STEP 1: pick a Driver first ----
-            # "Approved" trips are shown here as "🟡 Pending / Upcoming" from
-            # the driver's own perspective — assigned to them but not yet
-            # Gated Out. "All / No Driver Assigned" keeps the old behaviour
-            # of browsing every requisition (e.g. still-Pending requests
-            # that haven't been assigned a driver yet, or Rejected ones).
-            driver_filter_choices = ["— All / No Driver Assigned —"] + edit_driver_choices
-            selected_edit_driver = st.selectbox(
-                "1️⃣ Select Driver", driver_filter_choices, key="edit_trip_driver_filter",
-            )
+            st.markdown("##### 🔎 1. Find the trip (any status — Pending, Approved, On Trip, Completed, Rejected)")
+            ef1, ef2, ef3 = st.columns([2, 2, 3])
+            with ef1:
+                edit_status_filter = st.multiselect("Status (empty = all)", REQ_STATUS_OPTIONS, key="edit_find_status")
+            with ef2:
+                known_drivers = sorted({str(d).strip() for d in df_all["driver_name"].dropna().tolist() if str(d).strip()})
+                edit_driver_filter = st.selectbox("Driver", ["All Drivers"] + known_drivers, key="edit_find_driver")
+            with ef3:
+                edit_search = st.text_input(
+                    "Search", key="edit_find_search",
+                    placeholder="Req # (e.g. 42), name, destination, vehicle, purpose...",
+                )
+            edit_date_on = st.checkbox("Filter by Date of Travel", key="edit_find_date_on")
+            edit_date_range = None
+            if edit_date_on:
+                edit_date_range = st.date_input("Date of Travel range", value=(bd_today(), bd_today()),
+                                                key="edit_find_date_range")
 
-            if selected_edit_driver == "— All / No Driver Assigned —":
-                driver_scoped_df = df_all
+            edit_scope = df_all.copy()
+            if edit_status_filter:
+                edit_scope = edit_scope[edit_scope["status"].isin(edit_status_filter)]
+            if edit_driver_filter != "All Drivers":
+                _tk = _normalize_driver_name(edit_driver_filter)
+                edit_scope = edit_scope[edit_scope["driver_name"].map(_normalize_driver_name) == _tk]
+            if edit_date_on and edit_date_range:
+                _edate = pd.to_datetime(edit_scope["date_of_travel"], errors="coerce").dt.date
+                if isinstance(edit_date_range, (tuple, list)) and len(edit_date_range) == 2:
+                    edit_scope = edit_scope[(_edate >= edit_date_range[0]) & (_edate <= edit_date_range[1])]
+                elif isinstance(edit_date_range, (tuple, list)) and len(edit_date_range) == 1:
+                    edit_scope = edit_scope[_edate == edit_date_range[0]]
+            if edit_search.strip():
+                _needle = edit_search.strip().lstrip("#").lower()
+                _blob = pd.Series("", index=edit_scope.index)
+                for _c in ("applicant_name", "destination", "vehicle_number", "driver_name",
+                           "purpose", "department", "request_id"):
+                    if _c in edit_scope.columns:
+                        _blob = _blob + " " + edit_scope[_c].fillna("").astype(str)
+                _mask = _blob.str.lower().str.contains(_needle, regex=False)
+                if _needle.isdigit() and "id" in edit_scope.columns:
+                    _ids = pd.to_numeric(edit_scope["id"], errors="coerce").fillna(-1).astype(int).astype(str)
+                    _mask = _mask | (_ids == _needle)
+                edit_scope = edit_scope[_mask]
+
+            if edit_scope.empty:
+                st.info("No requisitions match these filters.")
             else:
-                target_key = _normalize_driver_name(selected_edit_driver)
-                driver_scoped_df = df_all[df_all["driver_name"].map(_normalize_driver_name) == target_key]
-
-            if driver_scoped_df.empty:
-                st.warning(
-                    f"No requisitions found for **{selected_edit_driver}** — showing all "
-                    "requisitions instead."
+                EDIT_MAX_OPTIONS = 300
+                if len(edit_scope) > EDIT_MAX_OPTIONS:
+                    st.caption(f"Showing the newest {EDIT_MAX_OPTIONS} of {len(edit_scope)} matches — narrow the filters to find older ones.")
+                edit_options = {}
+                for _, _r in edit_scope.head(EDIT_MAX_OPTIONS).iterrows():
+                    _label = (
+                        f"{short_req_id(_r.get('id'))} | {STATUS_BADGE.get(_r['status'], _r['status'])} | "
+                        f"{_r['date_of_travel']} {fmt_time_12h(_r['time_of_travel'], '')} | "
+                        f"{_r['applicant_name']} → {_r['destination']} | 🚘 {fmt(_r.get('driver_name'), '—')}"
+                    )
+                    edit_options[_label] = _r["request_id"]
+                selected_label = st.selectbox(
+                    f"2. Select the requisition to edit ({len(edit_scope)} found)",
+                    list(edit_options.keys()), key="edit_trip_select",
                 )
-                driver_scoped_df = df_all
-
-            # ---- STEP 2: pick a trip category for that driver ----
-            status_groups = {
-                "🟡 Pending / Upcoming (Approved, not yet started)": "Approved",
-                "🔵 On Trip": "On Trip",
-                "✅ Completed": "Completed",
-                "⏳ Still Pending (no driver assigned yet)": "Pending",
-                "🔴 Rejected": "Rejected",
-            }
-            # Only offer categories that actually have at least one matching
-            # row, so the dropdown doesn't show empty groups.
-            available_groups = {
-                label: status_val for label, status_val in status_groups.items()
-                if not driver_scoped_df[driver_scoped_df["status"] == status_val].empty
-            }
-            if not available_groups:
-                st.warning("No categorized trips found for this selection — showing all statuses instead.")
-                available_groups = {
-                    STATUS_BADGE.get(s, s): s
-                    for s in sorted(driver_scoped_df["status"].dropna().unique().tolist())
-                }
-
-            selected_group_label = st.selectbox(
-                "2️⃣ Select Trip Category", list(available_groups.keys()), key="edit_trip_status_filter",
-            )
-            category_df = driver_scoped_df[driver_scoped_df["status"] == available_groups[selected_group_label]]
-
-            # ---- STEP 3: pick the specific requisition to edit ----
-            edit_options = {
-                f"{short_req_id(r.get('id'))} — {r['applicant_name']} → {r['destination']} ({r['date_of_travel']})": r["request_id"]
-                for _, r in category_df.iterrows()
-            }
-            selected_label = st.selectbox(
-                "3️⃣ Select Requisition to Edit", list(edit_options.keys()), key="edit_trip_select"
-            )
-            selected_request_id = edit_options[selected_label]
-            row = df_all[df_all["request_id"] == selected_request_id].iloc[0]
-            selected_short_id = short_req_id(row.get("id"))
-            st.caption(f"Technical ID: `{selected_request_id}`")
-            st.markdown("---")
-
-            edit_driver_choices = edit_drivers_df["driver_name"].tolist() if not edit_drivers_df.empty else []
-            edit_vehicle_choices = edit_vehicles_df["vehicle_number"].tolist() if not edit_vehicles_df.empty else []
-            # Always keep the row's CURRENT driver/vehicle selectable even if
-            # it's since been removed from Manage Drivers & Vehicles, so
-            # opening this form never silently wipes out a valid historical
-            # assignment just because the master list changed later.
-            current_driver = fmt(row.get("driver_name"), "")
-            current_vehicle = fmt(row.get("vehicle_number"), "")
-            if current_driver and current_driver not in edit_driver_choices:
-                edit_driver_choices = [current_driver] + edit_driver_choices
-            if current_vehicle and current_vehicle not in edit_vehicle_choices:
-                edit_vehicle_choices = [current_vehicle] + edit_vehicle_choices
-            edit_driver_choices_display = ["— None —"] + edit_driver_choices
-            edit_vehicle_choices_display = ["— None —"] + edit_vehicle_choices
-
-            with st.form("edit_trip_form"):
-                st.markdown("##### Trip Details")
-                e1, e2 = st.columns(2)
-                with e1:
-                    et_applicant_name = st.text_input("Applicant Name", value=fmt(row.get("applicant_name"), ""))
-                    et_department = st.selectbox(
-                        "Department", DEPARTMENTS,
-                        index=DEPARTMENTS.index(row.get("department")) if row.get("department") in DEPARTMENTS else 0,
-                    )
-                    et_mobile = st.text_input("Mobile Number", value=fmt(row.get("mobile_number"), ""))
-                    et_passenger_count = st.number_input(
-                        "Passenger Count", min_value=1, max_value=50,
-                        value=int(row.get("passenger_count") or 1),
-                    )
-                    et_status = st.selectbox(
-                        "Status", REQ_STATUS_OPTIONS,
-                        index=REQ_STATUS_OPTIONS.index(row.get("status")) if row.get("status") in REQ_STATUS_OPTIONS else 0,
-                    )
-                with e2:
-                    try:
-                        et_date_default = datetime.strptime(str(row.get("date_of_travel")), "%Y-%m-%d").date()
-                    except (ValueError, TypeError):
-                        et_date_default = bd_today()
-                    et_date = st.date_input("Date of Travel", value=et_date_default)
-                    try:
-                        et_time_default = datetime.strptime(fmt(row.get("time_of_travel"), "09:00"), "%H:%M").time()
-                    except ValueError:
-                        et_time_default = bd_now().time()
-                    et_time = time_input_12h("Time of Travel", key_prefix="edit_trip_tt", default_time=et_time_default)
-                    et_destination = st.text_input("Destination", value=fmt(row.get("destination"), ""))
-                    et_vehicle_type = st.selectbox(
-                        "Vehicle Type", VEHICLE_TYPES,
-                        index=VEHICLE_TYPES.index(row.get("vehicle_type")) if row.get("vehicle_type") in VEHICLE_TYPES else 0,
-                    )
-
-                et_purpose = st.text_area("Purpose", value=fmt(row.get("purpose"), ""), height=80)
-                et_special_request = st.text_area("Special Request", value=fmt(row.get("special_request"), ""), height=60)
-
-                st.markdown("---")
-                st.markdown("##### Driver & Vehicle Assignment")
-                d1, d2 = st.columns(2)
-                with d1:
-                    et_driver = st.selectbox(
-                        "Driver", edit_driver_choices_display,
-                        index=edit_driver_choices_display.index(current_driver) if current_driver in edit_driver_choices_display else 0,
-                    )
-                with d2:
-                    et_vehicle = st.selectbox(
-                        "Vehicle Number", edit_vehicle_choices_display,
-                        index=edit_vehicle_choices_display.index(current_vehicle) if current_vehicle in edit_vehicle_choices_display else 0,
-                    )
-
-                st.markdown("---")
-                st.markdown("##### Odometer / KM Corrections")
-                st.caption(
-                    "Tick 'leave blank' to clear a value that hasn't actually been recorded, "
-                    "instead of leaving a stray 0 that would throw off distance reports."
-                )
-                k1, k2 = st.columns(2)
-                with k1:
-                    st.markdown("**Gate Officer's readings**")
-                    sk_blank = st.checkbox("Start KM — leave blank", value=is_blank(row.get("start_km")),
-                                            key="et_sk_blank")
-                    et_start_km = st.number_input(
-                        "Start KM", min_value=0.0, step=1.0, format="%.1f",
-                        value=float(row.get("start_km")) if not is_blank(row.get("start_km")) else 0.0,
-                        disabled=sk_blank, key="et_start_km",
-                    )
-                    ek_blank = st.checkbox("End KM — leave blank", value=is_blank(row.get("end_km")),
-                                            key="et_ek_blank")
-                    et_end_km = st.number_input(
-                        "End KM", min_value=0.0, step=1.0, format="%.1f",
-                        value=float(row.get("end_km")) if not is_blank(row.get("end_km")) else 0.0,
-                        disabled=ek_blank, key="et_end_km",
-                    )
-                with k2:
-                    st.markdown("**Driver's own readings**")
-                    dsk_blank = st.checkbox("Driver Start KM — leave blank", value=is_blank(row.get("driver_start_km")),
-                                             key="et_dsk_blank")
-                    et_driver_start_km = st.number_input(
-                        "Driver Start KM", min_value=0.0, step=1.0, format="%.1f",
-                        value=float(row.get("driver_start_km")) if not is_blank(row.get("driver_start_km")) else 0.0,
-                        disabled=dsk_blank, key="et_driver_start_km",
-                    )
-                    dek_blank = st.checkbox("Driver End KM — leave blank", value=is_blank(row.get("driver_end_km")),
-                                             key="et_dek_blank")
-                    et_driver_end_km = st.number_input(
-                        "Driver End KM", min_value=0.0, step=1.0, format="%.1f",
-                        value=float(row.get("driver_end_km")) if not is_blank(row.get("driver_end_km")) else 0.0,
-                        disabled=dek_blank, key="et_driver_end_km",
-                    )
-
-                et_admin_note = st.text_area("Admin Note", value=fmt(row.get("admin_note"), ""), height=60)
-                et_notify = st.checkbox(
-                    "📢 Send a Telegram notification about this correction", value=False, key="et_notify"
-                )
-
-                et_save_clicked = st.form_submit_button("💾 Save Changes", type="primary", use_container_width=True)
-
-            if et_save_clicked:
-                updates = {
-                    "applicant_name": et_applicant_name.strip(),
-                    "department": et_department,
-                    "mobile_number": et_mobile.strip(),
-                    "passenger_count": int(et_passenger_count),
-                    "status": et_status,
-                    "date_of_travel": str(et_date),
-                    "time_of_travel": et_time.strftime("%H:%M"),
-                    "destination": et_destination.strip(),
-                    "vehicle_type": et_vehicle_type,
-                    "purpose": et_purpose.strip(),
-                    "special_request": et_special_request.strip(),
-                    "driver_name": "" if et_driver == "— None —" else et_driver,
-                    "driver_contact": "" if et_driver == "— None —" else edit_driver_contact_map.get(et_driver, ""),
-                    "vehicle_number": "" if et_vehicle == "— None —" else et_vehicle,
-                    "start_km": None if sk_blank else float(et_start_km),
-                    "end_km": None if ek_blank else float(et_end_km),
-                    "driver_start_km": None if dsk_blank else float(et_driver_start_km),
-                    "driver_end_km": None if dek_blank else float(et_driver_end_km),
-                    "admin_note": et_admin_note.strip(),
-                }
-                # Recompute total_km using the same driver-first-then-gate-officer
-                # priority as effective_km_fields() everywhere else in the app,
-                # so a manual correction here stays consistent with every
-                # report/dashboard that reads total_km.
-                updates["total_km"] = effective_km_fields(updates)[2]
-
-                try:
-                    update_requisition(selected_request_id, updates, notify=et_notify)
-                    st.success(f"✅ Requisition {selected_short_id} updated.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"❌ Failed to update: {e}")
-
-            st.markdown("---")
-            st.markdown("##### 🗑️ Delete This Requisition Permanently")
-            st.caption(
-                f"This permanently removes **{selected_short_id}** from the system — it will "
-                "disappear from every report, export, and dashboard. This cannot be undone."
-            )
-            confirm_delete_trip = st.checkbox(
-                f"I understand this will permanently delete {selected_short_id}.",
-                key=f"confirm_del_trip_{selected_request_id}",
-            )
-            if st.button("🗑️ Delete This Requisition", type="primary", disabled=not confirm_delete_trip,
-                         use_container_width=True, key=f"del_trip_btn_{selected_request_id}"):
-                try:
-                    delete_requisition(selected_request_id)
-                    st.success(f"{selected_short_id} has been deleted.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"❌ Failed to delete: {e}")
+                selected_request_id = edit_options[selected_label]
+                selected_row = df_all[df_all["request_id"] == selected_request_id].iloc[0]
+                admin_edit_trip_panel(selected_row, df_all, edit_drivers_df, edit_vehicles_df)
 
     # ---------------- Manage Drivers & Vehicles (was Tab 6) ----------------
     if tab_fleet:
@@ -4410,6 +4780,10 @@ elif user["role"] == "admin":
             # gate-officer-fallback priority as the KM total above.
             duty_filtered["_start_km"] = duty_filtered.apply(lambda row: effective_km_fields(row)[0], axis=1)
             duty_filtered["_end_km"] = duty_filtered.apply(lambda row: effective_km_fields(row)[1], axis=1)
+            # Requisitions bundled in one group trip are ONE physical run: count its
+            # distance / hours once (the 2nd+ requisition shows 0 in those two columns).
+            _dup_group_rows = mark_group_duplicates(duty_filtered)
+            duty_filtered.loc[_dup_group_rows, ["_km", "_duration_hrs"]] = 0.0
 
             # Apply the chosen sort order to the Detailed Duty Log.
             duty_filtered["_sort_driver"] = duty_filtered["driver_name"].fillna("").astype(str).str.lower()
