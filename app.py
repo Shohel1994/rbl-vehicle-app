@@ -1282,6 +1282,7 @@ def delete_shuttle_template(template_id):
 # admin_note so re-checking never depends on exact row order/count matching
 # (safe even if Admin edits/deletes one of today's six later).
 DAILY_SHUTTLE_TAG = "AUTO-DAILY-SHUTTLE"
+DAILY_NIGHT_SHIFT_TAG = "AUTO-DAILY-NIGHT-SHIFT"
 
 DAILY_SHUTTLE_TEMPLATES = [
     {"destination": "Ishwardi", "time": "19:15", "passenger_count": 8, "purpose": "Staff Drop", "vehicle_type": "HIACE"},
@@ -1292,16 +1293,29 @@ DAILY_SHUTTLE_TEMPLATES = [
     {"destination": "Bepza", "time": "20:15", "passenger_count": 1, "purpose": "Commercial Duty", "vehicle_type": "HIACE"},
 ]
 
+# Night-shift vehicle (Commercial duty, e.g. Siam: ~6:30 PM to ~4:00 AM, then the
+# morning staff drop). 5 requisitions are created automatically every day as
+# PENDING, dated the day the shift STARTS. The time below is only a starting
+# default (6:30 PM) — Admin sets the REAL time in "Approved Departure Time"
+# when approving each one (single approve or Bulk Assign).
+DAILY_NIGHT_SHIFT_TEMPLATES = [
+    {"destination": "Bepza", "time": "18:30", "passenger_count": 1, "purpose": "Commercial Duty", "vehicle_type": "HIACE"}
+    for _ in range(5)
+]
+
+# (tag, templates, applicant_name, department) — one entry per auto-created group.
+DAILY_AUTO_GROUPS = [
+    (DAILY_SHUTTLE_TAG, DAILY_SHUTTLE_TEMPLATES, "Staff Shuttle", "Admin"),
+    (DAILY_NIGHT_SHIFT_TAG, DAILY_NIGHT_SHIFT_TEMPLATES, "Night Shift Vehicle", "Commercial"),
+]
+
 
 def ensure_daily_shuttle_requisitions():
-    """Auto-creates today's fixed shuttle requisitions (Pending, no driver/
-    vehicle assigned) if they don't already exist. Runs at most once per
-    browser session per day via session_state (not on every rerun/
-    auto-refresh), and is itself idempotent via the admin_note tag check —
-    so even if two people happen to trigger it around the same time, it
-    won't double-create today's six. Any failure here is logged and
-    swallowed, never shown to the user or allowed to block the rest of the
-    app from loading."""
+    """Auto-creates today's fixed requisitions (the 6 staff shuttles AND the 5
+    night-shift vehicle requisitions) as Pending, no driver/vehicle assigned, if
+    they don't already exist. Runs at most once per browser session per day and
+    is idempotent via the admin_note tag check per group. Any failure is logged
+    and swallowed, never blocking the rest of the app."""
     today_str = str(bd_today())
     if st.session_state.get("_daily_shuttle_checked_date") == today_str:
         return
@@ -1309,41 +1323,42 @@ def ensure_daily_shuttle_requisitions():
 
     try:
         sb = get_supabase_client()
-        existing = (
-            sb.table(REQUISITIONS_TABLE)
-            .select("id")
-            .eq("date_of_travel", today_str)
-            .like("admin_note", f"%{DAILY_SHUTTLE_TAG}%")
-            .execute()
-        )
-        already_count = len(existing.data) if existing.data else 0
-        if already_count >= len(DAILY_SHUTTLE_TEMPLATES):
-            return  # today's 6 are already in place
+        for tag, templates, applicant, dept in DAILY_AUTO_GROUPS:
+            existing = (
+                sb.table(REQUISITIONS_TABLE)
+                .select("id")
+                .eq("date_of_travel", today_str)
+                .like("admin_note", f"%{tag}%")
+                .execute()
+            )
+            already_count = len(existing.data) if existing.data else 0
+            if already_count >= len(templates):
+                continue
 
-        for tpl in DAILY_SHUTTLE_TEMPLATES[already_count:]:
-            data = {
-                "request_id": generate_request_id(),
-                "username": "",
-                "applicant_name": "Staff Shuttle",
-                "department": "Admin",
-                "mobile_number": "",
-                "date_of_travel": today_str,
-                "time_of_travel": tpl["time"],
-                "destination": tpl["destination"],
-                "passenger_count": tpl["passenger_count"],
-                "vehicle_type": tpl["vehicle_type"],
-                "purpose": tpl["purpose"],
-                "special_request": "",
-                "status": "Pending",
-                "driver_name": "",
-                "driver_contact": "",
-                "vehicle_number": "",
-                "approved_by": "",
-                "admin_note": DAILY_SHUTTLE_TAG,
-            }
-            insert_requisition(data)
+            for tpl in templates[already_count:]:
+                data = {
+                    "request_id": generate_request_id(),
+                    "username": "",
+                    "applicant_name": applicant,
+                    "department": dept,
+                    "mobile_number": "",
+                    "date_of_travel": today_str,
+                    "time_of_travel": tpl["time"],
+                    "destination": tpl["destination"],
+                    "passenger_count": tpl["passenger_count"],
+                    "vehicle_type": tpl["vehicle_type"],
+                    "purpose": tpl["purpose"],
+                    "special_request": "",
+                    "status": "Pending",
+                    "driver_name": "",
+                    "driver_contact": "",
+                    "vehicle_number": "",
+                    "approved_by": "",
+                    "admin_note": tag,
+                }
+                insert_requisition(data)
     except Exception as e:
-        print(f"Daily shuttle auto-creation error: {e}")
+        print(f"Daily auto-requisition error: {e}")
 
 
 # ------------------- SESSION (REMEMBER ME) HELPERS -------------------
@@ -1856,6 +1871,58 @@ DUTY_SUMMARY_GROUP_OPTIONS = [
 ]
 
 
+def effective_trip_date(df: pd.DataFrame) -> pd.Series:
+    """The date a trip REALLY belongs to: the date of the Gate Officer's actual
+    start (actual_exit_time) when the trip has started, otherwise the requested
+    date_of_travel. So a requisition made for 4 Oct that actually left on 7 Oct
+    night is reported on 7 Oct. Returns midnight timestamps (naive). Read-only."""
+    base = pd.to_datetime(df["date_of_travel"], errors="coerce")
+    if "actual_exit_time" not in df.columns:
+        return base
+    ex = pd.to_datetime(df["actual_exit_time"], errors="coerce", utc=True, format="mixed")
+    ex = ex.dt.tz_localize(None).dt.normalize()
+    return ex.astype("datetime64[ns]").fillna(base.astype("datetime64[ns]"))
+
+
+def assign_duty_dates(df: pd.DataFrame, gap_hours: float = 6.0, max_shift_hours: float = 18.0) -> pd.DataFrame:
+    """Adds a `_duty_date` column (YYYY-MM-DD) = the date the driver's DUTY
+    SESSION started, so a night shift is reported as ONE duty on ONE date
+    instead of being split across two calendar dates.
+
+    A session = a run of trips by the same driver where the next trip starts
+    less than `gap_hours` after the previous one ended. Example (Siam):
+    7 Oct 6:30 PM -> 8 Oct 4:00 AM commercial duty, then the morning staff drop
+    ending 9:00 AM = one session dated 7 Oct. He rests at the garage, comes back
+    the evening of 8 Oct = a NEW session dated 8 Oct. Needs `_start_dt` / `_end_dt`.
+    `max_shift_hours` is a safety cap: a trip starting more than this many hours
+    after the session began always starts a NEW session, so one stuck/forgotten
+    trip (e.g. gated in a day late) can never glue several days into one duty.
+    Read-only: nothing is written anywhere."""
+    out = df.copy()
+    if out.empty:
+        out["_duty_date"] = pd.Series(dtype=str)
+        return out
+    key = out["driver_name"].map(_normalize_driver_name)
+    if "vehicle_number" in out.columns:
+        veh = out["vehicle_number"].fillna("").astype(str).str.strip().str.lower()
+        key = key.where(key.astype(str).str.strip() != "", veh)
+    out["_skey"] = key
+    out = out.sort_values(["_skey", "_start_dt"], kind="stable")
+    gap = pd.Timedelta(hours=float(gap_hours))
+    cap = pd.Timedelta(hours=float(max_shift_hours))
+    duty_dates = {}
+    for _, grp in out.groupby("_skey", sort=False):
+        sess_start, running_end = None, None
+        for idx, st_, en_ in zip(grp.index, grp["_start_dt"], grp["_end_dt"]):
+            if sess_start is None or (st_ - running_end) > gap or (st_ - sess_start) > cap:
+                sess_start, running_end = st_, en_
+            else:
+                running_end = max(running_end, en_)
+            duty_dates[idx] = sess_start.strftime("%Y-%m-%d")
+    out["_duty_date"] = pd.Series(duty_dates)
+    return out.drop(columns=["_skey"]).sort_index()
+
+
 def build_duty_summary(df: pd.DataFrame, group_option: str) -> pd.DataFrame:
     """Roll the filtered duty rows up into a summary table.
 
@@ -1879,7 +1946,7 @@ def build_duty_summary(df: pd.DataFrame, group_option: str) -> pd.DataFrame:
         return pd.DataFrame(columns=out_cols)
 
     work = df.copy()
-    work["Date"] = work["_start_dt"].dt.strftime("%Y-%m-%d")
+    work["Date"] = work["_duty_date"] if "_duty_date" in work.columns else work["_start_dt"].dt.strftime("%Y-%m-%d")
     work["Driver Name"] = work["driver_name"].map(lambda v: fmt(v, "—"))
     work["Vehicle No"] = work["vehicle_number"].map(lambda v: fmt(v, "—"))
 
@@ -1945,7 +2012,7 @@ def build_driver_daily_matrix(df: pd.DataFrame, all_driver_names=None) -> pd.Dat
     days, g = [], pd.DataFrame()
     if not work.empty:
         work["_dkey"] = work["driver_name"].map(_normalize_driver_name)
-        work["_day_sort"] = work["_start_dt"].dt.strftime("%Y-%m-%d")
+        work["_day_sort"] = work["_duty_date"] if "_duty_date" in work.columns else work["_start_dt"].dt.strftime("%Y-%m-%d")
         g = work.groupby(["_dkey", "_day_sort"]).agg(
             _s=("_start_dt", "min"), _e=("_end_dt", "max"),
             swh=("_duration_hrs", "sum"), km=("_km", "sum"),
@@ -2547,7 +2614,7 @@ def render_management_dashboard(df_all: pd.DataFrame):
                              height=min(320, 45 + 35 * len(disp)))
 
     work_df = df_all.copy()
-    work_df["_dt"] = pd.to_datetime(work_df["date_of_travel"], errors="coerce")
+    work_df["_dt"] = effective_trip_date(work_df)
     min_d = work_df["_dt"].min()
     max_d = work_df["_dt"].max()
     default_start = min_d.date() if pd.notnull(min_d) else bd_today()
@@ -3280,7 +3347,7 @@ elif user["role"] == "nurse":
     company_header("🚨 Medical Emergency Vehicle Request")
     st.caption(f"Logged in as {user['full_name']} — {user.get('designation') or 'Nurse'}")
 
-    tab_emergency, tab_my_emergency_requests = section_nav("nurse_section", 
+    tab_emergency, tab_my_emergency_requests = section_nav("nurse_section",
         ["🚨 Emergency Request", "📍 My Requests / Live Status"]
     )
 
@@ -4235,7 +4302,7 @@ elif user["role"] == "admin":
                 total_km_all = float(completed_trips["_eff_km"].where(~mark_group_duplicates(completed_trips), 0.0).sum())
                 st.metric("🛣️ Total KM Covered (Completed Trips — Driver-verified)", f"{total_km_all:.1f} KM")
 
-            df_all["_dt"] = pd.to_datetime(df_all["date_of_travel"], errors="coerce")
+            df_all["_dt"] = effective_trip_date(df_all)
             monthly = df_all.dropna(subset=["_dt"]).copy()
             if not monthly.empty:
                 monthly["Month"] = monthly["_dt"].dt.to_period("M").astype(str)
@@ -4258,12 +4325,12 @@ elif user["role"] == "admin":
             with f3:
                 dest_filter = st.text_input("Destination contains")
 
-            df_all["_dt"] = pd.to_datetime(df_all["date_of_travel"], errors="coerce")
+            df_all["_dt"] = effective_trip_date(df_all)
             min_d = df_all["_dt"].min()
             max_d = df_all["_dt"].max()
             default_start = min_d.date() if pd.notnull(min_d) else bd_today()
             default_end = max_d.date() if pd.notnull(max_d) else bd_today()
-            date_range = st.date_input("Date of Travel range", value=(default_start, default_end))
+            date_range = st.date_input("Trip date range (actual start date)", value=(default_start, default_end))
 
             filtered = df_all.copy()
             if dept_filter:
@@ -4429,10 +4496,10 @@ elif user["role"] == "admin":
                     "Search", key="edit_find_search",
                     placeholder="Req # (e.g. 42), name, destination, vehicle, purpose...",
                 )
-            edit_date_on = st.checkbox("Filter by Date of Travel", key="edit_find_date_on")
+            edit_date_on = st.checkbox("Filter by trip date (actual start date)", key="edit_find_date_on")
             edit_date_range = None
             if edit_date_on:
-                edit_date_range = st.date_input("Date of Travel range", value=(bd_today(), bd_today()),
+                edit_date_range = st.date_input("Trip date range (actual start date)", value=(bd_today(), bd_today()),
                                                 key="edit_find_date_range")
 
             edit_scope = df_all.copy()
@@ -4442,7 +4509,7 @@ elif user["role"] == "admin":
                 _tk = _normalize_driver_name(edit_driver_filter)
                 edit_scope = edit_scope[edit_scope["driver_name"].map(_normalize_driver_name) == _tk]
             if edit_date_on and edit_date_range:
-                _edate = pd.to_datetime(edit_scope["date_of_travel"], errors="coerce").dt.date
+                _edate = effective_trip_date(edit_scope).dt.date
                 if isinstance(edit_date_range, (tuple, list)) and len(edit_date_range) == 2:
                     edit_scope = edit_scope[(_edate >= edit_date_range[0]) & (_edate <= edit_date_range[1])]
                 elif isinstance(edit_date_range, (tuple, list)) and len(edit_date_range) == 1:
@@ -4730,6 +4797,28 @@ elif user["role"] == "admin":
                     key="duty_sort_option",
                 )
 
+            fc10, fc11, fc12 = st.columns(3)
+            with fc10:
+                duty_shift_aware = st.checkbox(
+                    "🌙 Night-shift aware dates", value=True, key="duty_shift_aware",
+                    help="ON: a night shift (e.g. 6:30 PM to 9:00 AM next morning) is ONE duty counted on the "
+                         "date it STARTED. OFF: every trip goes to the calendar date it started on.",
+                )
+            with fc11:
+                duty_gap_hours = st.number_input(
+                    "New duty starts after a break of (hours)", min_value=1.0, max_value=24.0, value=6.0,
+                    step=0.5, key="duty_gap_hours", disabled=not duty_shift_aware,
+                    help="If a driver's next trip starts more than this many hours after the previous one ended, "
+                         "it counts as a new duty/shift.",
+                )
+            with fc12:
+                duty_max_shift = st.number_input(
+                    "Longest single duty (hours)", min_value=10.0, max_value=36.0, value=18.0,
+                    step=1.0, key="duty_max_shift", disabled=not duty_shift_aware,
+                    help="Safety limit: a trip starting later than this after the duty began is always counted "
+                         "as a NEW duty, so one forgotten/stuck trip cannot merge several days into one.",
+                )
+
             # -------------------------------------------------------------
             # STEP 3 — Apply the date/time window + vehicle/driver filters.
             # A trip is included if its duty window OVERLAPS the selected
@@ -4737,9 +4826,21 @@ elif user["role"] == "admin":
             # captures overnight duties like "07:00 today to 06:59 tomorrow".
             # Both sides are now UTC-aware, so this comparison is safe.
             # -------------------------------------------------------------
+            # Night-shift aware duty dates: computed on ALL trips (before the
+            # date-range filter) so a shift is never cut in half by the filter.
+            if duty_shift_aware:
+                duty_base = assign_duty_dates(duty_base, duty_gap_hours, duty_max_shift)
             duty_filtered = duty_base[
                 (duty_base["_start_dt"] <= range_end) & (duty_base["_end_dt"] >= range_start)
             ].copy()
+            if duty_shift_aware and not duty_filtered.empty:
+                # Keep only duties whose DUTY DATE (the day the shift started) is
+                # inside the chosen dates, so a night shift that began before the
+                # range never shows up as a stray earlier-date row.
+                duty_filtered = duty_filtered[
+                    (duty_filtered["_duty_date"] >= str(filter_start_date))
+                    & (duty_filtered["_duty_date"] <= str(filter_end_date))
+                ].copy()
 
             if duty_vehicle_filter != "All Vehicles":
                 duty_filtered = duty_filtered[
@@ -4813,6 +4914,28 @@ elif user["role"] == "admin":
                     "are old/forgotten, complete or remove them from the **✏️ Edit / Delete Trip** tab "
                     "to get accurate duty-hour totals."
                 )
+
+            # Trips running unusually long (> 12 h) are almost always a forgotten
+            # Gate-In or a wrong time, and they inflate duty hours / merge days.
+            if not duty_filtered.empty:
+                _long = duty_filtered[
+                    ((duty_filtered["_end_dt"] - duty_filtered["_start_dt"]).dt.total_seconds() / 3600.0) > 12
+                ]
+                if not _long.empty:
+                    st.warning(
+                        f"⚠️ {len(_long)} trip(s) ran longer than 12 hours (probably a late Gate In or a wrong "
+                        "time). They inflate duty hours — check and fix them in the ✏️ Edit / Delete Trip tab."
+                    )
+                    with st.expander("Show these long trips"):
+                        _lt = pd.DataFrame({
+                            "Req #": _long["id"].map(short_req_id) if "id" in _long.columns else "",
+                            "Driver": _long["driver_name"].map(lambda v: fmt(v, "—")),
+                            "Vehicle": _long["vehicle_number"].map(lambda v: fmt(v, "—")),
+                            "Start": _long["_start_dt"].dt.strftime("%Y-%m-%d %I:%M %p").map(drop_hour_zero),
+                            "End": _long["_end_dt"].dt.strftime("%Y-%m-%d %I:%M %p").map(drop_hour_zero),
+                            "Hours": ((_long["_end_dt"] - _long["_start_dt"]).dt.total_seconds() / 3600.0).round(1),
+                        })
+                        st.dataframe(_lt, use_container_width=True, hide_index=True)
 
             # Explain an empty result instead of just showing zeros. Only trips
             # that have actually left the gate (Gate Out, or the driver's Start
