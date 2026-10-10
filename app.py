@@ -2785,10 +2785,18 @@ if "auth_user" not in st.session_state:
     # Retrying up to 6 times (up to ~1.8s total) closes that gap so a
     # remembered device goes straight to the main dashboard, with only a
     # brief "Restoring your session..." placeholder instead of the login form.
-    COOKIE_BOOTSTRAP_MAX_RETRIES = 6
+    #
+    # IMPORTANT: on many versions of the cookie component the very first run
+    # returns an EMPTY dict {} (its default), not None, while the browser's real
+    # cookies are still on the way. Treating that {} as "no cookie" is what made
+    # the login page flash for a moment and then jump to the first page by itself.
+    # So an empty result is treated as "not ready yet" too, for the first few
+    # short retries only (a truly new/logged-out browser waits ~1.2 s once, then
+    # sees the login form as usual).
+    COOKIE_BOOTSTRAP_MAX_RETRIES = 4
     cookie_retries = st.session_state.get("_cookie_bootstrap_retries", 0)
 
-    if all_cookies is None and cookie_retries < COOKIE_BOOTSTRAP_MAX_RETRIES:
+    if (not all_cookies) and cookie_retries < COOKIE_BOOTSTRAP_MAX_RETRIES:
         st.session_state["_cookie_bootstrap_retries"] = cookie_retries + 1
         st.info("🔄 Restoring your session...")
         # A fresh key each retry (rather than one static key) is what makes
