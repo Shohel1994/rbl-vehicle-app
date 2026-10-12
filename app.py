@@ -1274,18 +1274,21 @@ def delete_shuttle_template(template_id):
 
 
 # ------------------- DAILY AUTO-GENERATED SHUTTLE REQUISITIONS (NEW) -------------------
-# Fixed 6-trip daily shuttle schedule. These are created automatically
+# Fixed 5-trip daily shuttle schedule. These are created automatically
 # (no button click needed) the first time ANY logged-in user loads the app
-# each day, as Pending requisitions with driver/vehicle left blank — Admin
+# AFTER 6:30 PM (Bangladesh time) each day — these are all evening/night
+# trips, so nothing is created during morning/daytime hours — as Pending requisitions with driver/vehicle left blank — Admin
 # just opens "Pending Requests" and picks Driver + Vehicle like any normal
 # approval (including via the existing Bulk Assign feature). Tagged via
 # admin_note so re-checking never depends on exact row order/count matching
 # (safe even if Admin edits/deletes one of today's six later).
 DAILY_SHUTTLE_TAG = "AUTO-DAILY-SHUTTLE"
+# Auto-creation only starts at/after this Bangladesh time (24h clock).
+DAILY_AUTO_START_HOUR = 18
+DAILY_AUTO_START_MINUTE = 30
 DAILY_NIGHT_SHIFT_TAG = "AUTO-DAILY-NIGHT-SHIFT"
 
 DAILY_SHUTTLE_TEMPLATES = [
-    {"destination": "Ishwardi", "time": "19:15", "passenger_count": 8, "purpose": "Staff Drop", "vehicle_type": "HIACE"},
     {"destination": "Ishwardi", "time": "19:15", "passenger_count": 8, "purpose": "Staff Drop", "vehicle_type": "HIACE"},
     {"destination": "Ishwardi", "time": "19:15", "passenger_count": 8, "purpose": "Staff Drop", "vehicle_type": "HIACE"},
     {"destination": "Dashuria", "time": "19:15", "passenger_count": 8, "purpose": "Staff Drop", "vehicle_type": "HIACE"},
@@ -1311,11 +1314,19 @@ DAILY_AUTO_GROUPS = [
 
 
 def ensure_daily_shuttle_requisitions():
-    """Auto-creates today's fixed requisitions (the 6 staff shuttles AND the 5
+    """Auto-creates today's fixed requisitions (the 5 staff shuttles AND the 5
     night-shift vehicle requisitions) as Pending, no driver/vehicle assigned, if
-    they don't already exist. Runs at most once per browser session per day and
-    is idempotent via the admin_note tag check per group. Any failure is logged
-    and swallowed, never blocking the rest of the app."""
+    they don't already exist. Only runs once the Bangladesh clock reaches 6:30 PM
+    (these are evening/night trips — nothing is created in the morning/daytime).
+    Runs at most once per browser session per day and is idempotent via the
+    admin_note tag check per group. Any failure is logged and swallowed, never
+    blocking the rest of the app."""
+    now_bd = bd_now()
+    if (now_bd.hour, now_bd.minute) < (DAILY_AUTO_START_HOUR, DAILY_AUTO_START_MINUTE):
+        # Before 6:30 PM: do nothing, and do NOT mark today as "checked" so
+        # the very next load after 6:30 PM still creates them.
+        return
+
     today_str = str(bd_today())
     if st.session_state.get("_daily_shuttle_checked_date") == today_str:
         return
@@ -2828,7 +2839,7 @@ if "auth_user" not in st.session_state:
         st.stop()
 
 user = st.session_state.auth_user
-ensure_daily_shuttle_requisitions()  # auto-creates today's 6 fixed shuttle requisitions, once per session/day
+ensure_daily_shuttle_requisitions()  # auto-creates today's 5 shuttle + 5 night-shift requisitions after 6:30 PM (BD time), once per session/day
 
 # =========================================================
 # 7. SIDEBAR
