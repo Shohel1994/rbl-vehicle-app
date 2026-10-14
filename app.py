@@ -1862,6 +1862,145 @@ def build_pdf_report(df: pd.DataFrame, filters_summary: str) -> bytes:
 
 
 # =========================================================
+# 5A. EMPLOYEE SELF-SERVICE: "MY REQUISITION HISTORY" EXCEL + PDF
+# =========================================================
+# Used only by the Employee dashboard's "My Requests / Live Status" tab.
+# It receives the DataFrame from fetch_requisitions_by_user(), which is
+# already filtered on the server to the logged-in user's own rows, so a
+# user can never export anybody else's data. Nothing else in the app calls
+# these helpers, so no other screen is affected.
+def build_my_history_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean, human-readable copy of a user's requisitions for export."""
+    rows = []
+    for _, r in df.iterrows():
+        s_km, e_km, t_km = effective_km_fields(r)
+        approved_time = r.get("approved_time")
+        rows.append({
+            "Req #": short_req_id(r.get("id")),
+            "Requested On": fmt_time_12h(r.get("created_at"), ""),
+            "Date of Travel": fmt(r.get("date_of_travel"), ""),
+            "Time of Travel": fmt_time_12h(r.get("time_of_travel"), ""),
+            "Destination": fmt(r.get("destination"), ""),
+            "Passengers": fmt(r.get("passenger_count"), ""),
+            "Vehicle Type": fmt(r.get("vehicle_type"), ""),
+            "Purpose": fmt(r.get("purpose"), ""),
+            "Special Request": fmt(r.get("special_request"), ""),
+            "Status": fmt(r.get("status"), ""),
+            "Driver": fmt(r.get("driver_name"), ""),
+            "Driver Contact": fmt(r.get("driver_contact"), ""),
+            "Vehicle No.": fmt(r.get("vehicle_number"), ""),
+            "Approved Departure": fmt_time_12h(approved_time, "") if not is_blank(approved_time) else "",
+            "Gate Out": fmt_time_12h(r.get("actual_exit_time"), ""),
+            "Gate In": fmt_time_12h(r.get("actual_return_time"), ""),
+            "Start KM": "" if s_km is None else s_km,
+            "End KM": "" if e_km is None else e_km,
+            "Total KM": "" if s_km is None else t_km,
+            "Admin Note": fmt(r.get("admin_note"), ""),
+        })
+    return pd.DataFrame(rows)
+
+
+def _my_history_counts(hist_df: pd.DataFrame) -> dict:
+    counts = {"Total": len(hist_df)}
+    for status in REQ_STATUS_OPTIONS:
+        counts[status] = int((hist_df["Status"] == status).sum()) if not hist_df.empty else 0
+    km = pd.to_numeric(hist_df["Total KM"], errors="coerce").sum() if not hist_df.empty else 0
+    counts["Total KM"] = round(float(km), 1)
+    return counts
+
+
+def build_my_history_excel(hist_df: pd.DataFrame, user: dict) -> bytes:
+    counts = _my_history_counts(hist_df)
+    summary_rows = [
+        ("Company", COMPANY_NAME), ("Name", user.get("full_name", "")),
+        ("Username", user.get("username", "")), ("Department", user.get("department", "")),
+        ("Generated on (BD time)", bd_now().strftime("%Y-%m-%d %I:%M %p")),
+    ] + [(k, v) for k, v in counts.items()]
+    summary_df = pd.DataFrame(summary_rows, columns=["Item", "Value"])
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        hist_df.to_excel(writer, index=False, sheet_name="My Requisitions")
+        summary_df.to_excel(writer, index=False, sheet_name="Summary")
+        _autofit_columns(writer, [("My Requisitions", hist_df), ("Summary", summary_df)])
+        # Bold, coloured header row + frozen header, so it looks like a report.
+        from openpyxl.styles import Font, PatternFill, Alignment
+        for name in ("My Requisitions", "Summary"):
+            ws = writer.sheets[name]
+            ws.freeze_panes = "A2"
+            for cell in ws[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="0F62FE")
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+    return buf.getvalue()
+
+
+class MyHistoryPDF(ReportPDF):
+    def header(self):
+        self.set_font("Helvetica", "B", 16)
+        self.set_text_color(15, 98, 254)
+        self.cell(0, 9, sanitize_pdf_text(COMPANY_NAME), align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        self.set_font("Helvetica", "", 10)
+        self.set_text_color(90, 90, 90)
+        self.cell(0, 6, sanitize_pdf_text(COMPANY_ADDRESS), align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        self.set_font("Helvetica", "B", 12)
+        self.set_text_color(0, 0, 0)
+        self.cell(0, 8, "My Vehicle Requisition History", align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        self.ln(2)
+
+
+def build_my_history_pdf(hist_df: pd.DataFrame, user: dict) -> bytes:
+    counts = _my_history_counts(hist_df)
+    pdf = MyHistoryPDF(orientation="L", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", size=10)
+    pdf.cell(0, 6, sanitize_pdf_text(
+        f"Name: {user.get('full_name', '')}   |   Department: {user.get('department', '')}   |   "
+        f"Username: {user.get('username', '')}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(0, 6, f"Generated on: {bd_now().strftime('%Y-%m-%d %I:%M %p')} (BD time)",
+             new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(2)
+
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 8, "Summary", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font("Helvetica", size=9)
+    pdf.set_fill_color(230, 230, 230)
+    for label in ["Total"] + REQ_STATUS_OPTIONS:
+        pdf.cell(38, 7, f"{label}: {counts[label]}", border=1, align="C", fill=True)
+    pdf.ln(12)
+
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 8, "Requisition Records", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(1)
+
+    headers = ["Req #", "Date", "Time", "Destination", "Purpose", "Pax", "Vehicle Type",
+               "Status", "Driver", "Vehicle No.", "Total KM", "Admin Note"]
+    cols = ["Req #", "Date of Travel", "Time of Travel", "Destination", "Purpose", "Passengers",
+            "Vehicle Type", "Status", "Driver", "Vehicle No.", "Total KM", "Admin Note"]
+    col_widths = [13, 19, 16, 34, 40, 10, 19, 17, 25, 23, 14, 27]
+
+    pdf.set_font("Helvetica", size=7)
+    heading_style = FontFace(emphasis="BOLD", color=(255, 255, 255), fill_color=(15, 98, 254))
+    with pdf.table(col_widths=col_widths, text_align="LEFT", first_row_as_headings=True,
+                   line_height=5, headings_style=heading_style, cell_fill_color=(245, 245, 245),
+                   cell_fill_mode="ROWS") as table:
+        header_row = table.row()
+        for h in headers:
+            header_row.cell(h)
+        for _, r in hist_df.iterrows():
+            row = table.row()
+            for col in cols:
+                row.cell(sanitize_pdf_text(r.get(col, "")))
+
+    pdf.ln(2)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(0, 8, f"Total KM: {counts['Total KM']:.1f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    return bytes(pdf.output())
+
+
+# =========================================================
 # 5B. DUTY TRACKER — EXCEL + PDF REPORT GENERATORS
 # =========================================================
 # These are ADDITIVE helpers for the new "Duty Tracker & Analytics" tab
@@ -2983,6 +3122,31 @@ if user["role"] == "user":
         if my_df.empty:
             st.info("You haven't submitted any requisitions yet.")
         else:
+            # ---- Download my complete history (Excel + PDF) — own data only ----
+            st.markdown("##### 📥 Download My Request History")
+            st.caption("Your complete requisition history (all dates, all statuses) — only your own requests.")
+            try:
+                my_hist_df = build_my_history_df(my_df)
+                _safe_user = re.sub(r"[^A-Za-z0-9_-]", "_", str(user["username"]))
+                _stamp = bd_now().strftime("%Y%m%d_%H%M")
+                hd1, hd2 = st.columns(2)
+                with hd1:
+                    st.download_button(
+                        "⬇️ Download Excel (.xlsx)", data=build_my_history_excel(my_hist_df, user),
+                        file_name=f"my_requisition_history_{_safe_user}_{_stamp}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True, key="my_hist_xlsx",
+                    )
+                with hd2:
+                    st.download_button(
+                        "⬇️ Download PDF (.pdf)", data=build_my_history_pdf(my_hist_df, user),
+                        file_name=f"my_requisition_history_{_safe_user}_{_stamp}.pdf",
+                        mime="application/pdf", use_container_width=True, key="my_hist_pdf",
+                    )
+            except Exception as e:
+                st.warning(f"Could not prepare the download files right now: {e}")
+            st.markdown("---")
+
             for _, r in my_df.iterrows():
                 with st.container():
                     st.markdown(f"""
@@ -3318,8 +3482,14 @@ elif user["role"] == "driver":
                             )
                         else:
                             d_start_km = start_km_val
+                        if has_own_start:
+                            st.caption(
+                                f"✏️ End KM is pre-filled with your Start KM ({start_km_val:.1f}). "
+                                "Just change the last 2-3 digits to the current odometer reading."
+                            )
                         d_end_km = st.number_input(
                             "End KM (Odometer Reading) *", min_value=0.0, step=1.0, format="%.1f",
+                            value=float(start_km_val) if has_own_start else 0.0,
                             help=(
                                 f"Must be greater than or equal to your Start KM ({start_km_val:.1f})."
                                 if has_own_start else
@@ -3334,6 +3504,13 @@ elif user["role"] == "driver":
                     if return_clicked:
                         if d_end_km < d_start_km:
                             st.error("End KM cannot be less than Start KM.")
+                        elif has_own_start and d_end_km == d_start_km:
+                            # End KM now starts pre-filled with the Start KM, so make sure
+                            # the driver didn't press the button without updating it.
+                            st.error(
+                                "End KM is still the same as Start KM — please change the last "
+                                "digits to the current odometer reading, then submit."
+                            )
                         else:
                             try:
                                 submit_driver_km_group(
