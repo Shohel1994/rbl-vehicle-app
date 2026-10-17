@@ -485,6 +485,7 @@ def _clear_user_caches():
 
 def _clear_requisition_caches():
     fetch_all_requisitions.clear()
+    fetch_active_requisitions.clear()
     fetch_requisitions_by_user.clear()
     fetch_requisitions_by_driver.clear()
     get_last_driver_end_km.clear()
@@ -580,6 +581,22 @@ REQUISITION_COLUMNS = [
 def fetch_all_requisitions() -> pd.DataFrame:
     sb = get_supabase_client()
     res = sb.table(REQUISITIONS_TABLE).select("*").order("created_at", desc=True).execute()
+    return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=REQUISITION_COLUMNS)
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def fetch_active_requisitions() -> pd.DataFrame:
+    """Only Pending / Approved / On Trip requisitions — a small, constant-size
+    slice (it does NOT grow as history piles up), used by Admin's landing page
+    so it opens fast. Sections that need the full history use fetch_all_requisitions()."""
+    sb = get_supabase_client()
+    res = (
+        sb.table(REQUISITIONS_TABLE)
+        .select("*")
+        .in_("status", ["Pending", "Approved", "On Trip"])
+        .order("created_at", desc=True)
+        .execute()
+    )
     return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=REQUISITION_COLUMNS)
 
 
@@ -2106,7 +2123,36 @@ def assign_duty_dates(df: pd.DataFrame, gap_hours: float = 6.0, max_shift_hours:
     return out.drop(columns=["_skey"]).sort_index()
 
 
-def build_duty_summary(df: pd.DataFrame, group_option: str) -> pd.DataFrame:
+def duty_span_hours(starts, ends, idle_gap_hours: float = 6.0) -> float:
+    """Duty time (TWH) of ONE driver (or vehicle) for ONE day.
+
+    = first trip start -> last trip end, but any break with NO trip for MORE than
+    `idle_gap_hours` is cut out and NOT counted. Example: a 7:00-9:00 AM trip and
+    a 6:30 PM-8:30 AM night duty on the same date is 2 h + 14 h = 16 h, not the
+    25.5 h you get by counting the whole 9.5 h rest in between. Shorter breaks
+    between trips (<= idle_gap_hours) still count as duty time, as before.
+    Read-only helper; `starts` / `ends` are datetime sequences."""
+    pairs = sorted(
+        ((s_, e_) for s_, e_ in zip(starts, ends) if pd.notna(s_) and pd.notna(e_)),
+        key=lambda p: p[0],
+    )
+    gap = pd.Timedelta(hours=float(idle_gap_hours))
+    total = pd.Timedelta(0)
+    blk_s = blk_e = None
+    for s_, e_ in pairs:
+        if blk_s is None:
+            blk_s, blk_e = s_, e_
+        elif (s_ - blk_e) > gap:
+            total += blk_e - blk_s
+            blk_s, blk_e = s_, e_
+        else:
+            blk_e = max(blk_e, e_)
+    if blk_s is not None:
+        total += blk_e - blk_s
+    return total.total_seconds() / 3600.0
+
+
+def build_duty_summary(df: pd.DataFrame, group_option: str, idle_gap_hours: float = 6.0) -> pd.DataFrame:
     """Roll the filtered duty rows up into a summary table.
 
     `df` is the already-filtered duty DataFrame from the Duty Tracker tab; it
@@ -2145,11 +2191,15 @@ def build_duty_summary(df: pd.DataFrame, group_option: str) -> pd.DataFrame:
         .reset_index()
     )
     # DUTY TIME = first trip start -> last trip end, per driver (or vehicle)
-    # per day, so gaps between trips are INCLUDED (e.g. 6:50 AM -> 9:00 PM).
+    # per day, so short gaps between trips are INCLUDED (e.g. 6:50 AM -> 9:00 PM),
+    # but a break with no trip for more than `idle_gap_hours` is NOT counted.
     # "Run Hours" stays the plain sum of each trip's own Start->End time.
     entity = "Vehicle No" if "Vehicle No" in keys else "Driver Name"
-    day = work.groupby(["Date", entity]).agg(_s=("_start_dt", "min"), _e=("_end_dt", "max")).reset_index()
-    day["duty_hrs"] = (day["_e"] - day["_s"]).dt.total_seconds() / 3600.0
+    day = pd.DataFrame(
+        [(d_, e_, duty_span_hours(grp["_start_dt"], grp["_end_dt"], idle_gap_hours))
+         for (d_, e_), grp in work.groupby(["Date", entity])],
+        columns=["Date", entity, "duty_hrs"],
+    )
     duty = day.groupby(keys)["duty_hrs"].sum().reset_index()
     g = g.merge(duty, on=keys, how="left")
     g["duty_hrs"] = g["duty_hrs"].fillna(0.0)
@@ -2170,17 +2220,103 @@ def build_duty_summary(df: pd.DataFrame, group_option: str) -> pd.DataFrame:
     return g[out_cols].reset_index(drop=True)
 
 
+def build_suspicious_trips(df: pd.DataFrame, min_hrs: float = 3.0, max_kmh: float = 10.0,
+                           always_hrs: float = 6.0) -> pd.DataFrame:
+    """Trips worth a second look, one row per physical trip (requisitions
+    bundled in a group trip appear once, with all their Req #s):
+      * EVERY trip that ran longer than `always_hrs` hours, whatever its KM, and
+      * shorter trips (at least `min_hrs` hours) that covered very FEW km (or no
+        km at all) — the classic sign of a forgotten / late "End Trip".
+    Needs the Duty Tracker helper columns _start_dt, _end_dt, _km. Read-only."""
+    cols = ["Req #", "Driver", "Vehicle", "Start", "End", "Hours", "KM", "Avg km/h", "Why flagged"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=cols)
+    rv = df.copy()
+    rv["_km_num"] = pd.to_numeric(rv["_km"], errors="coerce")
+    g = rv["trip_group_id"] if "trip_group_id" in rv.columns else pd.Series(None, index=rv.index, dtype=object)
+    has = g.notna() & (g.astype(str).str.strip() != "")
+    solo = pd.Series(["row-" + str(i) for i in range(len(rv))], index=rv.index)
+    rv["_tkey"] = g.astype(str).where(has, solo)
+    trips = rv.groupby("_tkey", sort=False).agg(
+        start=("_start_dt", "min"), end=("_end_dt", "max"), km=("_km_num", "max"),
+        driver=("driver_name", "first"), vehicle=("vehicle_number", "first"),
+        ids=("id", lambda s_: ", ".join(short_req_id(v) for v in s_)),
+        still_open=("status", lambda s_: bool((s_ == "On Trip").any())),
+    ).reset_index(drop=True)
+    trips["hrs"] = (trips["end"] - trips["start"]).dt.total_seconds() / 3600.0
+    trips["kmh"] = trips["km"] / trips["hrs"].where(trips["hrs"] > 0)
+    slow = trips["km"].isna() | (trips["km"] <= 0) | (trips["kmh"] < float(max_kmh))
+    flagged = trips[
+        (trips["hrs"] >= float(always_hrs)) | ((trips["hrs"] >= float(min_hrs)) & slow)
+    ].copy()
+    if flagged.empty:
+        return pd.DataFrame(columns=cols)
+
+    def _why(r):
+        if r["still_open"]:
+            return "Still On Trip — End Trip not recorded yet"
+        if pd.isna(r["km"]) or r["km"] <= 0:
+            return "No KM recorded for a long trip"
+        if r["km"] / r["hrs"] < float(max_kmh):
+            return f"Only {r['km']:.0f} km in {r['hrs']:.1f} h — maybe End Trip was done late"
+        return f"Trip ran {r['hrs']:.1f} h (longer than {float(always_hrs):g} h) — please check"
+
+    flagged = flagged.sort_values("hrs", ascending=False)
+    return pd.DataFrame({
+        "Req #": flagged["ids"],
+        "Driver": flagged["driver"].map(lambda v: fmt(v, "—")),
+        "Vehicle": flagged["vehicle"].map(lambda v: fmt(v, "—")),
+        "Start": flagged["start"].dt.strftime("%d-%b %I:%M %p").map(drop_hour_zero),
+        "End": flagged["end"].dt.strftime("%d-%b %I:%M %p").map(drop_hour_zero),
+        "Hours": flagged["hrs"].round(1),
+        "KM": flagged["km"].round(1),
+        "Avg km/h": flagged["kmh"].round(1),
+        "Why flagged": flagged.apply(_why, axis=1),
+    }).reset_index(drop=True)
+
+
+def build_long_duty_list(df: pd.DataFrame, limit_hrs: float = 12.0, idle_gap_hours: float = 6.0) -> pd.DataFrame:
+    """Driver-days whose duty time (first trip start -> last trip end without
+    long idle breaks, exactly the 'Total Duty Hours' of the Driver + Date summary) is MORE than
+    `limit_hrs`, with the Req #s of that duty and its longest trip so the cause
+    is easy to find. Read-only."""
+    cols = ["Date", "Driver Name", "Total Duty Time (h m)", "Total Duty Hours", "Trips", "Total KM",
+            "First Start", "Last End", "Longest trip", "Requisitions"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=cols)
+    summ = build_duty_summary(df, "Driver + Date (daily)", idle_gap_hours)
+    over = summ[summ["Total Duty Hours"] > float(limit_hrs)].copy()
+    if over.empty:
+        return pd.DataFrame(columns=cols)
+
+    w = df.copy()
+    w["Date"] = w["_duty_date"] if "_duty_date" in w.columns else w["_start_dt"].dt.strftime("%Y-%m-%d")
+    w["Driver Name"] = w["driver_name"].map(lambda v: fmt(v, "—"))
+    w["_h"] = (w["_end_dt"] - w["_start_dt"]).dt.total_seconds() / 3600.0
+    w = w.sort_values("_start_dt")
+    reqs, longest = {}, {}
+    for key, grp in w.groupby(["Date", "Driver Name"]):
+        reqs[key] = ", ".join(short_req_id(v) for v in grp["id"])
+        top = grp.loc[grp["_h"].idxmax()]
+        longest[key] = f"{short_req_id(top['id'])} ({top['_h']:.1f} h)"
+    keys = list(zip(over["Date"], over["Driver Name"]))
+    over["Requisitions"] = [reqs.get(k, "") for k in keys]
+    over["Longest trip"] = [longest.get(k, "") for k in keys]
+    return over[cols].sort_values("Total Duty Hours", ascending=False).reset_index(drop=True)
+
+
 MATRIX_METRICS = ["TWH", "SWH", "Km"]
 MATRIX_SUMMARY_TOPS = ("Total", "Average")
 
 
-def build_driver_daily_matrix(df: pd.DataFrame, all_driver_names=None) -> pd.DataFrame:
+def build_driver_daily_matrix(df: pd.DataFrame, all_driver_names=None, idle_gap_hours: float = 6.0) -> pd.DataFrame:
     """Driver x Date table in the sheet format: for every date three columns
     TWH | SWH | Km, then a 'Total' block and an 'Average' block (per-day
     average = total / number of date columns), and a GRAND TOTAL row.
 
       TWH = Total Working Hours = DUTY time (first trip start -> last trip end
-            that day, gaps between trips included).
+            that day; short gaps between trips included, but a break with no
+            trip for more than `idle_gap_hours` is NOT counted).
       SWH = trip running hours (sum of each trip's own Start -> End time).
       Km  = distance run that day (driver KM first, older start/end KM as fallback).
 
@@ -2200,7 +2336,11 @@ def build_driver_daily_matrix(df: pd.DataFrame, all_driver_names=None) -> pd.Dat
             _s=("_start_dt", "min"), _e=("_end_dt", "max"),
             swh=("_duration_hrs", "sum"), km=("_km", "sum"),
         ).reset_index()
-        g["twh"] = (g["_e"] - g["_s"]).dt.total_seconds() / 3600.0
+        _twh = {
+            k: duty_span_hours(grp["_start_dt"], grp["_end_dt"], idle_gap_hours)
+            for k, grp in work.groupby(["_dkey", "_day_sort"])
+        }
+        g["twh"] = [_twh[(a, b)] for a, b in zip(g["_dkey"], g["_day_sort"])]
         days = sorted(g["_day_sort"].unique())
         for k, n in work.groupby("_dkey")["driver_name"].first().items():
             display.setdefault(k, fmt(n, "—"))
@@ -2470,7 +2610,7 @@ def build_duty_tracker_pdf(detail_df: pd.DataFrame, summary_metrics: dict, filte
         pdf.set_font("Helvetica", "B", 11)
         pdf.cell(0, 8, "Driver-wise Daily Duty Hours & Run KM", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.set_font("Helvetica", "I", 8)
-        pdf.cell(0, 5, "TWH = total working (duty) hours, first start to last end  |  "
+        pdf.cell(0, 5, "TWH = total working (duty) hours, first start to last end, long idle breaks excluded  |  "
                        "SWH = trip running hours  |  Km = distance run",
                  new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.ln(1)
@@ -3566,9 +3706,24 @@ elif user["role"] == "admin":
     # ready regardless of which tab runs first in code — previously these
     # were only fetched inside specific tab bodies (old Tab 1 / old Tab 3),
     # which would have broken once those tabs were reordered.
-    with st.spinner("Loading users and requisitions..."):
-        users_df = fetch_all_users()
-        df_all = fetch_all_requisitions()
+    # Load ONLY what the section that is open actually uses (each section's code
+    # runs only when it is selected, and so should its data):
+    #   * Pending Requests (the landing page) -> just the few active trips
+    #   * Analytics / Export / Edit / Duty / Management -> full history
+    #   * Create Requisition / User List / ID Requests -> the users table
+    #   * Staff Shuttle / Manage Drivers & Vehicles -> nothing up front
+    users_df = pd.DataFrame()
+    df_all = pd.DataFrame(columns=REQUISITION_COLUMNS)
+    _needs_full_history = tab_analytics or tab_export or tab_edit_trip or tab_duty or tab_management
+    _needs_users = tab_create_req or tab_users or tab_pending_users
+    if _needs_full_history or tab_pending_req or _needs_users:
+        with st.spinner("Loading..."):
+            if _needs_users:
+                users_df = fetch_all_users()
+            if _needs_full_history:
+                df_all = fetch_all_requisitions()
+            elif tab_pending_req:
+                df_all = fetch_active_requisitions()
 
     # ---------------- Pending Requests (was Tab 3) ----------------
     if tab_pending_req:
@@ -3744,14 +3899,17 @@ elif user["role"] == "admin":
             # from df_all, which is ordered by created_at desc), so this
             # never hides the oldest/most-overdue requests — those surface
             # first as the newer ones above them get approved/rejected.
-            PENDING_DISPLAY_LIMIT = 50
+            PENDING_PAGE_SIZE = 15
+            PENDING_DISPLAY_LIMIT = st.session_state.get("pending_show_n", PENDING_PAGE_SIZE)
             pending_display_df = pending_df.head(PENDING_DISPLAY_LIMIT)
             if len(pending_df) > PENDING_DISPLAY_LIMIT:
                 st.info(
                     f"Showing the {PENDING_DISPLAY_LIMIT} most recent of {len(pending_df)} pending "
-                    "requests for speed. Approve/reject these first, or use Bulk Assign above, "
-                    "to bring the rest into view."
+                    "requests, so the page opens quickly."
                 )
+                if st.button(f"⬇️ Show {PENDING_PAGE_SIZE} more", key="pending_show_more"):
+                    st.session_state["pending_show_n"] = PENDING_DISPLAY_LIMIT + PENDING_PAGE_SIZE
+                    st.rerun()
             for _, r in pending_display_df.iterrows():
                 with st.expander(f"🟡 Requisition {short_req_id(r.get('id'))} — {r['applicant_name']} ({r['department']}) → {r['destination']}"):
                     st.caption(f"Technical ID: `{r['request_id']}`")
@@ -4747,14 +4905,14 @@ elif user["role"] == "admin":
                 # requisition forms) instead of the 24-hour st.time_input.
                 filter_start_time = time_input_12h(
                     "Start Time", key_prefix="duty_start",
-                    default_time=datetime.strptime("07:00", "%H:%M").time(),
+                    default_time=datetime.strptime("05:30", "%H:%M").time(),
                 )
             with fc2:
                 st.markdown("**End of Range**")
                 filter_end_date = st.date_input("End Date", value=bd_today() + timedelta(days=1), key="duty_end_date")
                 filter_end_time = time_input_12h(
                     "End Time", key_prefix="duty_end",
-                    default_time=datetime.strptime("06:59", "%H:%M").time(),
+                    default_time=datetime.strptime("05:29", "%H:%M").time(),
                 )
 
             # -------------------------------------------------------------
@@ -4897,10 +5055,10 @@ elif user["role"] == "admin":
                 )
             with fc11:
                 duty_gap_hours = st.number_input(
-                    "New duty starts after a break of (hours)", min_value=1.0, max_value=24.0, value=6.0,
-                    step=0.5, key="duty_gap_hours", disabled=not duty_shift_aware,
-                    help="If a driver's next trip starts more than this many hours after the previous one ended, "
-                         "it counts as a new duty/shift.",
+                    "Break with no trip, longer than (hours)", min_value=1.0, max_value=24.0, value=6.0,
+                    step=0.5, key="duty_gap_hours",
+                    help="If a driver has NO trip for more than this many hours, that break is NOT counted in "
+                         "duty hours (TWH), and (with night-shift dates ON) the next trip starts a new duty.",
                 )
             with fc12:
                 duty_max_shift = st.number_input(
@@ -4914,7 +5072,7 @@ elif user["role"] == "admin":
             # STEP 3 — Apply the date/time window + vehicle/driver filters.
             # A trip is included if its duty window OVERLAPS the selected
             # range at all (not just if it starts inside it) — this correctly
-            # captures overnight duties like "07:00 today to 06:59 tomorrow".
+            # captures overnight duties like "05:30 today to 05:29 tomorrow".
             # Both sides are now UTC-aware, so this comparison is safe.
             # -------------------------------------------------------------
             # Night-shift aware duty dates: computed on ALL trips (before the
@@ -5006,27 +5164,55 @@ elif user["role"] == "admin":
                     "to get accurate duty-hour totals."
                 )
 
-            # Trips running unusually long (> 12 h) are almost always a forgotten
-            # trip end entry or a wrong time, and they inflate duty hours / merge days.
+            # -------------------------------------------------------------
+            # 🚩 NEEDS REVIEW — two quick lists (with Requisition numbers) so
+            # Admin can find wrong entries at a glance and fix them in the
+            # ✏️ Edit / Delete Trip tab. Follows the filters chosen above.
+            # -------------------------------------------------------------
             if not duty_filtered.empty:
-                _long = duty_filtered[
-                    ((duty_filtered["_end_dt"] - duty_filtered["_start_dt"]).dt.total_seconds() / 3600.0) > 12
-                ]
-                if not _long.empty:
-                    st.warning(
-                        f"⚠️ {len(_long)} trip(s) ran longer than 12 hours (probably a late trip-end entry or a wrong "
-                        "time). They inflate duty hours — check and fix them in the ✏️ Edit / Delete Trip tab."
+                st.markdown("##### 🚩 Needs Review")
+                rv0, rv1, rv2, rv3 = st.columns(4)
+                with rv0:
+                    rv_always_hrs = st.number_input(
+                        "List EVERY trip longer than (hours)", min_value=1.0, max_value=48.0, value=6.0,
+                        step=0.5, key="rv_always_hrs",
+                        help="Any trip that ran longer than this is listed, whatever its KM.",
                     )
-                    with st.expander("Show these long trips"):
-                        _lt = pd.DataFrame({
-                            "Req #": _long["id"].map(short_req_id) if "id" in _long.columns else "",
-                            "Driver": _long["driver_name"].map(lambda v: fmt(v, "—")),
-                            "Vehicle": _long["vehicle_number"].map(lambda v: fmt(v, "—")),
-                            "Start": _long["_start_dt"].dt.strftime("%Y-%m-%d %I:%M %p").map(drop_hour_zero),
-                            "End": _long["_end_dt"].dt.strftime("%Y-%m-%d %I:%M %p").map(drop_hour_zero),
-                            "Hours": ((_long["_end_dt"] - _long["_start_dt"]).dt.total_seconds() / 3600.0).round(1),
-                        })
-                        st.dataframe(_lt, use_container_width=True, hide_index=True)
+                with rv1:
+                    rv_min_hrs = st.number_input(
+                        "Also list trips of at least (hours)…", min_value=1.0, max_value=24.0, value=3.0,
+                        step=0.5, key="rv_min_hrs",
+                    )
+                with rv2:
+                    rv_max_kmh = st.number_input(
+                        "…if average speed is below (km/h)", min_value=1.0, max_value=60.0, value=10.0,
+                        step=1.0, key="rv_max_kmh",
+                        help="A trip that took many hours but covered very few km usually means the driver "
+                             "pressed End Trip late (or forgot).",
+                    )
+                with rv3:
+                    rv_duty_limit = st.number_input(
+                        "Duty longer than (hours)", min_value=4.0, max_value=36.0, value=12.0,
+                        step=0.5, key="rv_duty_limit",
+                    )
+
+                _sus = build_suspicious_trips(duty_filtered, rv_min_hrs, rv_max_kmh, rv_always_hrs)
+                _longduty = build_long_duty_list(duty_filtered, rv_duty_limit, duty_gap_hours)
+
+                st.markdown(f"**1️⃣ Long trips / long trips with few km — {len(_sus)} trip(s)**")
+                if _sus.empty:
+                    st.success("✅ No trips to check in this range.")
+                else:
+                    st.caption("Open the Req # in **✏️ Edit / Delete Trip** and correct the Trip End time (or KM).")
+                    st.dataframe(_sus, use_container_width=True, hide_index=True)
+
+                st.markdown(f"**2️⃣ Duty longer than {rv_duty_limit:g} hours — {len(_longduty)} driver-day(s)**")
+                if _longduty.empty:
+                    st.success(f"✅ No driver was on duty for more than {rv_duty_limit:g} hours in this range.")
+                else:
+                    st.caption("Check the **Longest trip** first — a late End Trip there is the usual reason.")
+                    st.dataframe(_longduty, use_container_width=True, hide_index=True)
+                st.markdown("---")
 
             # Explain an empty result instead of just showing zeros. Only trips
             # that have actually started (trip start time / the driver's Start
@@ -5057,7 +5243,7 @@ elif user["role"] == "admin":
             run_hrs_total = float(duty_filtered["_duration_hrs"].sum())  # sum of trip run times
             # Duty time = first start -> last end per driver per day (gaps included)
             total_duration_hrs = float(
-                build_duty_summary(duty_filtered, "Driver + Date (daily)")["Total Duty Hours"].sum()
+                build_duty_summary(duty_filtered, "Driver + Date (daily)", duty_gap_hours)["Total Duty Hours"].sum()
             ) if not duty_filtered.empty else 0.0
             run_h = int(run_hrs_total)
             run_m = int(round((run_hrs_total - run_h) * 60))
@@ -5086,7 +5272,7 @@ elif user["role"] == "admin":
             k1, k2, k3, k4, k5 = st.columns(5)
             k1.metric("🛣️ Total Distance", f"{total_km:.1f} KM")
             k2.metric("⏱️ Total Duty Time", f"{duration_h}h {duration_m}m",
-                      help="First trip start to last trip end, per driver per day (gaps between trips included).")
+                      help="First trip start to last trip end, per driver per day. Breaks with no trip longer than the limit above are not counted.")
             k3.metric("🚙 Run Time (trips only)", f"{run_h}h {run_m}m")
             k4.metric("🚗 Total Trips", total_trips)
             k5.metric("👨‍✈️ Active Driver / Vehicle", f"{active_driver_label} / {active_vehicle_label}")
@@ -5100,7 +5286,7 @@ elif user["role"] == "admin":
             st.markdown("---")
             st.markdown(f"##### 👨‍✈️ Duty Summary — {duty_group_option} (কে কত ঘণ্টা ডিউটি করেছে)")
 
-            driver_summary_df = build_duty_summary(duty_filtered, duty_group_option)
+            driver_summary_df = build_duty_summary(duty_filtered, duty_group_option, duty_gap_hours)
             if driver_summary_df.empty:
                 st.info("No trips match the selected filters.")
             else:
@@ -5115,12 +5301,12 @@ elif user["role"] == "admin":
                 duty_drivers_df["driver_name"].tolist()
                 if duty_driver_filter == "All Drivers" and not duty_drivers_df.empty else []
             )
-            matrix_df = build_driver_daily_matrix(duty_filtered, matrix_names)
+            matrix_df = build_driver_daily_matrix(duty_filtered, matrix_names, duty_gap_hours)
 
             st.markdown("---")
             st.markdown("##### 🗓️ Driver-wise Daily Duty & Run KM (TWH | SWH | Km)")
             st.caption(
-                "**TWH** = total working (duty) hours, first trip start → last trip end that day  |  "
+                "**TWH** = total working (duty) hours, first trip start → last trip end that day (a break with no trip longer than the limit above is not counted)  |  "
                 "**SWH** = trip running hours  |  **Km** = distance run. "
                 "Average = total ÷ number of date columns. Date = the day the trip started."
             )
@@ -5176,7 +5362,7 @@ elif user["role"] == "admin":
                 "Summary Grouped By": duty_group_option,
                 "Log Sorted By": duty_sort_option,
                 "Total Distance (KM)": f"{total_km:.1f}",
-                "Total Duty Time (first start to last end)": f"{duration_h}h {duration_m}m",
+                "Total Duty Time (first start to last end, long idle breaks excluded)": f"{duration_h}h {duration_m}m",
                 "Run Time (trips only)": f"{run_h}h {run_m}m",
                 "Total Trips": total_trips,
                 "Active Driver": active_driver_label,
