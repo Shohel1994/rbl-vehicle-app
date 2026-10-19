@@ -1367,54 +1367,162 @@ def delete_shuttle_template(template_id):
     _clear_shuttle_template_caches()
 
 
-# ------------------- DAILY AUTO-GENERATED SHUTTLE REQUISITIONS (NEW) -------------------
-# Fixed 5-trip daily shuttle schedule. These are created automatically
-# (no button click needed) the first time ANY logged-in user loads the app
-# AFTER 6:30 PM (Bangladesh time) each day — these are all evening/night
-# trips, so nothing is created during morning/daytime hours — as Pending requisitions with driver/vehicle left blank — Admin
-# just opens "Pending Requests" and picks Driver + Vehicle like any normal
-# approval (including via the existing Bulk Assign feature). Tagged via
-# admin_note so re-checking never depends on exact row order/count matching
-# (safe even if Admin edits/deletes one of today's six later).
+# ------------------- DAILY AUTO-GENERATED REQUISITIONS (UPDATED) -------------------
+# Every day, the first time ANY logged-in user loads the app AFTER 6:30 PM
+# (Bangladesh time) the requisitions below are created automatically (no
+# button click needed). Four groups:
+#
+#   1. Staff Shuttle   (4 trips)  -> created as PENDING (Admin picks Driver +
+#                                    Vehicle in "Pending Requests", like always)
+#   2. Commercial Duty (6 trips)  -> ROSTER group: ONE driver + ONE vehicle for
+#                                    all 6 trips, chosen in the "🤖 Auto Duty
+#                                    Roster" admin tab. The 6 trips are ALWAYS
+#                                    created already APPROVED (never Pending).
+#                                    If no driver/vehicle is selected the group
+#                                    is simply not created until one is.
+#   3. Night Shift     (5 trips)  -> ROSTER group, same behaviour (one driver +
+#                                    one vehicle for all 5 trips, always Approved).
+#   4. Female Worker Drop (4 trips) -> created as PENDING.
+#
+# A roster selection STAYS the same every day until Admin changes it (weekly
+# rotation = just re-select the driver/vehicle once a week). A group whose
+# "Active" box is un-ticked is skipped (not created) that day.
+#
+# Each auto requisition is tagged in admin_note as "<TAG>#<slot no>", so
+# re-checking never depends on row order and never creates a duplicate (safe
+# even if Admin edits/deletes one of today's rows later).
 DAILY_SHUTTLE_TAG = "AUTO-DAILY-SHUTTLE"
+DAILY_COMMERCIAL_TAG = "AUTO-DAILY-COMMERCIAL"
+DAILY_NIGHT_SHIFT_TAG = "AUTO-DAILY-NIGHT-SHIFT"
+DAILY_FEMALE_DROP_TAG = "AUTO-DAILY-FEMALE-DROP"
+
 # Auto-creation only starts at/after this Bangladesh time (24h clock).
 DAILY_AUTO_START_HOUR = 18
 DAILY_AUTO_START_MINUTE = 30
-DAILY_NIGHT_SHIFT_TAG = "AUTO-DAILY-NIGHT-SHIFT"
 
+# Table that stores the roster (driver + vehicle chosen for each slot).
+AUTO_ROSTER_TABLE = "auto_duty_roster"
+AUTO_ROSTER_SQL = """create table if not exists auto_duty_roster (
+    slot_key text primary key,
+    group_tag text not null,
+    slot_no int not null,
+    driver_name text default '',
+    vehicle_number text default '',
+    trip_time text default '',
+    enabled boolean default true,
+    updated_by text default '',
+    updated_at timestamptz default now()
+);
+alter table auto_duty_roster disable row level security;"""
+
+# ---- Group 1: Staff Shuttle (Pending) ----
 DAILY_SHUTTLE_TEMPLATES = [
     {"destination": "Ishwardi", "time": "19:15", "passenger_count": 8, "purpose": "Staff Drop", "vehicle_type": "HIACE"},
     {"destination": "Ishwardi", "time": "19:15", "passenger_count": 8, "purpose": "Staff Drop", "vehicle_type": "HIACE"},
     {"destination": "Dashuria", "time": "19:15", "passenger_count": 8, "purpose": "Staff Drop", "vehicle_type": "HIACE"},
     {"destination": "Ishwardi", "time": "20:15", "passenger_count": 8, "purpose": "Staff Drop", "vehicle_type": "HIACE"},
-    {"destination": "Bepza", "time": "20:15", "passenger_count": 1, "purpose": "Commercial Duty", "vehicle_type": "HIACE"},
 ]
 
-# Night-shift vehicle (Commercial duty, e.g. Siam: ~6:30 PM to ~4:00 AM, then the
-# morning staff drop). 5 requisitions are created automatically every day as
-# PENDING, dated the day the shift STARTS. The time below is only a starting
-# default (6:30 PM) — Admin sets the REAL time in "Approved Departure Time"
-# when approving each one (single approve or Bulk Assign).
+# ---- Group 2: Commercial Duty (ROSTER) — number of slots = range(6) ----
+DAILY_COMMERCIAL_TEMPLATES = [
+    {"destination": "Bepza/others", "time": "20:15", "passenger_count": 1, "purpose": "Commercial Duty",
+     "vehicle_type": "HIACE", "label": f"Commercial Duty #{i}"}
+    for i in range(1, 7)
+]
+
+# ---- Group 3: Night Shift Vehicle (ROSTER) ----
+# "department" is different for every slot, so it is set per row here.
+# The time below is only the starting default — Admin can change the
+# departure time of each slot in the "🤖 Auto Duty Roster" tab.
 DAILY_NIGHT_SHIFT_TEMPLATES = [
-    {"destination": "Bepza", "time": "18:30", "passenger_count": 1, "purpose": "Commercial Duty", "vehicle_type": "HIACE"}
-    for _ in range(5)
+    {"destination": "Bepza", "time": "18:30", "passenger_count": 1, "purpose": "Admin general duty",
+     "vehicle_type": "HIACE", "department": dept, "label": f"{dept} (Night #{i})"}
+    for i, dept in enumerate(
+        ["Fuel Refill", "QC PICK/Drop", "Patient Drop", "QC PICK/Drop", "Patient Drop"], start=1
+    )
 ]
 
-# (tag, templates, applicant_name, department) — one entry per auto-created group.
-DAILY_AUTO_GROUPS = [
-    (DAILY_SHUTTLE_TAG, DAILY_SHUTTLE_TEMPLATES, "Staff Shuttle", "Admin"),
-    (DAILY_NIGHT_SHIFT_TAG, DAILY_NIGHT_SHIFT_TEMPLATES, "Night Shift Vehicle", "Commercial"),
+# ---- Group 4: Female Worker Drop (Pending) ----
+DAILY_FEMALE_DROP_TEMPLATES = [
+    {"destination": area, "time": "19:30", "passenger_count": 10, "purpose": "Female worker drop", "vehicle_type": "HIACE"}
+    for area in ["Ishwardi area", "Dashuria area", "Lalpur area", "Kustia area"]
 ]
+
+# One dict per auto-created group.  roster=True -> driver/vehicle taken from the
+# "🤖 Auto Duty Roster" tab (created Approved when both are selected).
+DAILY_AUTO_GROUPS = [
+    {"tag": DAILY_SHUTTLE_TAG, "templates": DAILY_SHUTTLE_TEMPLATES,
+     "applicant": "Staff Shuttle", "department": "Admin", "roster": False,
+     "title": "Staff Shuttle"},
+    {"tag": DAILY_COMMERCIAL_TAG, "templates": DAILY_COMMERCIAL_TEMPLATES,
+     "applicant": "Commercial", "department": "Commercial", "roster": True,
+     "title": "💼 Commercial Duty"},
+    {"tag": DAILY_NIGHT_SHIFT_TAG, "templates": DAILY_NIGHT_SHIFT_TEMPLATES,
+     "applicant": "Night Shift Vehicle", "department": "Commercial", "roster": True,
+     "title": "🌙 Night Shift Vehicle"},
+    {"tag": DAILY_FEMALE_DROP_TAG, "templates": DAILY_FEMALE_DROP_TEMPLATES,
+     "applicant": "Admin", "department": "Admin", "roster": False,
+     "title": "Female Worker Drop"},
+]
+
+
+# ---- Roster (driver + vehicle per slot) helpers ----
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_auto_roster():
+    """Returns ({slot_key: row}, error_text). error_text is '' when OK — it is
+    only filled when the roster table does not exist yet / can't be read."""
+    try:
+        sb = get_supabase_client()
+        res = sb.table(AUTO_ROSTER_TABLE).select("*").execute()
+        return {r["slot_key"]: r for r in (res.data or [])}, ""
+    except Exception as e:
+        return {}, str(e)
+
+
+def _clear_auto_roster_caches():
+    fetch_auto_roster.clear()
+
+
+def save_auto_roster_slots(rows: list):
+    """Saves (upserts) many roster slots in ONE request."""
+    sb = get_supabase_client()
+    sb.table(AUTO_ROSTER_TABLE).upsert(rows, on_conflict="slot_key").execute()
+    _clear_auto_roster_caches()
+
+
+def _slot_marker_found(marker: str, notes: list) -> bool:
+    """True if '<TAG>#<n>' appears in any note (and is not just a prefix of '#<n>0')."""
+    pat = re.escape(marker) + r"(?!\d)"
+    return any(re.search(pat, n) for n in notes)
+
+
+def _hhmm_to_time(value, fallback="08:00"):
+    """'HH:MM' / 'HH:MM:SS' -> datetime.time (falls back safely)."""
+    for candidate in (value, fallback):
+        if is_blank(candidate):
+            continue
+        for f in ("%H:%M:%S", "%H:%M"):
+            try:
+                return datetime.strptime(str(candidate).strip(), f).time()
+            except ValueError:
+                continue
+    return datetime.strptime("08:00", "%H:%M").time()
 
 
 def ensure_daily_shuttle_requisitions():
-    """Auto-creates today's fixed requisitions (the 5 staff shuttles AND the 5
-    night-shift vehicle requisitions) as Pending, no driver/vehicle assigned, if
-    they don't already exist. Only runs once the Bangladesh clock reaches 6:30 PM
-    (these are evening/night trips — nothing is created in the morning/daytime).
+    """Auto-creates today's fixed requisitions (Staff Shuttle, Commercial Duty,
+    Night Shift Vehicle, Female Worker Drop) if they don't already exist.
+    Only runs once the Bangladesh clock reaches the start time (6:30 PM).
+
+    Roster groups (Commercial / Night Shift): when the group has BOTH a driver and
+    a vehicle selected in the "🤖 Auto Duty Roster" tab, every trip of the group
+    is created already Approved with that driver + vehicle. They are never
+    created as Pending — if no driver/vehicle is selected (or the group is
+    switched off) nothing is created for that group.
+
     Runs at most once per browser session per day and is idempotent via the
-    admin_note tag check per group. Any failure is logged and swallowed, never
-    blocking the rest of the app."""
+    admin_note '<TAG>#<slot>' check. Any failure is logged and swallowed,
+    never blocking the rest of the app."""
     now_bd = bd_now()
     if (now_bd.hour, now_bd.minute) < (DAILY_AUTO_START_HOUR, DAILY_AUTO_START_MINUTE):
         # Before 6:30 PM: do nothing, and do NOT mark today as "checked" so
@@ -1428,27 +1536,66 @@ def ensure_daily_shuttle_requisitions():
 
     try:
         sb = get_supabase_client()
-        for tag, templates, applicant, dept in DAILY_AUTO_GROUPS:
+
+        # Roster is optional — if the table doesn't exist yet everything just
+        # falls back to Pending requisitions (the old behaviour).
+        roster = {}
+        try:
+            res_r = sb.table(AUTO_ROSTER_TABLE).select("*").execute()
+            roster = {r["slot_key"]: r for r in (res_r.data or [])}
+        except Exception as e:
+            print(f"Auto roster not available (using Pending): {e}")
+
+        contact_map = {}
+        if any(r.get("driver_name") for r in roster.values()):
+            try:
+                res_d = sb.table(DRIVERS_TABLE).select("driver_name, driver_contact").execute()
+                contact_map = {d["driver_name"]: (d.get("driver_contact") or "") for d in (res_d.data or [])}
+            except Exception as e:
+                print(f"Driver contact lookup failed: {e}")
+
+        for g in DAILY_AUTO_GROUPS:
+            tag, templates = g["tag"], g["templates"]
             existing = (
                 sb.table(REQUISITIONS_TABLE)
-                .select("id")
+                .select("admin_note")
                 .eq("date_of_travel", today_str)
                 .like("admin_note", f"%{tag}%")
                 .execute()
             )
-            already_count = len(existing.data) if existing.data else 0
-            if already_count >= len(templates):
-                continue
+            notes = [str(r.get("admin_note") or "") for r in (existing.data or [])]
+            # Rows made by the OLD version of this feature carried just the bare
+            # tag (no '#n'); count them so they are not created a second time.
+            legacy_count = sum(1 for n in notes if n.strip() == tag)
 
-            for tpl in templates[already_count:]:
+            for idx, tpl in enumerate(templates, start=1):
+                marker = f"{tag}#{idx}"
+                if _slot_marker_found(marker, notes) or idx <= legacy_count:
+                    continue
+
+                trip_time = tpl["time"]
+                driver = vehicle = ""
+                if g["roster"]:
+                    # ONE roster row per group (key = the group tag) — its driver,
+                    # vehicle and departure time apply to every trip of the group.
+                    slot = roster.get(tag)
+                    if slot is None or slot.get("enabled") is False:
+                        continue  # no roster saved yet / group switched off -> nothing created
+                    driver = (slot.get("driver_name") or "").strip()
+                    vehicle = (slot.get("vehicle_number") or "").strip()
+                    if not (driver and vehicle):
+                        continue  # roster groups are NEVER created as Pending
+                    if not is_blank(slot.get("trip_time")):
+                        trip_time = str(slot["trip_time"]).strip()[:5]
+
                 data = {
                     "request_id": generate_request_id(),
                     "username": "",
-                    "applicant_name": applicant,
-                    "department": dept,
+                    "applicant_name": tpl.get("applicant", g["applicant"]),
+                    "department": tpl.get("department", g["department"]),
                     "mobile_number": "",
                     "date_of_travel": today_str,
-                    "time_of_travel": tpl["time"],
+                    "time_of_travel": trip_time,
                     "destination": tpl["destination"],
                     "passenger_count": tpl["passenger_count"],
                     "vehicle_type": tpl["vehicle_type"],
@@ -1459,11 +1606,111 @@ def ensure_daily_shuttle_requisitions():
                     "driver_contact": "",
                     "vehicle_number": "",
                     "approved_by": "",
-                    "admin_note": tag,
+                    "admin_note": marker,
                 }
+                if driver and vehicle:
+                    data.update({
+                        "status": "Approved",
+                        "driver_name": driver,
+                        "driver_contact": contact_map.get(driver, ""),
+                        "vehicle_number": vehicle,
+                        "approved_by": "Auto Roster",
+                        "action_timestamp": bd_now_str(),
+                        "approved_time": trip_time,
+                    })
                 insert_requisition(data)
     except Exception as e:
         print(f"Daily auto-requisition error: {e}")
+
+
+# ------------------- AUTO "SUBMIT ALL FIXED TRIPS FOR TOMORROW" (NEW) -------------------
+# Does exactly what the Admin's "🌅 Submit ALL Fixed Trips for Tomorrow" button in
+# the 🚌 Staff Shuttle tab does — but automatically: the first time ANY device /
+# ANY logged-in user loads the app after 9:55 PM (Bangladesh time), every saved
+# shuttle template is submitted for TOMORROW.
+#   * Template has a valid default Driver + Vehicle -> created Approved and goes
+#     straight to the driver.
+#   * Template has no (valid) default Driver/Vehicle -> NOT created (these trips
+#     are never created as Pending). Save the template with a default Driver +
+#     Vehicle and it is submitted automatically.
+# It never creates a duplicate: if tomorrow already has a requisition for that
+# template (submitted by hand or by this function) the template is skipped.
+# Only runs between 9:55 PM and midnight, so after 12:00 AM it can never submit
+# for the day-after-tomorrow by mistake.
+TOMORROW_SHUTTLE_AUTO_HOUR = 21
+TOMORROW_SHUTTLE_AUTO_MINUTE = 55
+
+
+def ensure_tomorrow_shuttle_submitted():
+    now_bd = bd_now()
+    if (now_bd.hour, now_bd.minute) < (TOMORROW_SHUTTLE_AUTO_HOUR, TOMORROW_SHUTTLE_AUTO_MINUTE):
+        return  # too early (before 9:55 PM) — and after midnight hour is 0, so also a no-op
+
+    tomorrow = bd_today() + timedelta(days=1)
+    tomorrow_str = str(tomorrow)
+    if st.session_state.get("_tomorrow_shuttle_checked_date") == tomorrow_str:
+        return
+
+    try:
+        sb = get_supabase_client()
+        tpl_res = sb.table(SHUTTLE_TEMPLATES_TABLE).select("*").order("template_name").execute()
+        templates = tpl_res.data or []
+        if templates:
+            drv_res = sb.table(DRIVERS_TABLE).select("driver_name, driver_contact").execute()
+            veh_res = sb.table(VEHICLES_TABLE).select("vehicle_number").execute()
+            contact_map = {d["driver_name"]: (d.get("driver_contact") or "") for d in (drv_res.data or [])}
+            vehicle_set = {v["vehicle_number"] for v in (veh_res.data or [])}
+
+            existing = (
+                sb.table(REQUISITIONS_TABLE)
+                .select("admin_note")
+                .eq("date_of_travel", tomorrow_str)
+                .like("admin_note", "%shuttle template:%")
+                .execute()
+            )
+            notes = [str(r.get("admin_note") or "") for r in (existing.data or [])]
+
+            for tpl in templates:
+                name = str(tpl.get("template_name") or "").strip()
+                if not name:
+                    continue
+                if any(f"shuttle template: {name}" in n for n in notes):
+                    continue  # already submitted for tomorrow (by hand or automatically)
+
+                d_name = fmt(tpl.get("default_driver_name"), "")
+                v_number = fmt(tpl.get("default_vehicle_number"), "")
+                have_both = d_name in contact_map and v_number in vehicle_set
+                if not have_both:
+                    continue  # never create a Pending trip — needs a default Driver + Vehicle
+                time_val = fmt(tpl.get("default_time"), "08:00")
+                data = {
+                    "request_id": generate_request_id(),
+                    "username": "",
+                    "applicant_name": fmt(tpl.get("applicant_name"), name),
+                    "department": fmt(tpl.get("department"), "Admin"),
+                    "mobile_number": "",
+                    "date_of_travel": tomorrow_str,
+                    "time_of_travel": time_val,
+                    "destination": fmt(tpl.get("destination"), ""),
+                    "passenger_count": int(tpl.get("passenger_count") or 1),
+                    "vehicle_type": fmt(tpl.get("vehicle_type"), "HIACE"),
+                    "purpose": fmt(tpl.get("purpose"), name),
+                    "special_request": "",
+                    "status": "Approved",
+                    "driver_name": d_name,
+                    "driver_contact": contact_map.get(d_name, ""),
+                    "vehicle_number": v_number,
+                    "approved_by": "Auto (Shuttle 9:55 PM)",
+                    "admin_note": f"Auto-submitted from shuttle template: {name} (auto 9:55 PM)",
+                }
+                data["action_timestamp"] = bd_now_str()
+                data["approved_time"] = time_val
+                insert_requisition(data)
+        # Mark as done only after a clean run, so a temporary network error
+        # is retried on the next page load instead of being skipped for the day.
+        st.session_state["_tomorrow_shuttle_checked_date"] = tomorrow_str
+    except Exception as e:
+        print(f"Auto tomorrow-shuttle error: {e}")
 
 
 # ------------------- SESSION (REMEMBER ME) HELPERS -------------------
@@ -3151,7 +3398,8 @@ if "auth_user" not in st.session_state:
         st.stop()
 
 user = st.session_state.auth_user
-ensure_daily_shuttle_requisitions()  # auto-creates today's 5 shuttle + 5 night-shift requisitions after 6:30 PM (BD time), once per session/day
+ensure_daily_shuttle_requisitions()  # auto-creates today's shuttle / commercial / night-shift / female-drop requisitions after 6:30 PM (BD time), once per session/day (roster groups come out Approved)
+ensure_tomorrow_shuttle_submitted()  # after 9:55 PM (BD time): auto-submits ALL saved Staff Shuttle templates for tomorrow (same as the "Submit ALL Fixed Trips for Tomorrow" button), once per session/day
 
 # =========================================================
 # 7. SIDEBAR
@@ -3693,9 +3941,9 @@ elif user["role"] == "admin":
     # (default) tab an admin sees. Visual order comes purely from this label
     # list — each variable below is named for what it holds, not its position,
     # so the underlying tab bodies didn't need to be reshuffled in the file.
-    tab_pending_req, tab_create_req, tab_shuttle, tab_users, tab_pending_users, tab_analytics, tab_export, \
+    tab_pending_req, tab_create_req, tab_shuttle, tab_roster, tab_users, tab_pending_users, tab_analytics, tab_export, \
         tab_edit_trip, tab_fleet, tab_duty, tab_management = section_nav("admin_section", [
-            "🚗 Pending Requests", "➕ Create Requisition", "🚌 Staff Shuttle", "👥 User List", "⏳ ID Requests",
+            "🚗 Pending Requests", "➕ Create Requisition", "🚌 Staff Shuttle", "🤖 Auto Duty Roster", "👥 User List", "⏳ ID Requests",
             "📊 Analytics", "📁 All Requisitions & Export", "✏️ Edit / Delete Trip",
             "🚘 Manage Drivers & Vehicles",
             "🕒 Duty Tracker & Analytics",
@@ -4130,6 +4378,15 @@ elif user["role"] == "admin":
             "7:15 PM drop-off) — save each route once as a template below, then submit "
             "tomorrow's trip with a single click instead of retyping everything every day."
         )
+        st.info(
+            f"🤖 **Automatic:** every night after "
+            f"{TOMORROW_SHUTTLE_AUTO_HOUR % 12 or 12}:{TOMORROW_SHUTTLE_AUTO_MINUTE:02d} "
+            f"{'PM' if TOMORROW_SHUTTLE_AUTO_HOUR >= 12 else 'AM'} (Bangladesh time), as soon as anyone opens the app on "
+            "any device, ALL saved templates below are submitted for tomorrow automatically and go straight "
+            "to the driver as **Approved**. A template needs a default Driver + Vehicle for this — "
+            "templates without them are NOT submitted (never left as Pending). "
+            "Templates already submitted for tomorrow are never duplicated, so the manual button is still safe to use."
+        )
 
         shuttle_drivers_df = fetch_all_drivers()
         shuttle_vehicles_df = fetch_all_vehicles()
@@ -4370,6 +4627,9 @@ elif user["role"] == "admin":
                         "default_vehicle_number": "" if new_tpl_vehicle == "— None —" else new_tpl_vehicle,
                     })
                     st.success(f"✅ Template '{new_tpl_name.strip()}' saved.")
+                    # Past 9:55 PM? Submit the newly saved template for tomorrow right away.
+                    st.session_state.pop("_tomorrow_shuttle_checked_date", None)
+                    ensure_tomorrow_shuttle_submitted()
                     st.rerun()
                 except Exception as e:
                     st.error(f"❌ Failed to save template: {e}")
@@ -4384,6 +4644,10 @@ elif user["role"] == "admin":
                     f"**{tpl['template_name']}** — {fmt(tpl.get('destination'))} "
                     f"@ {fmt_time_12h(tpl.get('default_time'))}"
                 )
+                if (tpl.get("default_driver_name") not in shuttle_driver_options
+                        or tpl.get("default_vehicle_number") not in shuttle_vehicle_options):
+                    r1.caption("⚠️ No valid default Driver/Vehicle — this template will NOT be auto-submitted. "
+                               "Delete it and save again with a Driver + Vehicle.")
                 if r2.button("🗑️", key=f"del_shuttle_tpl_{tpl['id']}", help="Delete this template"):
                     try:
                         delete_shuttle_template(tpl["id"])
@@ -4391,6 +4655,122 @@ elif user["role"] == "admin":
                         st.rerun()
                     except Exception as e:
                         st.error(f"❌ Failed to delete template: {e}")
+
+    # ---------------- Auto Duty Roster (NEW) ----------------
+    # Admin picks ONE Driver + ONE Vehicle for each roster group (Commercial Duty
+    # = all 6 trips, Night Shift = all 5 trips). The choice is saved and every
+    # evening's auto requisitions use it (created already Approved) until Admin
+    # changes it — e.g. the weekly rotation.
+    if tab_roster:
+        st.subheader("🤖 Auto Duty Roster — Commercial Duty & Night Shift")
+        st.caption(
+            "Select ONE Driver and ONE Vehicle for each group and press Save — they are used for ALL trips "
+            "of that group and STAY the same every day until you change them. After "
+            f"{DAILY_AUTO_START_HOUR % 12 or 12}:{DAILY_AUTO_START_MINUTE:02d} "
+            f"{'PM' if DAILY_AUTO_START_HOUR >= 12 else 'AM'} (Bangladesh time) the app creates each day's "
+            "requisitions automatically, always **Approved** and sent straight to the driver. "
+            "A group with no Driver/Vehicle selected (or un-ticked Active) is NOT created."
+        )
+
+        roster_map, roster_err = fetch_auto_roster()
+        if roster_err:
+            st.error(
+                "⚠️ The roster table is not set up yet. Open **Supabase → SQL Editor**, run the SQL below "
+                "once, then refresh this page."
+            )
+            st.code(AUTO_ROSTER_SQL, language="sql")
+            st.caption(f"Technical detail: {roster_err}")
+        else:
+            roster_drivers_df = fetch_all_drivers()
+            roster_vehicles_df = fetch_all_vehicles()
+            roster_driver_opts = roster_drivers_df["driver_name"].tolist() if not roster_drivers_df.empty else []
+            roster_vehicle_opts = roster_vehicles_df["vehicle_number"].tolist() if not roster_vehicles_df.empty else []
+            roster_contact_map = (
+                dict(zip(roster_drivers_df["driver_name"], roster_drivers_df["driver_contact"]))
+                if not roster_drivers_df.empty else {}
+            )
+            NOT_SET = "— Not set (trips NOT created) —"
+
+            if not roster_driver_opts or not roster_vehicle_opts:
+                st.warning(
+                    "⚠️ No drivers or vehicles saved yet. Add them first under "
+                    "**🚘 Manage Drivers & Vehicles**, then come back here."
+                )
+
+            for g in DAILY_AUTO_GROUPS:
+                if not g["roster"]:
+                    continue
+                g_tag, g_templates = g["tag"], g["templates"]
+                saved = roster_map.get(g_tag, {})
+                saved_driver = (saved.get("driver_name") or "").strip()
+                saved_vehicle = (saved.get("vehicle_number") or "").strip()
+                saved_enabled = saved.get("enabled")
+                saved_enabled = True if saved_enabled is None else bool(saved_enabled)
+
+                drv_opts = [NOT_SET] + roster_driver_opts
+                if saved_driver and saved_driver not in drv_opts:
+                    drv_opts.insert(1, saved_driver)
+                veh_opts = [NOT_SET] + roster_vehicle_opts
+                if saved_vehicle and saved_vehicle not in veh_opts:
+                    veh_opts.insert(1, saved_vehicle)
+
+                st.markdown(f"#### {g['title']}")
+                st.caption(f"Applies to all {len(g_templates)} trips of this group each day.")
+                if not (saved_driver and saved_vehicle):
+                    st.warning("⚠️ No Driver/Vehicle saved for this group — its trips are NOT being created. Select and Save below.")
+                elif not saved_enabled:
+                    st.warning("⏸️ This group is switched off (Active un-ticked) — its trips are NOT being created.")
+                with st.form(f"roster_form_{g_tag}"):
+                    c1, c2, c3, c4 = st.columns([2.4, 2, 1.5, 1])
+                    sel_driver = c1.selectbox(
+                        "Driver", drv_opts,
+                        index=drv_opts.index(saved_driver) if saved_driver in drv_opts else 0,
+                        key=f"roster_drv_{g_tag}",
+                    )
+                    sel_vehicle = c2.selectbox(
+                        "Vehicle", veh_opts,
+                        index=veh_opts.index(saved_vehicle) if saved_vehicle in veh_opts else 0,
+                        key=f"roster_veh_{g_tag}",
+                    )
+                    sel_time = c3.time_input(
+                        "Departure time", value=_hhmm_to_time(saved.get("trip_time"), g_templates[0]["time"]),
+                        key=f"roster_time_{g_tag}",
+                    )
+                    sel_active = c4.checkbox("Active", value=saved_enabled, key=f"roster_on_{g_tag}")
+                    save_clicked = st.form_submit_button(
+                        f"💾 Save {g['title']} Roster", type="primary", use_container_width=True,
+                    )
+
+                if save_clicked:
+                    drv_val = "" if sel_driver == NOT_SET else sel_driver
+                    veh_val = "" if sel_vehicle == NOT_SET else sel_vehicle
+                    if bool(drv_val) != bool(veh_val):
+                        st.error("❌ Select BOTH Driver and Vehicle (or leave both as 'Not set').")
+                    else:
+                        try:
+                            row = {
+                                "slot_key": g_tag, "group_tag": g_tag, "slot_no": 0,
+                                "driver_name": drv_val, "vehicle_number": veh_val,
+                                "trip_time": sel_time.strftime("%H:%M"), "enabled": bool(sel_active),
+                                "updated_by": user["full_name"], "updated_at": bd_now_str(),
+                            }
+                            save_auto_roster_slots([row])
+                            # Existing (Pending / any) requisitions are never touched. If it is
+                            # already past the auto-start time, create any of today's trips of
+                            # this group that are still missing right now.
+                            st.session_state.pop("_daily_shuttle_checked_date", None)
+                            ensure_daily_shuttle_requisitions()
+                            msg = (f"✅ {g['title']} roster saved. The same Driver + Vehicle will be used for all "
+                                   f"{len(g_templates)} trips every day until you change it.")
+                            st.success(msg)
+                        except Exception as e:
+                            st.error(f"❌ Failed to save roster: {e}")
+
+            st.info(
+                "ℹ️ Existing Pending requisitions are never changed by this page. Staff Shuttle and Female Worker "
+                "Drop requisitions are created as **Pending** every day — approve them from "
+                "**🚗 Pending Requests** as usual."
+            )
 
     # ---------------- User List (was Tab 2) ----------------
     if tab_users:
