@@ -11,6 +11,7 @@ Author: Senior Python Developer (generated for Shohel Rana)
 
 import io
 import os
+import json
 import base64
 import hashlib
 import random
@@ -489,6 +490,7 @@ def _clear_requisition_caches():
     fetch_requisitions_by_user.clear()
     fetch_requisitions_by_driver.clear()
     get_last_driver_end_km.clear()
+    fetch_auto_duty_trips.clear()
 
 
 def _clear_driver_caches():
@@ -1411,8 +1413,10 @@ AUTO_ROSTER_SQL = """create table if not exists auto_duty_roster (
     trip_time text default '',
     enabled boolean default true,
     updated_by text default '',
-    updated_at timestamptz default now()
+    updated_at timestamptz default now(),
+    trips_json text default ''
 );
+alter table auto_duty_roster add column if not exists trips_json text default '';
 alter table auto_duty_roster disable row level security;"""
 
 # ---- Group 1: Staff Shuttle (Pending) ----
@@ -1483,6 +1487,28 @@ def _clear_auto_roster_caches():
     fetch_auto_roster.clear()
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_auto_duty_trips(date_from: str, date_to: str) -> pd.DataFrame:
+    """Auto-created Commercial Duty + Night Shift requisitions (any status) whose
+    trip date is between date_from and date_to (inclusive, 'YYYY-MM-DD').
+    Small, targeted query — does not load the whole history."""
+    sb = get_supabase_client()
+    frames = []
+    for tag in (DAILY_COMMERCIAL_TAG, DAILY_NIGHT_SHIFT_TAG):
+        res = (
+            sb.table(REQUISITIONS_TABLE).select("*")
+            .gte("date_of_travel", date_from).lte("date_of_travel", date_to)
+            .like("admin_note", f"%{tag}%")
+            .execute()
+        )
+        if res.data:
+            frames.append(pd.DataFrame(res.data))
+    if not frames:
+        return pd.DataFrame(columns=REQUISITION_COLUMNS)
+    df = pd.concat(frames, ignore_index=True).drop_duplicates(subset="request_id")
+    return df.sort_values(["date_of_travel", "time_of_travel"], ascending=[False, True]).reset_index(drop=True)
+
+
 def save_auto_roster_slots(rows: list):
     """Saves (upserts) many roster slots in ONE request."""
     sb = get_supabase_client()
@@ -1507,6 +1533,74 @@ def _hhmm_to_time(value, fallback="08:00"):
             except ValueError:
                 continue
     return datetime.strptime("08:00", "%H:%M").time()
+
+
+def _default_group_trips(g: dict) -> list:
+    """The built-in trips of a group (used until Admin edits them in the roster tab)."""
+    out = []
+    for i, tpl in enumerate(g["templates"], start=1):
+        out.append({
+            "tid": i,
+            "applicant": tpl.get("applicant", g["applicant"]),
+            "department": tpl.get("department", g["department"]),
+            "destination": tpl["destination"],
+            "time": tpl["time"],
+            "passengers": int(tpl["passenger_count"]),
+            "purpose": tpl["purpose"],
+            "vehicle_type": tpl["vehicle_type"],
+        })
+    return out
+
+
+def get_group_trips(g: dict, roster: dict):
+    """-> (trips, next_tid) for a roster group. Uses the list Admin saved in the
+    roster tab (trips_json); falls back to the built-in defaults when nothing
+    has been saved yet (or the saved text is unreadable)."""
+    defaults = _default_group_trips(g)
+    row = roster.get(g["tag"]) or {}
+    raw = row.get("trips_json")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            obj = json.loads(raw)
+            trips = []
+            for d in obj.get("trips", []):
+                trips.append({
+                    "tid": int(d["tid"]),
+                    "applicant": str(d.get("applicant", "")).strip(),
+                    "department": str(d.get("department", "")).strip(),
+                    "destination": str(d.get("destination", "")).strip(),
+                    "time": str(d.get("time", "")).strip()[:5],
+                    "passengers": max(1, int(d.get("passengers", 1))),
+                    "purpose": str(d.get("purpose", "")).strip(),
+                    "vehicle_type": str(d.get("vehicle_type", "HIACE")).strip() or "HIACE",
+                })
+            next_tid = int(obj.get("next_tid") or (max([x["tid"] for x in trips], default=0) + 1))
+            return trips, next_tid
+        except Exception as e:
+            print(f"Unreadable trips_json for {g['tag']} (using defaults): {e}")
+    return defaults, len(defaults) + 1
+
+
+def save_group_trips(tag: str, trips: list, next_tid: int, updated_by: str):
+    """Saves the trip list of one roster group (other roster fields stay as they are)."""
+    sb = get_supabase_client()
+    sb.table(AUTO_ROSTER_TABLE).upsert({
+        "slot_key": tag, "group_tag": tag, "slot_no": 0,
+        "trips_json": json.dumps({"next_tid": next_tid, "trips": trips}, ensure_ascii=False),
+        "updated_by": updated_by, "updated_at": bd_now_str(),
+    }, on_conflict="slot_key").execute()
+    _clear_auto_roster_caches()
+
+
+def parse_trip_time(value):
+    """'19:15' / '7:15 PM' -> 'HH:MM' (24h), or None if it can't be read."""
+    s = str(value or "").strip().upper().replace(".", "")
+    for f in ("%H:%M", "%H:%M:%S", "%I:%M %p", "%I:%M%p", "%I %p"):
+        try:
+            return datetime.strptime(s, f).strftime("%H:%M")
+        except ValueError:
+            continue
+    return None
 
 
 def ensure_daily_shuttle_requisitions():
@@ -1555,7 +1649,32 @@ def ensure_daily_shuttle_requisitions():
                 print(f"Driver contact lookup failed: {e}")
 
         for g in DAILY_AUTO_GROUPS:
-            tag, templates = g["tag"], g["templates"]
+            tag = g["tag"]
+
+            # --- which trips does this group create today? ---
+            driver = vehicle = ""
+            if g["roster"]:
+                # ONE roster row per group: its driver + vehicle apply to every trip,
+                # its trip list (editable in the roster tab) says WHAT trips exist.
+                slot = roster.get(tag)
+                if slot is None or slot.get("enabled") is False:
+                    continue  # no roster saved yet / group switched off -> nothing created
+                driver = (slot.get("driver_name") or "").strip()
+                vehicle = (slot.get("vehicle_number") or "").strip()
+                if not (driver and vehicle):
+                    continue  # roster groups are NEVER created as Pending
+                trips, _next = get_group_trips(g, roster)
+                items = [(tr["tid"], {
+                    "applicant": tr["applicant"], "department": tr["department"],
+                    "destination": tr["destination"], "time": tr["time"],
+                    "passenger_count": tr["passengers"], "purpose": tr["purpose"],
+                    "vehicle_type": tr["vehicle_type"],
+                }) for tr in trips]
+            else:
+                items = list(enumerate(g["templates"], start=1))
+            if not items:
+                continue
+
             existing = (
                 sb.table(REQUISITIONS_TABLE)
                 .select("admin_note")
@@ -1568,26 +1687,12 @@ def ensure_daily_shuttle_requisitions():
             # tag (no '#n'); count them so they are not created a second time.
             legacy_count = sum(1 for n in notes if n.strip() == tag)
 
-            for idx, tpl in enumerate(templates, start=1):
-                marker = f"{tag}#{idx}"
-                if _slot_marker_found(marker, notes) or idx <= legacy_count:
+            for slot_id, tpl in items:
+                marker = f"{tag}#{slot_id}"
+                if _slot_marker_found(marker, notes) or slot_id <= legacy_count:
                     continue
 
                 trip_time = tpl["time"]
-                driver = vehicle = ""
-                if g["roster"]:
-                    # ONE roster row per group (key = the group tag) — its driver,
-                    # vehicle and departure time apply to every trip of the group.
-                    slot = roster.get(tag)
-                    if slot is None or slot.get("enabled") is False:
-                        continue  # no roster saved yet / group switched off -> nothing created
-                    driver = (slot.get("driver_name") or "").strip()
-                    vehicle = (slot.get("vehicle_number") or "").strip()
-                    if not (driver and vehicle):
-                        continue  # roster groups are NEVER created as Pending
-                    if not is_blank(slot.get("trip_time")):
-                        trip_time = str(slot["trip_time"]).strip()[:5]
-
                 data = {
                     "request_id": generate_request_id(),
                     "username": "",
@@ -4669,8 +4774,12 @@ elif user["role"] == "admin":
             f"{DAILY_AUTO_START_HOUR % 12 or 12}:{DAILY_AUTO_START_MINUTE:02d} "
             f"{'PM' if DAILY_AUTO_START_HOUR >= 12 else 'AM'} (Bangladesh time) the app creates each day's "
             "requisitions automatically, always **Approved** and sent straight to the driver. "
-            "A group with no Driver/Vehicle selected (or un-ticked Active) is NOT created."
+            "A group with no Driver/Vehicle selected (or un-ticked Active) is NOT created. "
+            "Under each group you can also edit its trips (time, destination, department, applicant), add new trips or remove trips."
         )
+
+        if st.session_state.get("roster_flash"):
+            st.success(st.session_state.pop("roster_flash"))
 
         roster_map, roster_err = fetch_auto_roster()
         if roster_err:
@@ -4700,7 +4809,8 @@ elif user["role"] == "admin":
             for g in DAILY_AUTO_GROUPS:
                 if not g["roster"]:
                     continue
-                g_tag, g_templates = g["tag"], g["templates"]
+                g_tag = g["tag"]
+                g_trips, g_next_tid = get_group_trips(g, roster_map)
                 saved = roster_map.get(g_tag, {})
                 saved_driver = (saved.get("driver_name") or "").strip()
                 saved_vehicle = (saved.get("vehicle_number") or "").strip()
@@ -4715,13 +4825,15 @@ elif user["role"] == "admin":
                     veh_opts.insert(1, saved_vehicle)
 
                 st.markdown(f"#### {g['title']}")
-                st.caption(f"Applies to all {len(g_templates)} trips of this group each day.")
+                st.caption(f"Applies to all {len(g_trips)} trip(s) of this group each day.")
                 if not (saved_driver and saved_vehicle):
                     st.warning("⚠️ No Driver/Vehicle saved for this group — its trips are NOT being created. Select and Save below.")
                 elif not saved_enabled:
                     st.warning("⏸️ This group is switched off (Active un-ticked) — its trips are NOT being created.")
+
+                # ---- one Driver + one Vehicle for the whole group ----
                 with st.form(f"roster_form_{g_tag}"):
-                    c1, c2, c3, c4 = st.columns([2.4, 2, 1.5, 1])
+                    c1, c2, c3 = st.columns([2.6, 2.2, 1])
                     sel_driver = c1.selectbox(
                         "Driver", drv_opts,
                         index=drv_opts.index(saved_driver) if saved_driver in drv_opts else 0,
@@ -4732,13 +4844,9 @@ elif user["role"] == "admin":
                         index=veh_opts.index(saved_vehicle) if saved_vehicle in veh_opts else 0,
                         key=f"roster_veh_{g_tag}",
                     )
-                    sel_time = c3.time_input(
-                        "Departure time", value=_hhmm_to_time(saved.get("trip_time"), g_templates[0]["time"]),
-                        key=f"roster_time_{g_tag}",
-                    )
-                    sel_active = c4.checkbox("Active", value=saved_enabled, key=f"roster_on_{g_tag}")
+                    sel_active = c3.checkbox("Active", value=saved_enabled, key=f"roster_on_{g_tag}")
                     save_clicked = st.form_submit_button(
-                        f"💾 Save {g['title']} Roster", type="primary", use_container_width=True,
+                        f"💾 Save {g['title']} Driver & Vehicle", type="primary", use_container_width=True,
                     )
 
                 if save_clicked:
@@ -4748,29 +4856,233 @@ elif user["role"] == "admin":
                         st.error("❌ Select BOTH Driver and Vehicle (or leave both as 'Not set').")
                     else:
                         try:
-                            row = {
+                            save_auto_roster_slots([{
                                 "slot_key": g_tag, "group_tag": g_tag, "slot_no": 0,
                                 "driver_name": drv_val, "vehicle_number": veh_val,
-                                "trip_time": sel_time.strftime("%H:%M"), "enabled": bool(sel_active),
+                                "enabled": bool(sel_active),
                                 "updated_by": user["full_name"], "updated_at": bd_now_str(),
-                            }
-                            save_auto_roster_slots([row])
+                            }])
                             # Existing (Pending / any) requisitions are never touched. If it is
                             # already past the auto-start time, create any of today's trips of
                             # this group that are still missing right now.
                             st.session_state.pop("_daily_shuttle_checked_date", None)
                             ensure_daily_shuttle_requisitions()
-                            msg = (f"✅ {g['title']} roster saved. The same Driver + Vehicle will be used for all "
-                                   f"{len(g_templates)} trips every day until you change it.")
-                            st.success(msg)
+                            st.session_state["roster_flash"] = (
+                                f"✅ {g['title']} Driver & Vehicle saved. They will be used for all "
+                                f"{len(g_trips)} trip(s) every day until you change them."
+                            )
+                            st.rerun()
                         except Exception as e:
                             st.error(f"❌ Failed to save roster: {e}")
+
+                # ---- the trips themselves: edit / add / remove ----
+                with st.expander(
+                    f"✏️ Edit the {len(g_trips)} trip(s) of this group — change time, destination, department, "
+                    "applicant name · add new trips · remove trips", expanded=False,
+                ):
+                    st.caption(
+                        "Edit any cell directly. **Add a trip:** click the empty row at the bottom of the table (＋). "
+                        "**Remove a trip:** tick 🗑️ Delete on that row. Then press the Save button under the table. "
+                        "Changes apply from the next auto-creation (trips already created today are not changed — "
+                        "use the list at the bottom of this page for those)."
+                    )
+                    trips_sig = hashlib.md5(json.dumps(g_trips, sort_keys=True).encode("utf-8")).hexdigest()[:8]
+                    trips_df = pd.DataFrame([{
+                        "🗑️ Delete": False,
+                        "Applicant Name": tr["applicant"],
+                        "Department": tr["department"],
+                        "Destination": tr["destination"],
+                        "Time (HH:MM, 24h)": tr["time"],
+                        "Passengers": tr["passengers"],
+                        "Purpose": tr["purpose"],
+                        "Vehicle Type": tr["vehicle_type"],
+                        "_tid": tr["tid"],
+                    } for tr in g_trips], columns=[
+                        "🗑️ Delete", "Applicant Name", "Department", "Destination", "Time (HH:MM, 24h)",
+                        "Passengers", "Purpose", "Vehicle Type", "_tid",
+                    ])
+                    default_tpl = g["templates"][0]
+                    with st.form(f"trips_form_{g_tag}"):
+                        edited_trips = st.data_editor(
+                            trips_df, key=f"trips_editor_{g_tag}_{trips_sig}", num_rows="dynamic",
+                            hide_index=True, use_container_width=True,
+                            column_config={
+                                "🗑️ Delete": st.column_config.CheckboxColumn("🗑️ Delete", default=False),
+                                "Applicant Name": st.column_config.TextColumn("Applicant Name", default=g["applicant"]),
+                                "Department": st.column_config.TextColumn("Department", default=g["department"]),
+                                "Destination": st.column_config.TextColumn("Destination", default=default_tpl["destination"]),
+                                "Time (HH:MM, 24h)": st.column_config.TextColumn(
+                                    "Time (HH:MM, 24h)", default=default_tpl["time"], help="e.g. 19:15 (7:15 PM also works)"),
+                                "Passengers": st.column_config.NumberColumn("Passengers", min_value=1, step=1, default=1),
+                                "Purpose": st.column_config.TextColumn("Purpose", default=default_tpl["purpose"]),
+                                "Vehicle Type": st.column_config.SelectboxColumn(
+                                    "Vehicle Type", options=VEHICLE_TYPES, default="HIACE"),
+                                "_tid": None,
+                            },
+                        )
+                        save_trips_clicked = st.form_submit_button(
+                            f"💾 Save {g['title']} Trips", type="primary", use_container_width=True,
+                        )
+
+                    if save_trips_clicked:
+                        new_trips, errors = [], []
+                        next_tid = g_next_tid
+                        for n, (_, er) in enumerate(edited_trips.iterrows(), start=1):
+                            if bool(er.get("🗑️ Delete")):
+                                continue
+                            dest_txt = str(er.get("Destination") or "").strip()
+                            appl_txt = str(er.get("Applicant Name") or "").strip()
+                            if not dest_txt and not appl_txt:
+                                continue  # blank row
+                            if not dest_txt:
+                                errors.append(f"Row {n}: Destination is required.")
+                                continue
+                            hhmm = parse_trip_time(er.get("Time (HH:MM, 24h)"))
+                            if not hhmm:
+                                errors.append(f"Row {n}: Time '{er.get('Time (HH:MM, 24h)')}' is not valid — use HH:MM, e.g. 19:15.")
+                                continue
+                            tid_val = er.get("_tid")
+                            if pd.isna(tid_val):
+                                tid_val = next_tid
+                                next_tid += 1
+                            try:
+                                pax = max(1, int(er.get("Passengers") or 1))
+                            except (TypeError, ValueError):
+                                pax = 1
+                            vt = str(er.get("Vehicle Type") or "").strip() or "HIACE"
+                            new_trips.append({
+                                "tid": int(tid_val),
+                                "applicant": appl_txt or g["applicant"],
+                                "department": str(er.get("Department") or "").strip() or g["department"],
+                                "destination": dest_txt,
+                                "time": hhmm,
+                                "passengers": pax,
+                                "purpose": str(er.get("Purpose") or "").strip() or default_tpl["purpose"],
+                                "vehicle_type": vt,
+                            })
+                        if errors:
+                            for msg_err in errors:
+                                st.error(f"❌ {msg_err}")
+                        else:
+                            try:
+                                save_group_trips(g_tag, new_trips, next_tid, user["full_name"])
+                                # Past the auto-start time? Create any new trip of today right away.
+                                st.session_state.pop("_daily_shuttle_checked_date", None)
+                                ensure_daily_shuttle_requisitions()
+                                st.session_state["roster_flash"] = (
+                                    f"✅ {g['title']}: {len(new_trips)} trip(s) saved. "
+                                    "They will be created automatically every day."
+                                )
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"❌ Failed to save trips: {e}")
+                                st.caption(
+                                    "If the message mentions 'trips_json', run this once in Supabase → SQL Editor, "
+                                    "then try again:"
+                                )
+                                st.code(
+                                    "alter table auto_duty_roster add column if not exists trips_json text default '';",
+                                    language="sql",
+                                )
 
             st.info(
                 "ℹ️ Existing Pending requisitions are never changed by this page. Staff Shuttle and Female Worker "
                 "Drop requisitions are created as **Pending** every day — approve them from "
                 "**🚗 Pending Requests** as usual."
             )
+
+        # ------------------------------------------------------------------
+        # Commercial Duty + Night Shift trips: list, pick one from the dropdown,
+        # and edit EVERYTHING about it in the vertical edit form (same form as
+        # "✏️ Edit / Delete Trip": status, driver, vehicle, times, KM, note ...).
+        # ------------------------------------------------------------------
+        st.markdown("---")
+        st.markdown("### 📋 Commercial Duty & Night Shift Trips — View / Edit")
+        if st.session_state.get("edit_flash"):
+            st.success(st.session_state.pop("edit_flash"))
+
+        lf1, lf2, lf3 = st.columns([2, 2, 3])
+        with lf1:
+            list_group = st.selectbox(
+                "Group", ["All (Commercial + Night Shift)", "💼 Commercial Duty", "🌙 Night Shift Vehicle"],
+                key="auto_trips_group",
+            )
+        with lf2:
+            list_status = st.multiselect(
+                "Status", REQ_STATUS_OPTIONS, default=["Approved"], key="auto_trips_status",
+                help="Default shows the Approved trips. Add other statuses (On Trip, Completed ...) or clear it to see all.",
+            )
+        with lf3:
+            list_dates = st.date_input(
+                "Trip date (from — to)", value=(bd_today(), bd_today()), key="auto_trips_dates",
+            )
+        if isinstance(list_dates, (tuple, list)):
+            d_from = list_dates[0]
+            d_to = list_dates[1] if len(list_dates) == 2 else list_dates[0]
+        else:
+            d_from = d_to = list_dates
+
+        try:
+            auto_trips_df = fetch_auto_duty_trips(str(d_from), str(d_to))
+        except Exception as e:
+            auto_trips_df = pd.DataFrame(columns=REQUISITION_COLUMNS)
+            st.error(f"❌ Could not load the trips: {e}")
+
+        def _trip_group_label(note):
+            note = str(note or "")
+            if DAILY_COMMERCIAL_TAG in note:
+                return "💼 Commercial Duty"
+            if DAILY_NIGHT_SHIFT_TAG in note:
+                return "🌙 Night Shift Vehicle"
+            return "—"
+
+        if not auto_trips_df.empty:
+            auto_trips_df = auto_trips_df.copy()
+            auto_trips_df["_group"] = auto_trips_df["admin_note"].map(_trip_group_label)
+            if list_group != "All (Commercial + Night Shift)":
+                auto_trips_df = auto_trips_df[auto_trips_df["_group"] == list_group]
+            if list_status:
+                auto_trips_df = auto_trips_df[auto_trips_df["status"].isin(list_status)]
+
+        if auto_trips_df.empty:
+            st.info("No Commercial Duty / Night Shift trips match these filters.")
+        else:
+            st.caption(f"{len(auto_trips_df)} trip(s) found.")
+            st.dataframe(
+                pd.DataFrame({
+                    "Req #": auto_trips_df["id"].map(short_req_id),
+                    "Group": auto_trips_df["_group"],
+                    "Date": auto_trips_df["date_of_travel"],
+                    "Time": auto_trips_df["time_of_travel"].map(lambda v: fmt_time_12h(v, "")),
+                    "Duty / Dept": auto_trips_df["department"].fillna(""),
+                    "Destination": auto_trips_df["destination"].fillna(""),
+                    "Status": auto_trips_df["status"].map(lambda s: STATUS_BADGE.get(s, s)),
+                    "Driver": auto_trips_df["driver_name"].fillna(""),
+                    "Vehicle": auto_trips_df["vehicle_number"].fillna(""),
+                }),
+                use_container_width=True, hide_index=True,
+                height=min(80 + 35 * len(auto_trips_df), 420),
+            )
+
+            trip_options = {}
+            for _, _r in auto_trips_df.iterrows():
+                _label = (
+                    f"{short_req_id(_r.get('id'))} | {_r['_group']} | "
+                    f"{STATUS_BADGE.get(_r['status'], _r['status'])} | "
+                    f"{_r['date_of_travel']} {fmt_time_12h(_r['time_of_travel'], '')} | "
+                    f"{fmt(_r.get('department'), '')} → {fmt(_r.get('destination'), '')} | "
+                    f"🚘 {fmt(_r.get('driver_name'), '—')}"
+                )
+                trip_options[_label] = _r["request_id"]
+            picked = st.selectbox(
+                f"Select a trip to edit ({len(trip_options)} found)",
+                ["— Select a trip —"] + list(trip_options.keys()), key="auto_trips_pick",
+            )
+            if picked != "— Select a trip —":
+                picked_row = auto_trips_df[auto_trips_df["request_id"] == trip_options[picked]].iloc[0]
+                admin_edit_trip_panel(
+                    picked_row, auto_trips_df, fetch_all_drivers(), fetch_all_vehicles(),
+                )
 
     # ---------------- User List (was Tab 2) ----------------
     if tab_users:
