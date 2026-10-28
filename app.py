@@ -11,6 +11,7 @@ Author: Senior Python Developer (generated for Shohel Rana)
 
 import io
 import os
+import types
 import json
 import base64
 import hashlib
@@ -579,10 +580,30 @@ REQUISITION_COLUMNS = [
 ]
 
 
+def _execute_all_pages(make_query, page_size: int = 1000):
+    """Runs a Supabase query page by page and returns ALL rows.
+
+    Supabase/PostgREST silently returns at most 1000 rows per request. Without
+    paging, once the requisitions table grew past 1000 rows the OLDEST rows were
+    quietly cut off (the Export tab's start date jumped forward and old trips
+    vanished from reports even though they were still in the database).
+    `make_query` must return a fresh, ordered query each time it is called."""
+    rows, start = [], 0
+    while True:
+        batch = make_query().range(start, start + page_size - 1).execute().data or []
+        rows.extend(batch)
+        if len(batch) < page_size or start > 500000:
+            break
+        start += page_size
+    return types.SimpleNamespace(data=rows)
+
+
 @st.cache_data(ttl=90, show_spinner=False)
 def fetch_all_requisitions() -> pd.DataFrame:
     sb = get_supabase_client()
-    res = sb.table(REQUISITIONS_TABLE).select("*").order("created_at", desc=True).execute()
+    res = _execute_all_pages(
+        lambda: sb.table(REQUISITIONS_TABLE).select("*").order("created_at", desc=True).order("id", desc=True)
+    )
     return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=REQUISITION_COLUMNS)
 
 
@@ -592,12 +613,12 @@ def fetch_active_requisitions() -> pd.DataFrame:
     slice (it does NOT grow as history piles up), used by Admin's landing page
     so it opens fast. Sections that need the full history use fetch_all_requisitions()."""
     sb = get_supabase_client()
-    res = (
-        sb.table(REQUISITIONS_TABLE)
+    res = _execute_all_pages(
+        lambda: sb.table(REQUISITIONS_TABLE)
         .select("*")
         .in_("status", ["Pending", "Approved", "On Trip"])
         .order("created_at", desc=True)
-        .execute()
+        .order("id", desc=True)
     )
     return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=REQUISITION_COLUMNS)
 
@@ -606,12 +627,12 @@ def fetch_active_requisitions() -> pd.DataFrame:
 def fetch_requisitions_by_user(username: str) -> pd.DataFrame:
     """Server-side filtered fetch — strict data isolation: only this user's rows are ever requested."""
     sb = get_supabase_client()
-    res = (
-        sb.table(REQUISITIONS_TABLE)
+    res = _execute_all_pages(
+        lambda: sb.table(REQUISITIONS_TABLE)
         .select("*")
         .eq("username", username)
         .order("created_at", desc=True)
-        .execute()
+        .order("id", desc=True)
     )
     return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=REQUISITION_COLUMNS)
 
@@ -659,19 +680,21 @@ def fetch_requisitions_by_driver(driver_name: str) -> pd.DataFrame:
     sb = get_supabase_client()
     pattern = _driver_ilike_pattern(driver_name)
     try:
-        q = sb.table(REQUISITIONS_TABLE).select("*").not_.is_("driver_name", "null")
-        if pattern:
-            # Only this driver's rows travel over the network (fast on weak links).
-            q = q.ilike("driver_name", pattern)
-        res = q.order("created_at", desc=True).execute()
+        def _drv_query():
+            q = sb.table(REQUISITIONS_TABLE).select("*").not_.is_("driver_name", "null")
+            if pattern:
+                # Only this driver's rows travel over the network (fast on weak links).
+                q = q.ilike("driver_name", pattern)
+            return q.order("created_at", desc=True).order("id", desc=True)
+        res = _execute_all_pages(_drv_query)
     except Exception:
         # Safety net: fall back to the original full fetch + client-side filter.
-        res = (
-            sb.table(REQUISITIONS_TABLE)
+        res = _execute_all_pages(
+            lambda: sb.table(REQUISITIONS_TABLE)
             .select("*")
             .not_.is_("driver_name", "null")
             .order("created_at", desc=True)
-            .execute()
+            .order("id", desc=True)
         )
     if not res.data:
         return pd.DataFrame(columns=REQUISITION_COLUMNS)
