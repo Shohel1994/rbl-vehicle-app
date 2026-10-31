@@ -773,6 +773,44 @@ def group_trips(df: pd.DataFrame) -> list:
     return groups
 
 
+def _sort_dt(value):
+    """Timestamp text -> naive datetime for ordering. Reads the stored wall-clock
+    numbers as they are (same approach as fmt_time_12h) and copes with every shape
+    Supabase returns: 'YYYY-MM-DD HH:MM:SS', ISO 'T', fractional seconds, +00:00.
+    Missing/unreadable values sort LAST."""
+    if is_blank(value):
+        return datetime.max
+    s = str(value).strip().replace("T", " ")
+    s = re.sub(r"(\.\d+)?(Z|[+-]\d{2}:?\d{2})$", "", s, flags=re.IGNORECASE).strip()
+    for f in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(s, f)
+        except ValueError:
+            continue
+    return datetime.max
+
+
+def sort_by_approval_order(df: pd.DataFrame) -> pd.DataFrame:
+    """Oldest approval first: the requisition the Admin approved FIRST for a driver
+    comes first (#1), the next approved is #2, and so on. action_timestamp holds
+    the moment of approval; ties (e.g. a batch auto-created in the same second)
+    fall back to creation time and then id, so the order stays stable."""
+    if df is None or df.empty:
+        return df
+    d = df.copy()
+    keys = []
+    for col in ("action_timestamp", "created_at"):
+        if col in d.columns:
+            d["_k_" + col] = d[col].map(_sort_dt)
+            keys.append("_k_" + col)
+    if "id" in d.columns:
+        d["_k_id"] = pd.to_numeric(d["id"], errors="coerce")
+        keys.append("_k_id")
+    if keys:
+        d = d.sort_values(keys, ascending=True, na_position="last", kind="mergesort")
+    return d.drop(columns=[c for c in d.columns if c.startswith("_k_")])
+
+
 def mark_group_duplicates(df: pd.DataFrame) -> pd.Series:
     """True for the 2nd+ requisition of the same group trip, so distance/hours
     of one physical trip are not counted several times in totals."""
@@ -3762,12 +3800,13 @@ elif user["role"] == "driver":
     # ---------------- TAB 1: Start Trip (Start KM only) ----------------
     if tab_depart:
         st.subheader("Approved Trips Awaiting Your Start KM")
+        st.caption("🔢 Trips are listed in the order the Admin approved them — #1 was approved first, then #2, #3 ...")
         start_trips = my_trips[my_trips["status"] == "Approved"] if not my_trips.empty else my_trips
 
         if start_trips.empty:
             st.info("You have no Approved trips waiting to start.")
         else:
-            for grp in group_trips(start_trips):
+            for n, grp in enumerate(group_trips(sort_by_approval_order(start_trips)), start=1):
                 first = grp[0]
                 gkey = first["request_id"]
                 multi = len(grp) > 1
@@ -3775,10 +3814,10 @@ elif user["role"] == "driver":
                 ids_label = ", ".join(short_req_id(x.get("id")) for x in grp)
                 dests = " / ".join(dict.fromkeys(str(x["destination"]) for x in grp))
                 if multi:
-                    title = (f"🟢 Group Trip — Requisitions {ids_label} — {dests}  |  "
+                    title = (f"#{n} · 🟢 Group Trip — Requisitions {ids_label} — {dests}  |  "
                              f"Vehicle: {fmt(first.get('vehicle_number'), 'N/A')}")
                 else:
-                    title = (f"🟢 Requisition {short_req_id(first.get('id'))} — {first['destination']}  |  "
+                    title = (f"#{n} · 🟢 Requisition {short_req_id(first.get('id'))} — {first['destination']}  |  "
                              f"Vehicle: {fmt(first.get('vehicle_number'), 'N/A')}")
                 if any(not is_blank(x.get("admin_note")) for x in grp):
                     title += "  |  📝 ADMIN NOTE"
@@ -3843,7 +3882,7 @@ elif user["role"] == "driver":
         if end_trips.empty:
             st.info("No trips are currently waiting for your End KM.")
         else:
-            for grp in group_trips(end_trips):
+            for n, grp in enumerate(group_trips(sort_by_approval_order(end_trips)), start=1):
                 first = grp[0]
                 gkey = first["request_id"]
                 multi = len(grp) > 1
@@ -3853,10 +3892,10 @@ elif user["role"] == "driver":
                 ids_label = ", ".join(short_req_id(x.get("id")) for x in grp)
                 dests = " / ".join(dict.fromkeys(str(x["destination"]) for x in grp))
                 if multi:
-                    title = (f"🔵 Group Trip — Requisitions {ids_label} — {dests}  |  "
+                    title = (f"#{n} · 🔵 Group Trip — Requisitions {ids_label} — {dests}  |  "
                              f"Vehicle: {fmt(first.get('vehicle_number'), 'N/A')}")
                 else:
-                    title = (f"🔵 Requisition {short_req_id(first.get('id'))} — {first['destination']}  |  "
+                    title = (f"#{n} · 🔵 Requisition {short_req_id(first.get('id'))} — {first['destination']}  |  "
                              f"Vehicle: {fmt(first.get('vehicle_number'), 'N/A')}")
                 if any(not is_blank(x.get("admin_note")) for x in grp):
                     title += "  |  📝 ADMIN NOTE"
@@ -4390,26 +4429,50 @@ elif user["role"] == "admin":
         # selects in Pending Requests) so choosing someone here immediately
         # updates the defaults shown inside the form below, instead of only
         # taking effect after the form is submitted.
-        existing_user_options = ["— Manual Entry —"] + (
-            users_df[users_df["status"] == "Approved"]["username"].tolist() if not users_df.empty else []
+        # Each option reads "Full Name (username) · Department". The search box of the
+        # dropdown matches ANY part of that text, so the Admin can type either the
+        # person's real name or their login username and still find them.
+        user_label_map = {}
+        if not users_df.empty:
+            _approved = users_df[users_df["status"] == "Approved"]
+            _rows = []
+            for _, _u in _approved.iterrows():
+                _full = fmt(_u.get("full_name"), "(no name)")
+                _lbl = f"{_full} ({_u['username']})"
+                _dept = fmt(_u.get("department"), "")
+                if _dept:
+                    _lbl += f" · {_dept}"
+                _rows.append((_full.lower(), _lbl, _u["username"]))
+            for _, _lbl, _uname in sorted(_rows):
+                user_label_map[_lbl] = _uname
+        existing_user_options = ["— Manual Entry —"] + list(user_label_map.keys())
+        selected_user_label = st.selectbox(
+            "Fill from an existing user — type the Full Name or the Username to search (optional)",
+            existing_user_options, key="create_req_existing_user_v2",
         )
-        selected_existing_user = st.selectbox(
-            "Fill from an existing user (optional)", existing_user_options, key="create_req_existing_user",
-        )
+        selected_existing_user = user_label_map.get(selected_user_label, "— Manual Entry —")
         prefill = {}
         if selected_existing_user != "— Manual Entry —" and not users_df.empty:
             match = users_df[users_df["username"] == selected_existing_user]
             if not match.empty:
                 prefill = match.iloc[0].to_dict()
 
+        # Department of the picked user -> position in the list (ignores spaces / capital
+        # letters, so "quality " still matches "Quality").
+        _pref_dept = str(prefill.get("department") or "").strip().lower()
+        _pref_dept_idx = next((i for i, d in enumerate(DEPARTMENTS) if d.lower() == _pref_dept), 0)
+
         with st.form("admin_create_req_form", clear_on_submit=True):
             c1, c2 = st.columns(2)
             with c1:
                 ca_applicant_name = st.text_input("Applicant Name *", value=fmt(prefill.get("full_name"), ""))
+                # The key includes the picked user: a widget with a fixed key remembers its
+                # old value and ignores a new `index`, which is why Department stayed on
+                # "Accounts" while Name and Mobile were refilled correctly.
                 ca_department = st.selectbox(
                     "Department *", DEPARTMENTS,
-                    index=DEPARTMENTS.index(prefill.get("department")) if prefill.get("department") in DEPARTMENTS else 0,
-                    key="ca_department",
+                    index=_pref_dept_idx,
+                    key=f"ca_department_{selected_existing_user}",
                 )
                 ca_mobile = st.text_input("Mobile Number *", value=fmt(prefill.get("mobile"), ""),
                                            placeholder="01XXXXXXXXX")
