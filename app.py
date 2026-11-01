@@ -492,6 +492,7 @@ def _clear_requisition_caches():
     fetch_requisitions_by_driver.clear()
     get_last_driver_end_km.clear()
     fetch_auto_duty_trips.clear()
+    _fetch_purpose_rows.clear()
 
 
 def _clear_driver_caches():
@@ -578,6 +579,118 @@ REQUISITION_COLUMNS = [
     "actual_exit_time", "actual_return_time", "driver_start_km", "driver_end_km", "driver_km_updated_at",
     "trip_group_id",
 ]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_purpose_rows() -> list:
+    """Light query: only who wrote which Purpose / Destination / Admin Note (newest first)."""
+    sb = get_supabase_client()
+    res = _execute_all_pages(
+        lambda: sb.table(REQUISITIONS_TABLE)
+        .select("id, username, purpose, destination, admin_note")
+        .order("id", desc=True)
+    )
+    return res.data or []
+
+
+def get_text_suggestions(field: str, username: str = "", limit: int = 40, min_count: int = 2) -> list:
+    """Suggestions for a free-text box ('purpose' or 'destination'), learned from
+    past requisitions:
+      1) this person's OWN earlier entries (newest first), then
+      2) entries that were used at least twice by anyone, most common first.
+    One-off texts written by other people are never shown (they may be personal).
+    Auto-created duty trips and emergency trips are ignored.
+
+    Each field has its OWN list: 'purpose' only ever reads the Purpose column and
+    'destination' only the Destination column. Admin notes are never mixed into
+    them — the Admin-note suggestions are shown ONLY inside the Admin's
+    "Create Requisition" form (field='admin_note'), never on the employee form."""
+    if field not in ("purpose", "destination", "admin_note"):
+        return []
+    try:
+        rows = _fetch_purpose_rows()
+    except Exception as e:
+        print(f"Suggestions unavailable ({field}): {e}")
+        return []
+    own, own_keys, counts, shown = [], set(), {}, {}
+    for r in rows:  # newest first
+        text = re.sub(r"\s+", " ", str(r.get(field) or "")).strip()
+        note = str(r.get("admin_note") or "")
+        if not text or len(text) > 120 or text.startswith("🚨"):
+            continue
+        if "AUTO-DAILY" in note or "shuttle template" in note:
+            continue
+        k = text.casefold()
+        counts[k] = counts.get(k, 0) + 1
+        shown.setdefault(k, text)
+        if username and str(r.get("username") or "") == username and k not in own_keys:
+            own_keys.add(k)
+            own.append(text)
+    common = [shown[k] for k, c in sorted(counts.items(), key=lambda kv: -kv[1]) if c >= min_count and k not in own_keys]
+    return (own[:15] + common)[:limit]
+
+
+def get_admin_note_suggestions(applicant_username: str = "", limit: int = 40) -> list:
+    """Suggestions for an ADMIN NOTE (Admin-only screens; never shown to employees).
+      1) the notes Admin gave before on THIS applicant's requisitions — the ones
+         given most often come first (ties: most recent first), then
+      2) every other earlier admin note, most used first.
+    Auto-duty tags / auto-submit texts are ignored."""
+    try:
+        rows = _fetch_purpose_rows()
+    except Exception as e:
+        print(f"Admin-note suggestions unavailable: {e}")
+        return []
+    mine, allc, shown = {}, {}, {}
+    for r in rows:  # newest first -> dict order = most recent first, used as the tie-break
+        text = re.sub(r"\s+", " ", str(r.get("admin_note") or "")).strip()
+        if not text or len(text) > 200:
+            continue
+        if "AUTO-DAILY" in text or "shuttle template" in text:
+            continue
+        k = text.casefold()
+        shown.setdefault(k, text)
+        allc[k] = allc.get(k, 0) + 1
+        if applicant_username and str(r.get("username") or "") == applicant_username:
+            mine[k] = mine.get(k, 0) + 1
+    first = sorted(mine, key=lambda k: -mine[k])                    # stable sort keeps recency on ties
+    rest = [k for k in sorted(allc, key=lambda k: -allc[k]) if k not in mine]
+    return [shown[k] for k in (first + rest)][:limit]
+
+
+TEXT_PICK_NONE = "— Type my own (or pick a suggestion) —"
+
+
+def _apply_text_pick(pick_key: str, box_key: str):
+    """on_change of a suggestion dropdown: copies the chosen suggestion into its text
+    box (callbacks run BEFORE the page redraws, so this is allowed). The box stays
+    fully editable."""
+    choice = st.session_state.get(pick_key, TEXT_PICK_NONE)
+    st.session_state[box_key] = "" if choice == TEXT_PICK_NONE else choice
+
+
+def bordered_box():
+    """A bordered box that looks like the old st.form frame (plain container on
+    Streamlit versions that don't support borders)."""
+    try:
+        return st.container(border=True)
+    except TypeError:
+        return st.container()
+
+
+def text_picker(noun: str, field: str, pick_key: str, box_key: str, username: str = "", min_count: int = 2):
+    """Suggestion dropdown shown RIGHT ABOVE its text box (outside the form, so it
+    reacts instantly). Picking one fills the box; the user can edit it, or ignore
+    the dropdown and type anything."""
+    if field == "admin_note":
+        options = [TEXT_PICK_NONE] + get_admin_note_suggestions(username)
+    else:
+        options = [TEXT_PICK_NONE] + get_text_suggestions(field, username, min_count=min_count)
+    st.selectbox(
+        f"{noun} suggestions",  # hidden label (kept for accessibility) — the box itself says what to do
+        options, key=pick_key, on_change=_apply_text_pick, args=(pick_key, box_key),
+        label_visibility="collapsed",
+    )
 
 
 def _execute_all_pages(make_query, page_size: int = 1000):
@@ -3631,30 +3744,46 @@ if user["role"] == "user":
             "profile — no need to re-select or re-type them every time. You can still "
             "adjust them below if this trip needs different details."
         )
-        with st.form("req_form", clear_on_submit=True):
+        # This used to be an st.form. A form cannot react to a dropdown pick, so it is now a
+        # bordered box of normal widgets: that lets each "suggestion" dropdown sit RIGHT ABOVE
+        # its field (Destination / Purpose stay exactly where they were) and fill it instantly.
+        # All keys carry a version number; bumping it after a successful submit gives a
+        # fresh, empty form (same effect as the old clear_on_submit).
+        _v = st.session_state.get("emp_form_ver", 0)
+        if st.session_state.get("emp_flash"):
+            st.success(st.session_state.pop("emp_flash"))
+            st.balloons()
+
+        with bordered_box():
             c1, c2 = st.columns(2)
             with c1:
                 # Auto-filled directly from the logged-in session's profile data
                 # (st.session_state.auth_user) so employees never have to
                 # re-select their department or retype their name/mobile number
                 # for every new requisition.
-                applicant_name = st.text_input("Applicant Name *", value=user.get("full_name", ""))
+                applicant_name = st.text_input("Applicant Name *", value=user.get("full_name", ""), key=f"emp_name_{_v}")
                 department = st.selectbox(
                     "Department *", DEPARTMENTS,
                     index=DEPARTMENTS.index(user["department"]) if user.get("department") in DEPARTMENTS else 0,
+                    key=f"emp_dept_{_v}",
                 )
                 mobile_number = st.text_input("Mobile Number *", value=user.get("mobile", ""),
-                                               placeholder="01XXXXXXXXX")
-                passenger_count = st.number_input("Passenger Count *", min_value=1, max_value=50, value=1)
+                                               placeholder="01XXXXXXXXX", key=f"emp_mobile_{_v}")
+                passenger_count = st.number_input("Passenger Count *", min_value=1, max_value=50, value=1,
+                                                   key=f"emp_pax_{_v}")
+                text_picker("Purpose", "purpose", f"emp_purpose_pick_{_v}", f"emp_purpose_{_v}", user["username"])
+                purpose = st.text_area("Purpose of Travel *", height=90, key=f"emp_purpose_{_v}")
             with c2:
-                date_of_travel = st.date_input("Date of Travel *", min_value=bd_today())
-                time_of_travel = time_input_12h("Time of Travel *", key_prefix="new_req_tt")
-                destination = st.text_input("Destination *")
-                vehicle_type = st.selectbox("Vehicle Type Required *", VEHICLE_TYPES)
+                date_of_travel = st.date_input("Date of Travel *", min_value=bd_today(), key=f"emp_date_{_v}")
+                time_of_travel = time_input_12h("Time of Travel *", key_prefix=f"new_req_tt_{_v}")
+                text_picker("Destination", "destination", f"emp_dest_pick_{_v}", f"emp_dest_{_v}", user["username"])
+                destination = st.text_input("Destination *", key=f"emp_dest_{_v}")
+                vehicle_type = st.selectbox("Vehicle Type Required *", VEHICLE_TYPES, key=f"emp_vtype_{_v}")
 
-            purpose = st.text_area("Purpose of Travel *", height=90)
-            special_request = st.text_area("Special Request (optional)", height=70)
-            submitted = st.form_submit_button("🚀 Submit Requisition", type="primary", use_container_width=True)
+            special_request = st.text_area("Special Request (optional)", height=70, key=f"emp_special_{_v}")
+            submitted = st.button(
+                "🚀 Submit Requisition", type="primary", use_container_width=True, key=f"emp_submit_{_v}",
+            )
 
         if submitted:
             errors = []
@@ -3694,8 +3823,11 @@ if user["role"] == "user":
                 with st.spinner("Saving to Supabase..."):
                     try:
                         new_id = insert_requisition(data)
-                        st.success(f"✅ Requisition submitted! Your Requisition number is **{short_req_id(new_id)}**")
-                        st.balloons()
+                        st.session_state["emp_flash"] = (
+                            f"✅ Requisition submitted! Your Requisition number is **{short_req_id(new_id)}**"
+                        )
+                        st.session_state["emp_form_ver"] = _v + 1  # fresh empty form
+                        st.rerun()
                     except Exception as e:
                         st.error(f"❌ Failed to save requisition: {e}")
 
@@ -4253,6 +4385,7 @@ elif user["role"] == "admin":
                     "Approved Departure Time (applied to every selected request)",
                     key_prefix="bulk_assign_time",
                 )
+                text_picker("Admin note", "admin_note", "bulk_note_pick", "bulk_assign_note")
                 bulk_note = st.text_area(
                     "Admin Note / Remarks (optional, applied to every selected request)",
                     key="bulk_assign_note",
@@ -4357,7 +4490,10 @@ elif user["role"] == "admin":
                         key=f"veh_{r['request_id']}", disabled=not vehicle_options,
                     )
 
-                    with st.form(f"action_{r['request_id']}"):
+                    # Not an st.form any more: a form can't react to a dropdown pick, and the
+                    # Admin-note suggestion has to fill the note box instantly. Approving or
+                    # rejecting reruns the page and the request leaves this queue anyway.
+                    with bordered_box():
                         try:
                             default_time = datetime.strptime(r["time_of_travel"], "%H:%M").time()
                         except (ValueError, TypeError):
@@ -4367,6 +4503,11 @@ elif user["role"] == "admin":
                             key_prefix=f"atime_{r['request_id']}",
                             default_time=default_time,
                         )
+                        # Notes Admin gave before to THIS applicant come first (most-used first).
+                        text_picker(
+                            "Admin note", "admin_note", f"notepick_{r['request_id']}", f"note_{r['request_id']}",
+                            str(r.get("username") or ""),
+                        )
                         admin_note = st.text_area(
                             "Admin Note / Remarks (optional)",
                             placeholder="e.g., Rescheduled due to vehicle availability, or reason for rejection",
@@ -4374,8 +4515,12 @@ elif user["role"] == "admin":
                         )
 
                         b1, b2 = st.columns(2)
-                        approve_clicked = b1.form_submit_button("✅ Approve", type="primary", use_container_width=True)
-                        reject_clicked = b2.form_submit_button("❌ Reject", use_container_width=True)
+                        approve_clicked = b1.button(
+                            "✅ Approve", type="primary", use_container_width=True, key=f"approve_{r['request_id']}",
+                        )
+                        reject_clicked = b2.button(
+                            "❌ Reject", use_container_width=True, key=f"reject_{r['request_id']}",
+                        )
 
                     if approve_clicked or reject_clicked:
                         new_status = "Approved" if approve_clicked else "Rejected"
@@ -4462,30 +4607,44 @@ elif user["role"] == "admin":
         _pref_dept = str(prefill.get("department") or "").strip().lower()
         _pref_dept_idx = next((i for i, d in enumerate(DEPARTMENTS) if d.lower() == _pref_dept), 0)
 
-        with st.form("admin_create_req_form", clear_on_submit=True):
+        # Not an st.form any more (a form can't react to a dropdown pick): a bordered box of
+        # normal widgets, so each suggestion dropdown sits RIGHT ABOVE its field. All keys
+        # carry a version number that is bumped after a successful create -> fresh empty form.
+        # If a user is picked above, that person's own history comes first in the suggestions.
+        _cv = st.session_state.get("ca_form_ver", 0)
+        _sugg_user = selected_existing_user if selected_existing_user != "— Manual Entry —" else ""
+        _pk = f"{_cv}_{selected_existing_user}"  # also changes when another user is picked -> re-prefill
+        if st.session_state.get("ca_flash"):
+            st.success(st.session_state.pop("ca_flash"))
+            st.balloons()
+
+        with bordered_box():
             c1, c2 = st.columns(2)
             with c1:
-                ca_applicant_name = st.text_input("Applicant Name *", value=fmt(prefill.get("full_name"), ""))
+                ca_applicant_name = st.text_input("Applicant Name *", value=fmt(prefill.get("full_name"), ""),
+                                                   key=f"ca_name_{_pk}")
                 # The key includes the picked user: a widget with a fixed key remembers its
                 # old value and ignores a new `index`, which is why Department stayed on
                 # "Accounts" while Name and Mobile were refilled correctly.
                 ca_department = st.selectbox(
                     "Department *", DEPARTMENTS,
                     index=_pref_dept_idx,
-                    key=f"ca_department_{selected_existing_user}",
+                    key=f"ca_department_{_pk}",
                 )
                 ca_mobile = st.text_input("Mobile Number *", value=fmt(prefill.get("mobile"), ""),
-                                           placeholder="01XXXXXXXXX")
+                                           placeholder="01XXXXXXXXX", key=f"ca_mobile_{_pk}")
                 ca_passenger_count = st.number_input("Passenger Count *", min_value=1, max_value=50, value=1,
-                                                      key="ca_passenger_count")
+                                                      key=f"ca_passenger_count_{_cv}")
+                text_picker("Purpose", "purpose", f"ca_purpose_pick_{_cv}", f"ca_purpose_{_cv}", _sugg_user)
+                ca_purpose = st.text_area("Purpose of Travel *", height=90, key=f"ca_purpose_{_cv}")
             with c2:
-                ca_date = st.date_input("Date of Travel *", min_value=bd_today(), key="ca_date")
-                ca_time = time_input_12h("Time of Travel *", key_prefix="create_req_tt")
-                ca_destination = st.text_input("Destination *", key="ca_destination")
-                ca_vehicle_type = st.selectbox("Vehicle Type Required *", VEHICLE_TYPES, key="ca_vehicle_type")
+                ca_date = st.date_input("Date of Travel *", min_value=bd_today(), key=f"ca_date_{_cv}")
+                ca_time = time_input_12h("Time of Travel *", key_prefix=f"create_req_tt_{_cv}")
+                text_picker("Destination", "destination", f"ca_dest_pick_{_cv}", f"ca_destination_{_cv}", _sugg_user)
+                ca_destination = st.text_input("Destination *", key=f"ca_destination_{_cv}")
+                ca_vehicle_type = st.selectbox("Vehicle Type Required *", VEHICLE_TYPES, key=f"ca_vehicle_type_{_cv}")
 
-            ca_purpose = st.text_area("Purpose of Travel *", height=90, key="ca_purpose")
-            ca_special_request = st.text_area("Special Request (optional)", height=70, key="ca_special_request")
+            ca_special_request = st.text_area("Special Request (optional)", height=70, key=f"ca_special_{_cv}")
 
             st.markdown("---")
             st.markdown("##### 🚗 Assign Driver & Vehicle (required to create)")
@@ -4493,17 +4652,20 @@ elif user["role"] == "admin":
             with d1:
                 ca_driver = st.selectbox(
                     "Driver Name *", create_driver_options or ["No drivers available"],
-                    disabled=not create_driver_options, key="ca_driver",
+                    disabled=not create_driver_options, key=f"ca_driver_{_cv}",
                 )
             with d2:
                 ca_vehicle = st.selectbox(
                     "Vehicle Number *", create_vehicle_options or ["No vehicles available"],
-                    disabled=not create_vehicle_options, key="ca_vehicle",
+                    disabled=not create_vehicle_options, key=f"ca_vehicle_{_cv}",
                 )
-            ca_admin_note = st.text_area("Admin Note (optional)", height=60, key="ca_admin_note")
+            # Admin notes are only ever seen by Admins. If a person is picked above, the notes given
+            # to THEIR earlier requisitions come first (most used first), then all other notes.
+            text_picker("Admin note", "admin_note", f"ca_note_pick_{_cv}", f"ca_admin_note_{_cv}", _sugg_user)
+            ca_admin_note = st.text_area("Admin Note (optional)", height=60, key=f"ca_admin_note_{_cv}")
 
-            ca_submitted = st.form_submit_button("✅ Create & Approve Requisition", type="primary",
-                                                  use_container_width=True)
+            ca_submitted = st.button("✅ Create & Approve Requisition", type="primary",
+                                      use_container_width=True, key=f"ca_submit_{_cv}")
 
         if ca_submitted:
             errors = []
@@ -4553,11 +4715,12 @@ elif user["role"] == "admin":
                 with st.spinner("Saving to Supabase..."):
                     try:
                         new_id = insert_requisition(data)
-                        st.success(
+                        st.session_state["ca_flash"] = (
                             f"✅ Requisition **{short_req_id(new_id)}** created and already Approved — "
                             f"Driver **{ca_driver}** / Vehicle **{ca_vehicle}**."
                         )
-                        st.balloons()
+                        st.session_state["ca_form_ver"] = _cv + 1  # fresh empty form
+                        st.rerun()
                     except Exception as e:
                         st.error(f"❌ Failed to save requisition: {e}")
 
