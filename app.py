@@ -782,9 +782,15 @@ def _driver_ilike_pattern(name) -> str:
     return ("%" + "%".join(chars) + "%") if chars else ""
 
 
+DRIVER_ACTIVE_STATUSES = ["Approved", "On Trip"]
+
+
 @st.cache_data(ttl=90, show_spinner=False)
 def fetch_requisitions_by_driver(driver_name: str) -> pd.DataFrame:
-    """All trips assigned to this driver, matched case-insensitively and
+    """The trips this driver still has to ACT on — only Approved (waiting to start) and
+    On Trip (waiting for End KM) rows are fetched; completed history is NOT downloaded,
+    so the Driver Dashboard stays fast however many trips the driver has done.
+    Trips are matched case-insensitively and
     ignoring leading/trailing whitespace (see _normalize_driver_name) —
     so a mismatch like "Yusuf" vs "yusuf " no longer hides trips from the
     Driver Dashboard. Fetches every requisition with a driver assigned and
@@ -794,7 +800,11 @@ def fetch_requisitions_by_driver(driver_name: str) -> pd.DataFrame:
     pattern = _driver_ilike_pattern(driver_name)
     try:
         def _drv_query():
-            q = sb.table(REQUISITIONS_TABLE).select("*").not_.is_("driver_name", "null")
+            q = (
+                sb.table(REQUISITIONS_TABLE).select("*")
+                .not_.is_("driver_name", "null")
+                .in_("status", DRIVER_ACTIVE_STATUSES)
+            )
             if pattern:
                 # Only this driver's rows travel over the network (fast on weak links).
                 q = q.ilike("driver_name", pattern)
@@ -806,6 +816,7 @@ def fetch_requisitions_by_driver(driver_name: str) -> pd.DataFrame:
             lambda: sb.table(REQUISITIONS_TABLE)
             .select("*")
             .not_.is_("driver_name", "null")
+            .in_("status", DRIVER_ACTIVE_STATUSES)
             .order("created_at", desc=True)
             .order("id", desc=True)
         )
@@ -1631,7 +1642,7 @@ DAILY_FEMALE_DROP_TEMPLATES = [
 DAILY_AUTO_GROUPS = [
     {"tag": DAILY_SHUTTLE_TAG, "templates": DAILY_SHUTTLE_TEMPLATES,
      "applicant": "Staff Shuttle", "department": "Admin", "roster": False,
-     "title": "Staff Shuttle"},
+     "title": "🚌 Staff Shuttle"},
     {"tag": DAILY_COMMERCIAL_TAG, "templates": DAILY_COMMERCIAL_TEMPLATES,
      "applicant": "Commercial", "department": "Commercial", "roster": True,
      "title": "💼 Commercial Duty"},
@@ -1640,7 +1651,7 @@ DAILY_AUTO_GROUPS = [
      "title": "🌙 Night Shift Vehicle"},
     {"tag": DAILY_FEMALE_DROP_TAG, "templates": DAILY_FEMALE_DROP_TEMPLATES,
      "applicant": "Admin", "department": "Admin", "roster": False,
-     "title": "Female Worker Drop"},
+     "title": "🚐 Female Worker Drop"},
 ]
 
 
@@ -1661,14 +1672,45 @@ def _clear_auto_roster_caches():
     fetch_auto_roster.clear()
 
 
+# ---- App-wide settings (one special row of the roster table; JSON in its trips_json column) ----
+APP_SETTINGS_KEY = "__APP_SETTINGS__"
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_app_settings() -> dict:
+    """App-wide switches chosen by Admin, e.g. {"autorefresh_on": false}. Cached for a
+    minute (so every page load does not hit the database); any problem (table or
+    column missing, ...) returns {} which means 'everything on, as before'."""
+    try:
+        sb = get_supabase_client()
+        res = sb.table(AUTO_ROSTER_TABLE).select("trips_json").eq("slot_key", APP_SETTINGS_KEY).execute()
+        raw = (res.data[0].get("trips_json") if res.data else "") or ""
+        obj = json.loads(raw) if raw.strip() else {}
+        return obj if isinstance(obj, dict) else {}
+    except Exception as e:
+        print(f"App settings unavailable (defaults used): {e}")
+        return {}
+
+
+def save_app_setting(key: str, value, updated_by: str):
+    cur = dict(fetch_app_settings())
+    cur[key] = value
+    sb = get_supabase_client()
+    sb.table(AUTO_ROSTER_TABLE).upsert({
+        "slot_key": APP_SETTINGS_KEY, "group_tag": "settings", "slot_no": 0, "enabled": True,
+        "trips_json": json.dumps(cur), "updated_by": updated_by, "updated_at": bd_now_str(),
+    }, on_conflict="slot_key").execute()
+    fetch_app_settings.clear()
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_auto_duty_trips(date_from: str, date_to: str) -> pd.DataFrame:
-    """Auto-created Commercial Duty + Night Shift requisitions (any status) whose
+    """Auto-created requisitions of ALL auto groups (any status) whose
     trip date is between date_from and date_to (inclusive, 'YYYY-MM-DD').
     Small, targeted query — does not load the whole history."""
     sb = get_supabase_client()
     frames = []
-    for tag in (DAILY_COMMERCIAL_TAG, DAILY_NIGHT_SHIFT_TAG):
+    for tag in [g["tag"] for g in DAILY_AUTO_GROUPS]:
         res = (
             sb.table(REQUISITIONS_TABLE).select("*")
             .gte("date_of_travel", date_from).lte("date_of_travel", date_to)
@@ -1826,26 +1868,27 @@ def ensure_daily_shuttle_requisitions():
             tag = g["tag"]
 
             # --- which trips does this group create today? ---
+            # Every group (roster or Pending) reads its trip list from the roster tab
+            # (falls back to the built-in defaults until Admin edits/saves it there).
             driver = vehicle = ""
+            slot = roster.get(tag)
+            if slot is not None and slot.get("enabled") is False:
+                continue  # group switched off (Active un-ticked) -> nothing created
             if g["roster"]:
-                # ONE roster row per group: its driver + vehicle apply to every trip,
-                # its trip list (editable in the roster tab) says WHAT trips exist.
-                slot = roster.get(tag)
-                if slot is None or slot.get("enabled") is False:
-                    continue  # no roster saved yet / group switched off -> nothing created
+                # ONE roster row per group: its driver + vehicle apply to every trip.
+                if slot is None:
+                    continue  # no roster saved yet
                 driver = (slot.get("driver_name") or "").strip()
                 vehicle = (slot.get("vehicle_number") or "").strip()
                 if not (driver and vehicle):
                     continue  # roster groups are NEVER created as Pending
-                trips, _next = get_group_trips(g, roster)
-                items = [(tr["tid"], {
-                    "applicant": tr["applicant"], "department": tr["department"],
-                    "destination": tr["destination"], "time": tr["time"],
-                    "passenger_count": tr["passengers"], "purpose": tr["purpose"],
-                    "vehicle_type": tr["vehicle_type"],
-                }) for tr in trips]
-            else:
-                items = list(enumerate(g["templates"], start=1))
+            trips, _next = get_group_trips(g, roster)
+            items = [(tr["tid"], {
+                "applicant": tr["applicant"], "department": tr["department"],
+                "destination": tr["destination"], "time": tr["time"],
+                "passenger_count": tr["passengers"], "purpose": tr["purpose"],
+                "vehicle_type": tr["vehicle_type"],
+            }) for tr in trips]
             if not items:
                 continue
 
@@ -3694,10 +3737,36 @@ st.sidebar.markdown("---")
 st.sidebar.markdown(f"**{user['full_name']}**")
 st.sidebar.caption(f"Role: {ROLE_DISPLAY.get(user['role'], user['role'].capitalize())}")
 
-auto_refresh_on = st.sidebar.checkbox("🔄 Auto-refresh every 90s", value=True,
-                                       help="Automatically reloads live data across the app every 90 seconds. "
-                                            "Turn off temporarily if you're filling out a long form, "
-                                            "or use '🔄 Refresh Now' any time for an on-demand update.")
+def _save_global_autorefresh(by: str):
+    """on_change of the Admin master switch: saves it for EVERYONE."""
+    try:
+        save_app_setting("autorefresh_on", bool(st.session_state.get("admin_global_ar", True)), by)
+        st.session_state.pop("_global_ar_err", None)
+    except Exception as e:
+        st.session_state["_global_ar_err"] = str(e)
+
+
+_global_ar = bool(fetch_app_settings().get("autorefresh_on", True))
+if user["role"] == "admin":
+    st.session_state["admin_global_ar"] = _global_ar   # always mirror the saved value
+    st.sidebar.checkbox(
+        "🌐 Auto-refresh for ALL users", key="admin_global_ar",
+        on_change=_save_global_autorefresh, args=(user["full_name"],),
+        help="Admin master switch. OFF = auto-refresh stops on every panel and every device "
+             "(each person can still use '🔄 Refresh Now'). ON = it works again everywhere. "
+             "Devices pick the change up within a few minutes.",
+    )
+    if st.session_state.get("_global_ar_err"):
+        st.sidebar.error("Could not save the switch — run the one-time SQL (trips_json column) from the "
+                         "Auto Duty Roster tab first.")
+if _global_ar:
+    auto_refresh_on = st.sidebar.checkbox("🔄 Auto-refresh every 2 min", value=True,
+                                           help="Automatically reloads live data across the app every 2 minutes. "
+                                                "Turn off temporarily if you're filling out a long form, "
+                                                "or use '🔄 Refresh Now' any time for an on-demand update.")
+else:
+    auto_refresh_on = False
+    st.sidebar.caption("🔄 Auto-refresh is switched OFF by the Admin for everyone. Use 'Refresh Now' for the latest data.")
 if st.sidebar.button("🔄 Refresh Now", use_container_width=True):
     st.rerun()
 st.sidebar.markdown("---")
@@ -3713,8 +3782,26 @@ NO_AUTOREFRESH_ROLES = set()   # no role is exempt
 # so ALL roles refresh every 120 seconds (the sidebar's "Refresh Now" button is
 # always there for an instant manual refresh).
 AUTOREFRESH_INTERVAL_MS = 120_000
+# Driver Dashboard: how many trips are drawn at first (the rest sit behind a "Show more" button).
+DRIVER_TRIPS_VISIBLE = 3
+
+
+def _set_state_flag(key: str, value):
+    st.session_state[key] = value
 if auto_refresh_on and user["role"] not in NO_AUTOREFRESH_ROLES:
     st_autorefresh(interval=AUTOREFRESH_INTERVAL_MS, key="global_autorefresh")
+
+# While auto-refresh is OFF a screen no longer reloads by itself, so it could never notice that
+# Admin switched it back ON. This tiny background check (a "fragment": it re-runs only itself, no
+# page reload) looks at the saved switch every few minutes and reloads the page ONLY when it changed.
+GLOBAL_AR_WATCH_SECONDS = 180
+if hasattr(st, "fragment"):
+    @st.fragment(run_every=GLOBAL_AR_WATCH_SECONDS)
+    def _watch_global_autorefresh(known_flag: bool):
+        if bool(fetch_app_settings().get("autorefresh_on", True)) != known_flag:
+            st.rerun()
+
+    _watch_global_autorefresh(_global_ar)
 
 
 def section_nav(key: str, labels: list):
@@ -3938,7 +4025,11 @@ elif user["role"] == "driver":
         if start_trips.empty:
             st.info("You have no Approved trips waiting to start.")
         else:
-            for n, grp in enumerate(group_trips(sort_by_approval_order(start_trips)), start=1):
+            _groups_drvs = group_trips(sort_by_approval_order(start_trips))
+            _visible_drvs = (
+                _groups_drvs if st.session_state.get("drv_show_all_start") else _groups_drvs[:DRIVER_TRIPS_VISIBLE]
+            )
+            for n, grp in enumerate(_visible_drvs, start=1):
                 first = grp[0]
                 gkey = first["request_id"]
                 multi = len(grp) > 1
@@ -3996,6 +4087,18 @@ elif user["role"] == "driver":
                         except Exception as e:
                             st.error(f"❌ Failed to record Start KM: {e}")
 
+            if len(_groups_drvs) > DRIVER_TRIPS_VISIBLE:
+                if st.session_state.get("drv_show_all_start"):
+                    st.button("⬆️ Show fewer trips", key="drvs_fewer", use_container_width=True,
+                              on_click=_set_state_flag, args=("drv_show_all_start", False))
+                else:
+                    st.button(
+                        f"➕ Show {len(_groups_drvs) - len(_visible_drvs)} more trip(s) "
+                        f"(showing {len(_visible_drvs)} of {len(_groups_drvs)})",
+                        key="drvs_more", use_container_width=True,
+                        on_click=_set_state_flag, args=("drv_show_all_start", True),
+                    )
+
     # ---------------- TAB 2: End Trip (End KM only) ----------------
     if tab_return:
         st.subheader("Trips Currently On the Road")
@@ -4014,7 +4117,11 @@ elif user["role"] == "driver":
         if end_trips.empty:
             st.info("No trips are currently waiting for your End KM.")
         else:
-            for n, grp in enumerate(group_trips(sort_by_approval_order(end_trips)), start=1):
+            _groups_drve = group_trips(sort_by_approval_order(end_trips))
+            _visible_drve = (
+                _groups_drve if st.session_state.get("drv_show_all_end") else _groups_drve[:DRIVER_TRIPS_VISIBLE]
+            )
+            for n, grp in enumerate(_visible_drve, start=1):
                 first = grp[0]
                 gkey = first["request_id"]
                 multi = len(grp) > 1
@@ -4108,6 +4215,18 @@ elif user["role"] == "driver":
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"❌ Failed to record End KM: {e}")
+
+            if len(_groups_drve) > DRIVER_TRIPS_VISIBLE:
+                if st.session_state.get("drv_show_all_end"):
+                    st.button("⬆️ Show fewer trips", key="drve_fewer", use_container_width=True,
+                              on_click=_set_state_flag, args=("drv_show_all_end", False))
+                else:
+                    st.button(
+                        f"➕ Show {len(_groups_drve) - len(_visible_drve)} more trip(s) "
+                        f"(showing {len(_visible_drve)} of {len(_groups_drve)})",
+                        key="drve_more", use_container_width=True,
+                        on_click=_set_state_flag, args=("drv_show_all_end", True),
+                    )
 
 # =========================================================
 # 9C. NURSE / SENIOR NURSE — EMERGENCY DASHBOARD (NEW)
@@ -5016,7 +5135,7 @@ elif user["role"] == "admin":
     # evening's auto requisitions use it (created already Approved) until Admin
     # changes it — e.g. the weekly rotation.
     if tab_roster:
-        st.subheader("🤖 Auto Duty Roster — Commercial Duty & Night Shift")
+        st.subheader("🤖 Auto Duty Roster — Auto-created Trips")
         st.caption(
             "Select ONE Driver and ONE Vehicle for each group and press Save — they are used for ALL trips "
             "of that group and STAY the same every day until you change them. After "
@@ -5024,7 +5143,9 @@ elif user["role"] == "admin":
             f"{'PM' if DAILY_AUTO_START_HOUR >= 12 else 'AM'} (Bangladesh time) the app creates each day's "
             "requisitions automatically, always **Approved** and sent straight to the driver. "
             "A group with no Driver/Vehicle selected (or un-ticked Active) is NOT created. "
-            "Under each group you can also edit its trips (time, destination, department, applicant), add new trips or remove trips."
+            "Staff Shuttle and Female Worker Drop have no driver here: their trips are created as **Pending** "
+            "for you to approve. Under EVERY group you can edit its trips (time, destination, department, "
+            "applicant ...), add new trips or remove trips."
         )
 
         if st.session_state.get("roster_flash"):
@@ -5056,8 +5177,6 @@ elif user["role"] == "admin":
                 )
 
             for g in DAILY_AUTO_GROUPS:
-                if not g["roster"]:
-                    continue
                 g_tag = g["tag"]
                 g_trips, g_next_tid = get_group_trips(g, roster_map)
                 saved = roster_map.get(g_tag, {})
@@ -5074,55 +5193,86 @@ elif user["role"] == "admin":
                     veh_opts.insert(1, saved_vehicle)
 
                 st.markdown(f"#### {g['title']}")
-                st.caption(f"Applies to all {len(g_trips)} trip(s) of this group each day.")
-                if not (saved_driver and saved_vehicle):
-                    st.warning("⚠️ No Driver/Vehicle saved for this group — its trips are NOT being created. Select and Save below.")
-                elif not saved_enabled:
-                    st.warning("⏸️ This group is switched off (Active un-ticked) — its trips are NOT being created.")
+                if g["roster"]:
+                    st.caption(f"Applies to all {len(g_trips)} trip(s) of this group each day.")
+                    if not (saved_driver and saved_vehicle):
+                        st.warning("⚠️ No Driver/Vehicle saved for this group — its trips are NOT being created. Select and Save below.")
+                    elif not saved_enabled:
+                        st.warning("⏸️ This group is switched off (Active un-ticked) — its trips are NOT being created.")
 
-                # ---- one Driver + one Vehicle for the whole group ----
-                with st.form(f"roster_form_{g_tag}"):
-                    c1, c2, c3 = st.columns([2.6, 2.2, 1])
-                    sel_driver = c1.selectbox(
-                        "Driver", drv_opts,
-                        index=drv_opts.index(saved_driver) if saved_driver in drv_opts else 0,
-                        key=f"roster_drv_{g_tag}",
-                    )
-                    sel_vehicle = c2.selectbox(
-                        "Vehicle", veh_opts,
-                        index=veh_opts.index(saved_vehicle) if saved_vehicle in veh_opts else 0,
-                        key=f"roster_veh_{g_tag}",
-                    )
-                    sel_active = c3.checkbox("Active", value=saved_enabled, key=f"roster_on_{g_tag}")
-                    save_clicked = st.form_submit_button(
-                        f"💾 Save {g['title']} Driver & Vehicle", type="primary", use_container_width=True,
-                    )
+                    # ---- one Driver + one Vehicle for the whole group ----
+                    with st.form(f"roster_form_{g_tag}"):
+                        c1, c2, c3 = st.columns([2.6, 2.2, 1])
+                        sel_driver = c1.selectbox(
+                            "Driver", drv_opts,
+                            index=drv_opts.index(saved_driver) if saved_driver in drv_opts else 0,
+                            key=f"roster_drv_{g_tag}",
+                        )
+                        sel_vehicle = c2.selectbox(
+                            "Vehicle", veh_opts,
+                            index=veh_opts.index(saved_vehicle) if saved_vehicle in veh_opts else 0,
+                            key=f"roster_veh_{g_tag}",
+                        )
+                        sel_active = c3.checkbox("Active", value=saved_enabled, key=f"roster_on_{g_tag}")
+                        save_clicked = st.form_submit_button(
+                            f"💾 Save {g['title']} Driver & Vehicle", type="primary", use_container_width=True,
+                        )
 
-                if save_clicked:
-                    drv_val = "" if sel_driver == NOT_SET else sel_driver
-                    veh_val = "" if sel_vehicle == NOT_SET else sel_vehicle
-                    if bool(drv_val) != bool(veh_val):
-                        st.error("❌ Select BOTH Driver and Vehicle (or leave both as 'Not set').")
-                    else:
+                    if save_clicked:
+                        drv_val = "" if sel_driver == NOT_SET else sel_driver
+                        veh_val = "" if sel_vehicle == NOT_SET else sel_vehicle
+                        if bool(drv_val) != bool(veh_val):
+                            st.error("❌ Select BOTH Driver and Vehicle (or leave both as 'Not set').")
+                        else:
+                            try:
+                                save_auto_roster_slots([{
+                                    "slot_key": g_tag, "group_tag": g_tag, "slot_no": 0,
+                                    "driver_name": drv_val, "vehicle_number": veh_val,
+                                    "enabled": bool(sel_active),
+                                    "updated_by": user["full_name"], "updated_at": bd_now_str(),
+                                }])
+                                # Existing (Pending / any) requisitions are never touched. If it is
+                                # already past the auto-start time, create any of today's trips of
+                                # this group that are still missing right now.
+                                st.session_state.pop("_daily_shuttle_checked_date", None)
+                                ensure_daily_shuttle_requisitions()
+                                st.session_state["roster_flash"] = (
+                                    f"✅ {g['title']} Driver & Vehicle saved. They will be used for all "
+                                    f"{len(g_trips)} trip(s) every day until you change them."
+                                )
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"❌ Failed to save roster: {e}")
+
+                else:
+                    # Pending group (Staff Shuttle / Female Worker Drop): no driver or vehicle here —
+                    # Admin approves these from "Pending Requests". Only an on/off switch + the trip table.
+                    st.caption(
+                        f"{len(g_trips)} trip(s) are created every day as **Pending** — approve them from "
+                        "**🚗 Pending Requests**."
+                    )
+                    if not saved_enabled:
+                        st.warning("⏸️ This group is switched off (Active un-ticked) — its trips are NOT being created.")
+                    with st.form(f"active_form_{g_tag}"):
+                        sel_active_p = st.checkbox(
+                            "Active — create these trips every day", value=saved_enabled, key=f"roster_on_{g_tag}",
+                        )
+                        save_active_clicked = st.form_submit_button(
+                            f"💾 Save {g['title']} On/Off", use_container_width=True,
+                        )
+                    if save_active_clicked:
                         try:
                             save_auto_roster_slots([{
                                 "slot_key": g_tag, "group_tag": g_tag, "slot_no": 0,
-                                "driver_name": drv_val, "vehicle_number": veh_val,
-                                "enabled": bool(sel_active),
+                                "enabled": bool(sel_active_p),
                                 "updated_by": user["full_name"], "updated_at": bd_now_str(),
                             }])
-                            # Existing (Pending / any) requisitions are never touched. If it is
-                            # already past the auto-start time, create any of today's trips of
-                            # this group that are still missing right now.
-                            st.session_state.pop("_daily_shuttle_checked_date", None)
-                            ensure_daily_shuttle_requisitions()
                             st.session_state["roster_flash"] = (
-                                f"✅ {g['title']} Driver & Vehicle saved. They will be used for all "
-                                f"{len(g_trips)} trip(s) every day until you change them."
+                                f"✅ {g['title']} is now {'ON' if sel_active_p else 'OFF'}."
                             )
                             st.rerun()
                         except Exception as e:
-                            st.error(f"❌ Failed to save roster: {e}")
+                            st.error(f"❌ Failed to save: {e}")
 
                 # ---- the trips themselves: edit / add / remove ----
                 with st.expander(
@@ -5235,9 +5385,8 @@ elif user["role"] == "admin":
                                 )
 
             st.info(
-                "ℹ️ Existing Pending requisitions are never changed by this page. Staff Shuttle and Female Worker "
-                "Drop requisitions are created as **Pending** every day — approve them from "
-                "**🚗 Pending Requests** as usual."
+                "ℹ️ Existing requisitions are never changed by the tables above — edits apply from the next "
+                "auto-creation. To change a trip that was already created, use the list below."
             )
 
         # ------------------------------------------------------------------
@@ -5246,20 +5395,20 @@ elif user["role"] == "admin":
         # "✏️ Edit / Delete Trip": status, driver, vehicle, times, KM, note ...).
         # ------------------------------------------------------------------
         st.markdown("---")
-        st.markdown("### 📋 Commercial Duty & Night Shift Trips — View / Edit")
+        st.markdown("### 📋 Auto-created Trips — View / Edit")
         if st.session_state.get("edit_flash"):
             st.success(st.session_state.pop("edit_flash"))
 
         lf1, lf2, lf3 = st.columns([2, 2, 3])
         with lf1:
             list_group = st.selectbox(
-                "Group", ["All (Commercial + Night Shift)", "💼 Commercial Duty", "🌙 Night Shift Vehicle"],
+                "Group", ["All auto-created trips"] + [g["title"] for g in DAILY_AUTO_GROUPS],
                 key="auto_trips_group",
             )
         with lf2:
             list_status = st.multiselect(
-                "Status", REQ_STATUS_OPTIONS, default=["Approved"], key="auto_trips_status",
-                help="Default shows the Approved trips. Add other statuses (On Trip, Completed ...) or clear it to see all.",
+                "Status", REQ_STATUS_OPTIONS, default=["Approved", "Pending"], key="auto_trips_status",
+                help="Default shows Approved and Pending trips. Add other statuses (On Trip, Completed ...) or clear it to see all.",
             )
         with lf3:
             list_dates = st.date_input(
@@ -5279,16 +5428,15 @@ elif user["role"] == "admin":
 
         def _trip_group_label(note):
             note = str(note or "")
-            if DAILY_COMMERCIAL_TAG in note:
-                return "💼 Commercial Duty"
-            if DAILY_NIGHT_SHIFT_TAG in note:
-                return "🌙 Night Shift Vehicle"
+            for _g in DAILY_AUTO_GROUPS:
+                if _g["tag"] in note:
+                    return _g["title"]
             return "—"
 
         if not auto_trips_df.empty:
             auto_trips_df = auto_trips_df.copy()
             auto_trips_df["_group"] = auto_trips_df["admin_note"].map(_trip_group_label)
-            if list_group != "All (Commercial + Night Shift)":
+            if list_group != "All auto-created trips":
                 auto_trips_df = auto_trips_df[auto_trips_df["_group"] == list_group]
             if list_status:
                 auto_trips_df = auto_trips_df[auto_trips_df["status"].isin(list_status)]
