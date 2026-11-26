@@ -3818,6 +3818,532 @@ def section_nav(key: str, labels: list):
     return tuple(choice == l for l in labels)
 
 # =========================================================
+# EXCEL REGISTER IMPORT (Admin)  —  NEW
+# =========================================================
+# Lets the Admin type the drivers' handwritten-register trips into an Excel
+# sheet and upload it: new trips are ADDED, existing trips are CORRECTED
+# (when the "Req #" column is filled). Nothing here touches the existing
+# screens. Imported trips never send Telegram alerts.
+from datetime import time as _ri_time          # `time` is already the stdlib module in this file
+
+RI_COLUMNS = [
+    ("Req # (only to EDIT)", 14, "Leave EMPTY for a new trip. To correct a trip already in the app, type its Req # (the short number the app shows). Only the cells you fill are changed."),
+    ("Trip Date *", 14, "Date the trip started."),
+    ("Driver *", 22, "Pick from the list (must match a driver in the app)."),
+    ("Vehicle No *", 18, "Pick from the list."),
+    ("Start Time", 12, "e.g. 7:30 AM  or  19:30"),
+    ("End Date", 14, "Empty = same day (the next day is used automatically if End Time is earlier than Start Time)."),
+    ("End Time", 12, "e.g. 6:15 PM  or  18:15"),
+    ("Start KM", 12, "Odometer at start."),
+    ("End KM", 12, "Odometer at end."),
+    ("Total KM", 11, "Automatic - do not type."),
+    ("Destination / Route *", 28, "Where the trip went."),
+    ("Purpose", 26, "Optional."),
+    ("Vehicle Type", 16, "Optional (default: Other)."),
+    ("Department", 22, "Optional (default: Admin)."),
+    ("Applicant", 20, "Optional (default: Driver Register)."),
+    ("Passengers", 11, "Optional (default: 1)."),
+    ("Remarks", 28, "Saved as Admin Note."),
+]
+RI_FIRST_ROW = 6
+RI_LAST_ROW = 1005
+RI_DEFAULT_APPLICANT = "Driver Register"
+RI_DEFAULT_DEPARTMENT = "Admin"
+RI_DEFAULT_VEHICLE_TYPE = "Other"
+
+
+def _ri_parse_date(v):
+    if is_blank(v):
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    s = str(v).strip()
+    for f in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d-%b-%Y", "%d %b %Y", "%d/%m/%y", "%d-%m-%y"):
+        try:
+            return datetime.strptime(s, f).date()
+        except ValueError:
+            pass
+    raise ValueError(f"cannot read date '{s}' (use e.g. 25-Oct-2026)")
+
+
+def _ri_parse_time(v):
+    if is_blank(v):
+        return None
+    if isinstance(v, datetime):
+        return v.time().replace(second=0, microsecond=0)
+    if isinstance(v, _ri_time):
+        return v.replace(second=0, microsecond=0)
+    if isinstance(v, (int, float)) and 0 <= float(v) < 1:      # Excel time fraction
+        mins = int(round(float(v) * 24 * 60)) % (24 * 60)
+        return _ri_time(mins // 60, mins % 60)
+    s = re.sub(r"\s+", " ", str(v).strip().upper().replace(".", ""))
+    for f in ("%H:%M:%S", "%H:%M", "%I:%M %p", "%I:%M%p", "%I %p", "%I%p"):
+        try:
+            return datetime.strptime(s, f).time()
+        except ValueError:
+            pass
+    raise ValueError(f"cannot read time '{v}' (use e.g. 7:30 AM or 19:30)")
+
+
+def _ri_parse_km(v, label):
+    if is_blank(v):
+        return None
+    try:
+        x = float(str(v).replace(",", "").strip())
+    except ValueError:
+        raise ValueError(f"{label} '{v}' is not a number")
+    if x < 0:
+        raise ValueError(f"{label} cannot be negative")
+    return x
+
+
+def _ri_dt_str(v):
+    """Stored DB timestamp -> naive datetime (or None)."""
+    if is_blank(v):
+        return None
+    s = re.sub(r"(\.\d+)?(Z|[+-]\d{2}:?\d{2})$", "", str(v).strip().replace("T", " "), flags=re.I).strip()
+    for f in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(s, f)
+        except ValueError:
+            pass
+    return None
+
+
+def build_register_template_bytes(drivers: list, vehicles: list) -> bytes:
+    """Blank Excel sheet for the handwritten register, with dropdowns filled
+    from the app's live driver / vehicle lists."""
+    from openpyxl import Workbook
+    from openpyxl.comments import Comment
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.worksheet.datavalidation import DataValidation
+    from openpyxl.utils import get_column_letter as L
+
+    F = "Arial"
+    thin = Side(style="thin", color="BFBFBF")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+    head_fill = PatternFill("solid", fgColor="1F4E78")
+    req_fill = PatternFill("solid", fgColor="C00000")
+    inp_fill = PatternFill("solid", fgColor="FFFFE0")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Trips"
+    ws["A1"] = "RBL VMS - Driver Handwritten Register  (fill, save, then upload in the app: Admin > Excel Import)"
+    ws["A1"].font = Font(name=F, size=14, bold=True, color="1F4E78")
+    ws["A2"] = "Yellow cells = you type.  One ROW = one trip.  Columns with * are required.  Total KM is automatic."
+    ws["A3"] = ("NEW trip: leave 'Req #' empty.   EDIT an existing trip: type its Req # and fill ONLY the cells "
+                "you want to change.   Night shift: End Date may stay empty (next day is used automatically "
+                "when End Time is earlier than Start Time).")
+    for a in ("A2", "A3"):
+        ws[a].font = Font(name=F, size=10, italic=True)
+
+    for i, (h, w, note) in enumerate(RI_COLUMNS, start=1):
+        c = ws.cell(row=5, column=i, value=h)
+        c.font = Font(name=F, bold=True, color="FFFFFF", size=10)
+        c.fill = req_fill if "*" in h else head_fill
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = box
+        c.comment = Comment(note, "VMS")
+        ws.column_dimensions[L(i)].width = w
+    ws.row_dimensions[5].height = 32
+    ws.freeze_panes = "C6"
+
+    col_fmt = {2: "dd-mmm-yyyy", 5: "hh:mm AM/PM", 6: "dd-mmm-yyyy", 7: "hh:mm AM/PM",
+               8: "#,##0.#", 9: "#,##0.#", 10: "#,##0.0;-#,##0.0;;@"}
+    for r in range(RI_FIRST_ROW, RI_LAST_ROW + 1):
+        for ci in range(1, len(RI_COLUMNS) + 1):
+            c = ws.cell(row=r, column=ci)
+            c.font = Font(name=F, size=10)
+            c.border = box
+            if ci in col_fmt:
+                c.number_format = col_fmt[ci]
+            if ci != 10:
+                c.fill = inp_fill
+        ws.cell(row=r, column=10, value=f'=IF(AND(ISNUMBER(H{r}),ISNUMBER(I{r})),I{r}-H{r},"")')
+
+    example = [None, date(2026, 10, 25), (drivers[0] if drivers else "Driver Name"),
+               (vehicles[0] if vehicles else "DHAKA-METRO-XX-0000"), _ri_time(7, 30), None, _ri_time(18, 15),
+               383939, 384112, None, "Ishwardi EPZ - Pabna - Ishwardi EPZ", "Staff shuttle",
+               "HIACE", "Admin", "Driver Register", 1, "EXAMPLE ROW - overwrite or delete"]
+    for ci, v in enumerate(example, start=1):
+        if v is not None:
+            ws.cell(row=RI_FIRST_ROW, column=ci).value = v
+    ws.cell(row=RI_FIRST_ROW, column=17).font = Font(name=F, size=10, italic=True, color="7F7F7F")
+
+    ls = wb.create_sheet("Lists")
+    for c, t in zip("ABCD", ("Drivers", "Vehicles", "Vehicle Types", "Departments")):
+        ls[f"{c}1"] = t
+        ls[f"{c}1"].font = Font(name=F, bold=True)
+    for col, items in ((1, drivers), (2, vehicles), (3, VEHICLE_TYPES), (4, DEPARTMENTS)):
+        for i, v in enumerate(items, start=2):
+            ls.cell(row=i, column=col, value=v)
+    for col, w in zip("ABCD", (26, 24, 20, 32)):
+        ls.column_dimensions[col].width = w
+
+    def dv(formula, col, warn=False):
+        d = DataValidation(type="list", formula1=formula, allow_blank=True)
+        d.errorStyle = "warning" if warn else "stop"
+        d.showErrorMessage = True
+        d.error = "Not in the list."
+        ws.add_data_validation(d)
+        d.add(f"{col}{RI_FIRST_ROW}:{col}{RI_LAST_ROW}")
+
+    dv("=Lists!$A$2:$A$300", "C", warn=True)
+    dv("=Lists!$B$2:$B$300", "D", warn=True)
+    dv("=Lists!$C$2:$C$30", "M")
+    dv("=Lists!$D$2:$D$40", "N")
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _ri_read_rows(file_bytes: bytes) -> list:
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
+    if "Trips" not in wb.sheetnames:
+        raise ValueError("The sheet named 'Trips' was not found. Use the template from this page.")
+    ws = wb["Trips"]
+    rows = []
+    for r in range(RI_FIRST_ROW, ws.max_row + 1):
+        vals = [ws.cell(row=r, column=i).value for i in range(1, len(RI_COLUMNS) + 1)]
+        if all(is_blank(vals[i]) for i in (0, 1, 2, 3, 4, 6, 7, 8, 10)):
+            continue
+        if str(vals[16] or "").startswith("EXAMPLE ROW"):
+            continue
+        rows.append((r, vals))
+    return rows
+
+
+def analyze_register_excel(file_bytes: bytes, admin_user: dict) -> dict:
+    """Checks the uploaded Excel against the database WITHOUT writing anything.
+    Returns {'new': [...], 'edits': [...], 'errors': [(row, msg)], 'already': [...], 'n_rows': int}."""
+    sb = get_supabase_client()
+    drivers_df, vehicles_df = fetch_all_drivers(), fetch_all_vehicles()
+    drv_map = {str(r["driver_name"]).strip().lower(): r for r in drivers_df.to_dict("records")}
+    veh_map = {str(v).strip().lower(): str(v) for v in vehicles_df["vehicle_number"].tolist()}
+
+    try:
+        rows = _ri_read_rows(file_bytes)
+    except Exception as ex:
+        return {"new": [], "edits": [], "errors": [(0, f"Cannot read the Excel file: {ex}")], "already": [], "n_rows": 0}
+
+    errors, new_rows, edits, seen = [], [], [], set()
+    for xl_row, v in rows:
+        (req_no, d_trip, driver, vehicle, t_start, d_end, t_end, km_s, km_e, _tot,
+         dest, purpose, vtype, dept, applicant, pax, remarks) = v
+        problems = []
+        try:
+            d_trip, d_end = _ri_parse_date(d_trip), _ri_parse_date(d_end)
+            t_start, t_end = _ri_parse_time(t_start), _ri_parse_time(t_end)
+            km_s, km_e = _ri_parse_km(km_s, "Start KM"), _ri_parse_km(km_e, "End KM")
+        except ValueError as ex:
+            errors.append((xl_row, str(ex)))
+            continue
+
+        drv_row = None
+        if not is_blank(driver):
+            drv_row = drv_map.get(str(driver).strip().lower())
+            if not drv_row:
+                problems.append(f"driver '{driver}' is not in the app's driver list")
+        veh_name = None
+        if not is_blank(vehicle):
+            veh_name = veh_map.get(str(vehicle).strip().lower())
+            if not veh_name:
+                problems.append(f"vehicle '{vehicle}' is not in the app's vehicle list")
+        if not is_blank(vtype) and vtype not in VEHICLE_TYPES:
+            problems.append(f"Vehicle Type '{vtype}' is not valid")
+        if not is_blank(dept) and dept not in DEPARTMENTS:
+            problems.append(f"Department '{dept}' is not valid")
+        if km_s is not None and km_e is not None and km_e < km_s:
+            problems.append("End KM is smaller than Start KM")
+        if not is_blank(pax):
+            try:
+                int(float(pax))
+            except ValueError:
+                problems.append(f"Passengers '{pax}' is not a number")
+
+        is_edit = not is_blank(req_no)
+        if not is_edit:
+            for label, val in (("Trip Date", d_trip), ("Driver", driver), ("Vehicle No", vehicle),
+                               ("Destination / Route", dest)):
+                if is_blank(val):
+                    problems.append(f"{label} is required")
+
+        exit_ts = return_ts = None
+        if d_trip and t_start:
+            exit_ts = datetime.combine(d_trip, t_start)
+        if t_end:
+            end_day = d_end or d_trip
+            if end_day:
+                ret = datetime.combine(end_day, t_end)
+                if d_end is None and exit_ts and ret < exit_ts:
+                    ret += timedelta(days=1)                    # night shift
+                return_ts = ret
+        elif d_end:
+            problems.append("End Date given but End Time is empty")
+        if exit_ts and return_ts and return_ts < exit_ts:
+            problems.append("End date/time is earlier than start date/time")
+
+        if problems:
+            errors.append((xl_row, "; ".join(problems)))
+            continue
+
+        if is_edit:
+            try:
+                rid = int(float(str(req_no).replace("#", "").strip()))
+            except ValueError:
+                errors.append((xl_row, f"Req # '{req_no}' is not a number"))
+                continue
+            edits.append({"xl_row": xl_row, "id": rid, "d_trip": d_trip, "t_start": t_start, "d_end": d_end,
+                          "t_end": t_end, "exit_ts": exit_ts, "return_ts": return_ts, "driver": drv_row,
+                          "vehicle": veh_name, "km_s": km_s, "km_e": km_e, "dest": dest, "purpose": purpose,
+                          "vtype": vtype, "dept": dept, "applicant": applicant, "pax": pax, "remarks": remarks})
+            continue
+
+        has_end = return_ts is not None or km_e is not None
+        has_start = exit_ts is not None or km_s is not None
+        status = "Completed" if has_end else ("On Trip" if has_start else "Approved")
+        total = round(km_e - km_s, 1) if (km_s is not None and km_e is not None) else None
+        now_str = bd_now_str()
+        key = "|".join(str(x) for x in (d_trip, t_start, drv_row["driver_name"], veh_name, km_s, km_e,
+                                         str(dest).strip().lower()))
+        request_id = f"REG-{d_trip.strftime('%Y%m%d')}-{hashlib.md5(key.encode()).hexdigest()[:8].upper()}"
+        if request_id in seen:
+            errors.append((xl_row, "duplicate of another row in this Excel"))
+            continue
+        seen.add(request_id)
+        t0 = t_start or _ri_time(0, 0)
+        new_rows.append({"xl_row": xl_row, "data": {
+            "request_id": request_id,
+            "username": admin_user["username"],
+            "applicant_name": str(applicant).strip() if not is_blank(applicant) else RI_DEFAULT_APPLICANT,
+            "department": dept if not is_blank(dept) else RI_DEFAULT_DEPARTMENT,
+            "mobile_number": "N/A",
+            "date_of_travel": str(d_trip),
+            "time_of_travel": t0.strftime("%H:%M"),
+            "destination": str(dest).strip(),
+            "passenger_count": int(float(pax)) if not is_blank(pax) else 1,
+            "vehicle_type": vtype if not is_blank(vtype) else RI_DEFAULT_VEHICLE_TYPE,
+            "purpose": str(purpose).strip() if not is_blank(purpose) else "Driver register entry",
+            "special_request": "",
+            "status": status,
+            "driver_name": drv_row["driver_name"],
+            "driver_contact": drv_row.get("driver_contact") or "",
+            "vehicle_number": veh_name,
+            "approved_by": admin_user.get("full_name") or "Admin",
+            "action_timestamp": now_str,
+            "approved_time": t0.strftime("%H:%M"),
+            "admin_note": (str(remarks).strip() + " | " if not is_blank(remarks) else "") + "Imported from driver register",
+            "actual_exit_time": exit_ts.strftime("%Y-%m-%d %H:%M:%S") if exit_ts else None,
+            "actual_return_time": return_ts.strftime("%Y-%m-%d %H:%M:%S") if return_ts else None,
+            "driver_start_km": km_s,
+            "driver_end_km": km_e,
+            "total_km": total,
+            "driver_km_updated_at": now_str,
+            "created_at": now_str,
+        }})
+
+    # trips that are already saved (safe re-upload of the same file)
+    already = []
+    if new_rows:
+        ids = [n["data"]["request_id"] for n in new_rows]
+        existing = set()
+        for i in range(0, len(ids), 100):
+            res = sb.table(REQUISITIONS_TABLE).select("request_id").in_("request_id", ids[i:i + 100]).execute()
+            existing |= {r["request_id"] for r in (res.data or [])}
+        already = [n for n in new_rows if n["data"]["request_id"] in existing]
+        new_rows = [n for n in new_rows if n["data"]["request_id"] not in existing]
+
+    edit_ops = []
+    for e in edits:
+        res = sb.table(REQUISITIONS_TABLE).select("*").eq("id", e["id"]).limit(1).execute()
+        if not res.data:
+            errors.append((e["xl_row"], f"Req # {e['id']} does not exist in the app"))
+            continue
+        cur = res.data[0]
+        up = {}
+        if e["driver"]:
+            up["driver_name"] = e["driver"]["driver_name"]
+            up["driver_contact"] = e["driver"].get("driver_contact") or ""
+        if e["vehicle"]:
+            up["vehicle_number"] = e["vehicle"]
+        if e["d_trip"]:
+            up["date_of_travel"] = str(e["d_trip"])
+        if e["t_start"]:
+            up["time_of_travel"] = e["t_start"].strftime("%H:%M")
+            up["approved_time"] = e["t_start"].strftime("%H:%M")
+        cur_exit, cur_ret = _ri_dt_str(cur.get("actual_exit_time")), _ri_dt_str(cur.get("actual_return_time"))
+        new_exit, new_ret = e["exit_ts"], e["return_ts"]
+        if new_exit is None and e["t_start"] and cur_exit:      # only a time typed -> keep stored date
+            new_exit = datetime.combine(cur_exit.date(), e["t_start"])
+        if new_ret is None and e["t_end"]:
+            try:
+                fallback_day = parse_stored_datetime(cur.get("date_of_travel")) or bd_now()
+            except Exception:
+                fallback_day = bd_now()
+            base_day = e["d_end"] or (new_exit or cur_exit or fallback_day).date()
+            new_ret = datetime.combine(base_day, e["t_end"])
+            if e["d_end"] is None and (new_exit or cur_exit) and new_ret < (new_exit or cur_exit):
+                new_ret += timedelta(days=1)
+        if new_exit:
+            up["actual_exit_time"] = new_exit.strftime("%Y-%m-%d %H:%M:%S")
+        if new_ret:
+            up["actual_return_time"] = new_ret.strftime("%Y-%m-%d %H:%M:%S")
+        if e["km_s"] is not None:
+            up["driver_start_km"] = e["km_s"]
+        if e["km_e"] is not None:
+            up["driver_end_km"] = e["km_e"]
+        s_km = up.get("driver_start_km", cur.get("driver_start_km"))
+        e_km = up.get("driver_end_km", cur.get("driver_end_km"))
+        if not is_blank(s_km) and not is_blank(e_km):
+            if float(e_km) < float(s_km):
+                errors.append((e["xl_row"], f"Req # {e['id']}: End KM would be smaller than Start KM"))
+                continue
+            up["total_km"] = round(float(e_km) - float(s_km), 1)
+        fin_exit, fin_ret = new_exit or cur_exit, new_ret or cur_ret
+        if fin_exit and fin_ret and fin_ret < fin_exit:
+            errors.append((e["xl_row"], f"Req # {e['id']}: end time would be earlier than start time"))
+            continue
+        for k, val in (("destination", e["dest"]), ("purpose", e["purpose"]), ("vehicle_type", e["vtype"]),
+                       ("department", e["dept"]), ("applicant_name", e["applicant"]), ("admin_note", e["remarks"])):
+            if not is_blank(val):
+                up[k] = str(val).strip()
+        if not is_blank(e["pax"]):
+            up["passenger_count"] = int(float(e["pax"]))
+        if not up:
+            errors.append((e["xl_row"], f"Req # {e['id']}: nothing to change (all cells empty)"))
+            continue
+        if cur.get("status") in ("Approved", "On Trip", "Completed"):
+            if fin_ret or not is_blank(e_km):
+                up["status"] = "Completed"
+            elif fin_exit or not is_blank(s_km):
+                up["status"] = "On Trip"
+        edit_ops.append({"xl_row": e["xl_row"], "id": e["id"], "request_id": cur.get("request_id"), "updates": up})
+
+    return {"new": new_rows, "edits": edit_ops, "errors": errors, "already": already, "n_rows": len(rows)}
+
+
+def commit_register_import(result: dict):
+    """Writes the checked result to Supabase (no Telegram alerts)."""
+    sb = get_supabase_client()
+    new = [n["data"] for n in result["new"]]
+    for i in range(0, len(new), 50):
+        sb.table(REQUISITIONS_TABLE).insert(new[i:i + 50]).execute()
+    for e in result["edits"]:
+        sb.table(REQUISITIONS_TABLE).update(e["updates"]).eq("request_id", e["request_id"]).execute()
+    _clear_requisition_caches()
+
+
+# =========================================================
+# DRIVER QUICK TRIP (NEW)
+# =========================================================
+# When a driver had to run a trip but no requisition was requested/assigned
+# (schedule clash, no time, urgent), the driver can start it himself:
+# pick the vehicle + Start KM -> a requisition is created automatically with
+# status "On Trip". He finishes it later from the normal "End Trip" tab.
+# Admin finds these trips afterwards (Edit / Delete Trip -> "Only driver Quick
+# Trips") and corrects destination / department / times / KM.
+QUICK_TRIP_PURPOSE = "🚦 Driver Quick Trip (self-started, no requisition)"
+QUICK_TRIP_APPROVER = "Self-started by driver"
+
+
+def _quick_trip_vehicle_type(vehicle_number) -> str:
+    """Vehicle type of the last requisition that used this vehicle (the
+    vehicles table has no type column); falls back to 'Other'."""
+    try:
+        sb = get_supabase_client()
+        res = (sb.table(REQUISITIONS_TABLE).select("vehicle_type")
+               .eq("vehicle_number", vehicle_number).order("created_at", desc=True).limit(1).execute())
+        vt = res.data[0].get("vehicle_type") if res.data else None
+        if not is_blank(vt) and vt in VEHICLE_TYPES:
+            return vt
+    except Exception:
+        pass
+    return "Other"
+
+
+def create_driver_quick_trip(user: dict, vehicle_number: str, start_km: float, destination: str = ""):
+    """Creates an 'On Trip' requisition for the logged-in driver. Returns the new short id.
+    Raises ValueError for problems the driver can fix (shown as a normal error)."""
+    if is_blank(vehicle_number):
+        raise ValueError("Please select the vehicle.")
+    if is_blank(start_km) or float(start_km) <= 0:
+        raise ValueError("Please enter the Start KM (odometer reading).")
+    sb = get_supabase_client()
+    driver_name = str(user.get("full_name", "")).strip()
+
+    # Block a second start for the same driver + vehicle (also stops double-clicks).
+    pattern = _driver_ilike_pattern(driver_name)
+    q = (sb.table(REQUISITIONS_TABLE).select("id")
+         .eq("status", "On Trip").eq("vehicle_number", vehicle_number))
+    if pattern:
+        q = q.ilike("driver_name", pattern)
+    if (q.limit(1).execute().data or []):
+        raise ValueError(
+            f"You already have a running trip with {vehicle_number}. "
+            "Complete it first from the 🏁 End Trip tab."
+        )
+
+    drivers_df = fetch_all_drivers()
+    contact = ""
+    if not drivers_df.empty:
+        m = drivers_df[drivers_df["driver_name"].map(_normalize_driver_name) == _normalize_driver_name(driver_name)]
+        if not m.empty:
+            contact = str(m.iloc[0].get("driver_contact") or "")
+    if not contact:
+        contact = str(user.get("mobile") or "")
+
+    now = bd_now()
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    dest = str(destination).strip() or "Not specified (Driver Quick Trip)"
+    data = {
+        "request_id": generate_request_id(),
+        "username": user["username"],
+        "applicant_name": driver_name,
+        "department": "Admin",
+        "mobile_number": contact or "N/A",
+        "date_of_travel": str(now.date()),
+        "time_of_travel": now.strftime("%H:%M"),
+        "destination": dest,
+        "passenger_count": 1,
+        "vehicle_type": _quick_trip_vehicle_type(vehicle_number),
+        "purpose": QUICK_TRIP_PURPOSE,
+        "special_request": "",
+        "status": "On Trip",
+        "driver_name": driver_name,
+        "driver_contact": contact,
+        "vehicle_number": vehicle_number,
+        "approved_by": QUICK_TRIP_APPROVER,
+        "action_timestamp": now_str,
+        "approved_time": now.strftime("%H:%M"),
+        "actual_exit_time": now_str,
+        "driver_start_km": float(start_km),
+        "driver_km_updated_at": now_str,
+        "created_at": now_str,
+    }
+    res = sb.table(REQUISITIONS_TABLE).insert(data).execute()
+    new_id = res.data[0].get("id") if res.data else None
+    _clear_requisition_caches()
+
+    send_telegram_alert(
+        "🚦 **Driver Quick Trip Started!** (no requisition — self-started)\n\n"
+        f"🆔 **Requisition #:** {short_req_id(new_id)}\n"
+        f"👨‍✈️ **Driver:** {driver_name}\n"
+        f"🚗 **Vehicle:** {vehicle_number}\n"
+        f"🔢 **Start KM:** {km_plain(start_km)}\n"
+        f"📍 **Destination:** {dest}\n"
+        f"⏰ **Time:** {now.strftime('%Y-%m-%d %I:%M %p')}\n\n"
+        "⚠️ Admin: please review and correct the details later "
+        "(Edit / Delete Trip → Only driver Quick Trips)."
+    )
+    return short_req_id(new_id)
+
+
+# =========================================================
 # 8. EMPLOYEE DASHBOARD
 # =========================================================
 if user["role"] == "user":
@@ -4011,7 +4537,8 @@ elif user["role"] == "driver":
         "ask an Admin to check the name spelling in **Manage Drivers & Vehicles**."
     )
 
-    tab_depart, tab_return = section_nav("driver_section", ["🚦 Start Trip (Approved)", "🏁 End Trip (Return)"])
+    tab_depart, tab_return, tab_quick = section_nav("driver_section", [
+        "🚦 Start Trip (Approved)", "🏁 End Trip (Return)", "⚡ Quick Trip (No Requisition)"])
 
     with st.spinner("Loading your assigned trips..."):
         my_trips = fetch_requisitions_by_driver(user["full_name"])
@@ -4228,6 +4755,60 @@ elif user["role"] == "driver":
                         on_click=_set_state_flag, args=("drv_show_all_end", True),
                     )
 
+    # ---------------- TAB 3: Quick Trip (no requisition) ----------------
+    if tab_quick:
+        st.subheader("⚡ Quick Trip — start without a requisition")
+        if st.session_state.get("quick_flash"):
+            st.success(st.session_state.pop("quick_flash"))
+        st.caption(
+            "Use this when you had to take a trip but no requisition was assigned to you "
+            "(no time, schedule clash, urgent run). Choose the vehicle, enter the Start KM and press Start — "
+            "a requisition is created automatically. When you are back, finish it from "
+            "**🏁 End Trip (Return)**. Admin will check and correct the details later."
+        )
+
+        _qt_running = my_trips[my_trips["status"] == "On Trip"] if not my_trips.empty else my_trips
+        if not _qt_running.empty:
+            st.info(
+                f"🛣️ You currently have **{len(_qt_running)}** trip(s) on the road. "
+                "Enter the End KM for them in the **🏁 End Trip (Return)** tab when you are back."
+            )
+
+        _qt_vehicles = fetch_all_vehicles()
+        if _qt_vehicles.empty:
+            st.warning("⚠️ No vehicles are registered yet. Ask Admin to add them under Manage Drivers & Vehicles.")
+        else:
+            _qt_list = _qt_vehicles["vehicle_number"].tolist()
+            _qt_default = 0
+            if not my_trips.empty:
+                _recent = [v for v in my_trips["vehicle_number"].tolist() if not is_blank(v) and v in _qt_list]
+                if _recent:
+                    _qt_default = _qt_list.index(_recent[0])
+            _qt_vehicle = st.selectbox("Vehicle *", _qt_list, index=_qt_default, key="quick_vehicle")
+            _qt_auto = get_last_driver_end_km(user["full_name"], _qt_vehicle)
+            if _qt_auto and _qt_auto > 0:
+                st.caption(f"↩️ Start KM auto-filled from your last logged End KM for **{_qt_vehicle}** — change it if needed.")
+
+            with st.form("quick_trip_form"):
+                _qt_start = driver_km_input("Start KM (Odometer Reading) *", _qt_auto, key=f"quick_start_{_qt_vehicle}")
+                _qt_dest = st.text_input("Destination (optional)", key="quick_dest",
+                                         placeholder="e.g. Ishwardi EPZ — leave empty if unsure")
+                _qt_go = st.form_submit_button("🚦 Start Quick Trip", type="primary", use_container_width=True)
+
+            if _qt_go:
+                try:
+                    with st.spinner("Starting your trip..."):
+                        _qt_id = create_driver_quick_trip(user, _qt_vehicle, _qt_start, _qt_dest)
+                    st.session_state["quick_flash"] = (
+                        f"✅ Trip started — Requisition **{_qt_id}** created (status: On Trip). "
+                        "When you return, open **🏁 End Trip (Return)** and enter the End KM."
+                    )
+                    st.rerun()
+                except ValueError as ex:
+                    st.error(str(ex))
+                except Exception as ex:
+                    st.error(f"❌ Failed to start the trip: {ex}")
+
 # =========================================================
 # 9C. NURSE / SENIOR NURSE — EMERGENCY DASHBOARD (NEW)
 # =========================================================
@@ -4360,12 +4941,13 @@ elif user["role"] == "admin":
     # list — each variable below is named for what it holds, not its position,
     # so the underlying tab bodies didn't need to be reshuffled in the file.
     tab_pending_req, tab_create_req, tab_shuttle, tab_roster, tab_users, tab_pending_users, tab_analytics, tab_export, \
-        tab_edit_trip, tab_fleet, tab_duty, tab_management = section_nav("admin_section", [
+        tab_edit_trip, tab_fleet, tab_duty, tab_management, tab_import = section_nav("admin_section", [
             "🚗 Pending Requests", "➕ Create Requisition", "🚌 Staff Shuttle", "🤖 Auto Duty Roster", "👥 User List", "⏳ ID Requests",
             "📊 Analytics", "📁 All Requisitions & Export", "✏️ Edit / Delete Trip",
             "🚘 Manage Drivers & Vehicles",
             "🕒 Duty Tracker & Analytics",
             "🏆 Management Dashboard",
+            "📥 Excel Import",
         ])
 
     # Hoisted above every tab body so both users_df and df_all are guaranteed
@@ -5834,6 +6416,10 @@ elif user["role"] == "admin":
                     "Search", key="edit_find_search",
                     placeholder="Req # (e.g. 42), name, destination, vehicle, purpose...",
                 )
+            edit_quick_only = st.checkbox(
+                "⚡ Only driver Quick Trips (self-started, no requisition) — to review & correct",
+                key="edit_find_quick",
+            )
             edit_date_on = st.checkbox("Filter by trip date (actual start date)", key="edit_find_date_on")
             edit_date_range = None
             if edit_date_on:
@@ -5841,6 +6427,8 @@ elif user["role"] == "admin":
                                                 key="edit_find_date_range")
 
             edit_scope = df_all.copy()
+            if edit_quick_only:
+                edit_scope = edit_scope[edit_scope["approved_by"].fillna("").astype(str) == QUICK_TRIP_APPROVER]
             if edit_status_filter:
                 edit_scope = edit_scope[edit_scope["status"].isin(edit_status_filter)]
             if edit_driver_filter != "All Drivers":
@@ -6485,6 +7073,90 @@ elif user["role"] == "admin":
                     "⬇️ Download PDF (.pdf)", data=duty_pdf_bytes, file_name="duty_tracker_report.pdf",
                     mime="application/pdf", use_container_width=True,
                 )
+
+    # ---------------- Excel Import (NEW) ----------------
+    if tab_import:
+        st.subheader("📥 Excel Import — Driver Handwritten Register")
+        if st.session_state.get("ri_flash"):
+            st.success(st.session_state.pop("ri_flash"))
+        st.caption(
+            "Type the trips from the drivers' handwritten register into the Excel sheet, then upload it here. "
+            "**New trips** are added (leave the *Req #* column empty). **Existing trips** are corrected when you type "
+            "their *Req #* — only the cells you fill are changed. Imported trips send no Telegram alert."
+        )
+
+        _ri_drv, _ri_veh = fetch_all_drivers(), fetch_all_vehicles()
+        st.markdown("##### Step 1 — Download the Excel sheet")
+        st.download_button(
+            "⬇️ Download Excel Template (with your drivers & vehicles)",
+            data=build_register_template_bytes(
+                _ri_drv["driver_name"].tolist() if not _ri_drv.empty else [],
+                _ri_veh["vehicle_number"].tolist() if not _ri_veh.empty else [],
+            ),
+            file_name="driver_register_template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        st.caption("New driver/vehicle? Add it under **🚘 Manage Drivers & Vehicles** first, then download the template again.")
+
+        st.markdown("##### Step 2 — Upload the filled Excel and check it")
+        _ri_ver = st.session_state.get("ri_ver", 0)
+        _ri_file = st.file_uploader("Filled Excel file (.xlsx)", type=["xlsx"], key=f"ri_upload_{_ri_ver}")
+        if _ri_file is not None:
+            _ri_bytes = _ri_file.getvalue()
+            _ri_sig = hashlib.md5(_ri_bytes).hexdigest()
+            if st.button("🔍 Check File", use_container_width=True, key=f"ri_check_{_ri_ver}"):
+                with st.spinner("Checking every row..."):
+                    _res = analyze_register_excel(_ri_bytes, user)
+                st.session_state["ri_result"] = {"sig": _ri_sig, **_res}
+            _res = st.session_state.get("ri_result")
+            if _res and _res.get("sig") == _ri_sig:
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("New trips", len(_res["new"]))
+                m2.metric("Edits", len(_res["edits"]))
+                m3.metric("Already saved", len(_res["already"]))
+                m4.metric("Rows with errors", len(_res["errors"]))
+
+                if _res["errors"]:
+                    st.error("Fix these rows in Excel, upload again and re-check. Nothing was saved.")
+                    st.dataframe(pd.DataFrame(_res["errors"], columns=["Excel row", "Problem"]),
+                                 use_container_width=True, hide_index=True)
+                if _res["new"]:
+                    st.markdown("**New trips to be added**")
+                    st.dataframe(pd.DataFrame([
+                        {"Excel row": n["xl_row"], "Date": n["data"]["date_of_travel"],
+                         "Driver": n["data"]["driver_name"], "Vehicle": n["data"]["vehicle_number"],
+                         "Start": n["data"]["actual_exit_time"], "End": n["data"]["actual_return_time"],
+                         "Start KM": n["data"]["driver_start_km"], "End KM": n["data"]["driver_end_km"],
+                         "Total KM": n["data"]["total_km"], "Destination": n["data"]["destination"],
+                         "Status": n["data"]["status"]} for n in _res["new"]
+                    ]), use_container_width=True, hide_index=True)
+                if _res["edits"]:
+                    st.markdown("**Existing trips to be corrected**")
+                    st.dataframe(pd.DataFrame([
+                        {"Excel row": e["xl_row"], "Req #": e["id"],
+                         "Fields changed": ", ".join(sorted(e["updates"]))} for e in _res["edits"]
+                    ]), use_container_width=True, hide_index=True)
+                if _res["already"]:
+                    st.info(f"{len(_res['already'])} trip(s) in this file are already saved and will be skipped.")
+
+                if not _res["errors"]:
+                    if not _res["new"] and not _res["edits"]:
+                        st.info("Nothing new to save.")
+                    else:
+                        st.markdown("##### Step 3 — Save")
+                        if st.button(f"💾 Save {len(_res['new'])} new trip(s) and {len(_res['edits'])} edit(s)",
+                                     type="primary", use_container_width=True, key=f"ri_save_{_ri_ver}"):
+                            try:
+                                with st.spinner("Saving to Supabase..."):
+                                    commit_register_import(_res)
+                                st.session_state["ri_flash"] = (
+                                    f"✅ Saved {len(_res['new'])} new trip(s) and {len(_res['edits'])} edit(s).")
+                                st.session_state.pop("ri_result", None)
+                                st.session_state["ri_ver"] = _ri_ver + 1       # clears the uploader
+                                st.rerun()
+                            except Exception as ex:
+                                st.error(f"❌ Failed to save: {ex}")
 
     # ---------------- Management Dashboard (NEW) ----------------
     if tab_management:
